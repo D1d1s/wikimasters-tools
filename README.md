@@ -71,8 +71,10 @@ invendus.
 rapporte plus que vendre.
 
 **Et dans les pages du jeu** — un filtre *Nouveaux* dans votre collection, un tri
-**par valeur réelle** de toute la collection, et une page de revente qui vous dit
-à quel prix vendre et sur quelles cartes vous seriez le seul vendeur.
+**par valeur réelle** de toute la collection, un bouton **Tout souhaiter** qui met
+une recherche entière en liste de souhaits — « BMW », c'est 345 cartes en un
+clic au lieu de mille gestes — et une page de revente qui vous dit à quel prix
+vendre et sur quelles cartes vous seriez le seul vendeur.
 
 ---
 
@@ -94,5 +96,5 @@ Tout fonctionne dans les deux cas. Ce qui change vient du site, pas de l'outil :
 la régénération d'un paquet (~3 min avec PRO, ~10 min sans) et le pack quotidien
 bonus, réservé aux comptes PRO.
 
-Si les prix affichent « réservé aux comptes PRO », vérifiez que **Lecture directe
-de la base** est cochée dans les Réglages. Elle l'est par défaut.
+Si les prix affichent « réservé aux comptes PRO », vérifiez que **Accès direct
+à la base** est coché dans les Réglages. Il l'est par défaut.
