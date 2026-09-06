@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WikiMasters Tools
 // @namespace    https://www.wiki-masters.com/
-// @version      2.6.0
+// @version      2.7.0
 // @description  Boîte à outils WikiMasters : ouverture automatique des paquets, suivi des tirages, cote des cartes et revente.
 // @match        https://www.wiki-masters.com/*
 // @match        https://wiki-masters.com/*
@@ -49,7 +49,7 @@
    * disait 1.67 : de quoi chercher longtemps pourquoi un correctif « n'arrive
    * pas ». À tenir à jour avec `@version` en tête de fichier.
    */
-  const VERSION = '2.6.0';
+  const VERSION = '2.7.0';
 
   const CFG = {
     /*
@@ -811,7 +811,7 @@
        * encore serait se moquer du monde.
        */
       b.textContent = 'Valeur ↓ · cote bloquée';
-      b.title = 'L’API du marché est réservée aux comptes PRO (403). Coche « Lecture directe de '
+      b.title = 'L’API du marché est réservée aux comptes PRO (403). Coche « Accès direct à '
         + 'la base » dans les réglages : la cote se relève alors sur la table des enchères, '
         + 'sans abonnement, et ce tri redevient possible.';
     } else if (!sell.rows.length) {
@@ -894,6 +894,7 @@
     applyNewFilter();
     injectValueSort();
     paintValueBadges();
+    injectWishAll();
   }
 
   /** Répartition par rareté, dérivée de l'historique — jamais comptée à part. */
@@ -1468,6 +1469,48 @@
       return await res.json();
     } catch (_) {
       return null;
+    }
+  }
+
+  /*
+   * Écrire, et plus seulement lire
+   * ------------------------------
+   * Un seul geste passe par là, et il n'a pas d'autre chemin : la liste de
+   * souhaits. Le site ne publie aucune route d'API pour elle — aucun
+   * `/api/…wish…` dans ses seize bundles — parce que son propre client tape
+   * la table `wishlist_items` en direct. Ce n'est donc pas un raccourci
+   * derrière le dos du site : c'est exactement ce que la page fait quand tu
+   * cliques « Ajouter à la liste de souhaits ».
+   *
+   * L'engagement de la lecture vaut ici mot pour mot : jeton relu à chaque
+   * appel, jamais recopié dans le stockage du script, jamais journalisé. Et
+   * une écriture ne part jamais seule — il faut un clic, sur un bouton qui
+   * annonce son compte avant d'agir.
+   *
+   * On rend le statut plutôt que `null` : à la différence d'une lecture, une
+   * écriture qui échoue doit pouvoir le dire, et dire de quoi elle est morte.
+   */
+  async function sbWrite(method, path, body) {
+    if (!prefs.db) return { ok: false, status: 0, raison: 'option' };
+    const token = sbToken();
+    if (!token) return { ok: false, status: 0, raison: 'jeton' };
+    try {
+      const res = await fetch(`${sbUrl()}/${path}`, {
+        method,
+        credentials: 'omit',
+        headers: {
+          apikey: SB_ANON,
+          Authorization: `Bearer ${token}`,
+          'Content-Type': 'application/json',
+          // `return=minimal` : on ne demande pas au serveur de nous relire les
+          // lignes qu'on vient d'écrire — 345 cartes renvoyées pour rien.
+          Prefer: 'return=minimal',
+        },
+        ...(body ? { body: JSON.stringify(body) } : {}),
+      });
+      return { ok: res.ok, status: res.status, raison: res.ok ? '' : 'serveur' };
+    } catch (_) {
+      return { ok: false, status: 0, raison: 'réseau' };
     }
   }
 
@@ -3522,7 +3565,7 @@
        * — ils vont donc en console, où `diagCote()` les attend déjà.
        */
       state.dbNote = 'La base n’a pas répondu — la réserve reste estimée. '
-        + 'Décoche puis recoche « Lecture directe » pour réessayer.';
+        + 'Décoche puis recoche « Accès direct » pour réessayer.';
       console.info('[WikiMasters Tools] get_my_profile : aucune réponse exploitable.'
         + ' Voir wmSchema() pour les tables lisibles.');
       render();
@@ -4776,7 +4819,7 @@
             <label class="opt"><input type="checkbox" data-opt-bonus> Réclamer les paquets bonus</label>
             <label class="opt" title="Clique le bouton Réclamer du site pour chaque succès débloqué, quand tu es sur la page Succès"><input type="checkbox" data-opt-autoclaim> Réclamer les récompenses de succès</label>
             <div class="sect suite">Ce qu'il lit et te signale</div>
-            <label class="opt" title="Lit tes propres lignes dans la base du jeu, avec la session déjà ouverte dans cet onglet : réserve exacte et liste complète des ventes, là où l'API du site ne renvoie plus que des compteurs. Le jeton n'est ni stocké, ni journalisé, ni exporté."><input type="checkbox" data-opt-db> Lecture directe de la base</label>
+            <label class="opt" title="Lit tes propres lignes dans la base du jeu, avec la session déjà ouverte dans cet onglet : réserve exacte et liste complète des ventes, là où l'API du site ne renvoie plus que des compteurs. Une seule écriture passe par là, jamais toute seule : le bouton « Tout souhaiter » de la page Toutes les cartes, parce que le site n'expose aucune route d'API pour la liste de souhaits et que son propre client écrit dans cette table. Le jeton n'est ni stocké, ni journalisé, ni exporté."><input type="checkbox" data-opt-db> Accès direct à la base</label>
             <label class="opt"><input type="checkbox" data-opt-notify> Notifications bureau</label>
             <div class="note-vente">Mettre en vente et donner restent à ta main. Les relances
               automatiques se cochent dans <b>Marché</b>, et le panneau ne donne jamais seul.</div>
@@ -5132,7 +5175,7 @@
       // Relire tout de suite : cocher la case sans rien voir changer pendant
       // une minute donnerait l'impression que le réglage ne fait rien.
       state.packsReadAt = 0;
-      state.dbNote = prefs.db ? '' : 'Lecture directe désactivée.';
+      state.dbNote = prefs.db ? '' : 'Accès direct désactivé.';
       // La cote refusée par l'API redevient possible par la base : on lève le
       // verrou posé par le 403, sans quoi le relevé refuserait de repartir.
       if (prefs.db) {
@@ -5871,7 +5914,14 @@
    * elle ne bouge qu'à ta main.
    */
   const WISH_TTL_MS = 900000;      // 15 min : une liste de souhaits ne bouge pas seule
-  const WISH_MAX_PAGES = 12;       // garde-fou si `total` mentait
+  /*
+   * 12 pages suffisaient tant que la liste se remplissait à la main. « Tout
+   * souhaiter » la fait passer à quelques centaines d'un clic : au plafond
+   * d'avant, le volet aurait cessé de surveiller le reste sans le dire —
+   * exactement au moment où tu viens de le lui confier. La boucle s'arrête de
+   * toute façon sur `total`, donc ces pages ne sont lues que si elles existent.
+   */
+  const WISH_MAX_PAGES = 40;       // 2 000 cartes ; garde-fou si `total` mentait
   const WISH_SCAN_PAGES = 8;       // ~400 annonces, la fenêtre récente du marché
   const WISH_SCAN_MS = 100000;     // sous les deux minutes que couvrent ces pages
   const WISH_SEEN_MAX = 800;       // annonces retenues : deux balayages de recul
@@ -5901,6 +5951,528 @@
     state.wish = { at: Date.now(), cards: cartes };
     saveStore({ wish: state.wish });
     return state.wish;
+  }
+
+  /*
+   * Souhaiter toute une recherche
+   * -----------------------------
+   * Le site fait de la liste de souhaits un geste à l'unité : ouvrir la fiche
+   * d'une carte, cliquer, refermer. Sur « BMW » — 345 cartes — c'est mille
+   * gestes, et personne ne les fait. La liste reste donc maigre, et le volet
+   * Souhaits, qui croise le marché avec elle, n'a presque rien à croiser.
+   *
+   * Rien n'oblige pourtant à en faire mille : la recherche s'énumère en sept
+   * requêtes, et la table accepte un tableau. Les 345 cartes partent en une
+   * écriture, réversible par le même chemin.
+   *
+   * Ce que le bouton refuse de faire : plus que ce qui est affiché. Il lit la
+   * recherche du champ ET les raretés actives dans la barre, parce qu'un
+   * bouton qui souhaite 345 cartes alors que l'écran en montre 4 est un piège.
+   */
+  const WISH_Q_PAGES = 60;      // 3 000 cartes lues au plus — au-delà ce n'est plus une recherche
+  const WISH_LOT_ADD = 200;     // lignes par écriture : un corps qui reste petit
+  const WISH_LOT_DEL = 100;     // identifiants par suppression : l'URL a une longueur
+  const WISH_ARME_MS = 6000;    // le compte annoncé doit avoir le temps d'être lu
+  const WISH_PAGE_GAP = 120;    // souffle entre deux pages : 60 pages ne partent pas en rafale
+
+  /*
+   * Le seul plafond qui veuille dire quelque chose : ce que le volet Souhaits
+   * sait surveiller, soit `WISH_MAX_PAGES × 50`. Au-delà, le bouton
+   * remplirait une liste dont la fin ne serait plus regardée — et une alerte
+   * qu'on croit armée sans qu'elle le soit est pire que pas d'alerte du tout.
+   *
+   * Le chiffre n'est donc pas rond par goût : il suit le volet. Bouger l'un
+   * bouge l'autre, et c'est voulu.
+   */
+  const WISH_SUIVI_MAX = WISH_MAX_PAGES * 50;
+
+  /*
+   * Une lecture courte — deux cartes trouvées en 300 ms — rendrait l'armement
+   * illusoire : un double-clic armerait puis exécuterait dans le même geste.
+   * Le second clic n'est donc accepté qu'après ce délai, le temps qu'un œil
+   * lise le compte annoncé.
+   */
+  const WISH_ARME_MIN_MS = 500;
+
+  /*
+   * Un compte rendu qui explique un refus doit tenir le temps qu'on aille lire
+   * son infobulle. Douze secondes s'éteignaient au milieu de la phrase.
+   */
+  const WISH_NOTE_MS = 20000;
+
+  const RARETES = ['L', 'UR', 'SR', 'R', 'PC', 'C'];
+
+  let wishAllBusy = '';         // '' | 'lecture' | 'ecriture'
+  let wishAllArme = 0;          // horodatage de fin d'armement
+  let wishAllArmeA = 0;         // horodatage de début : le double-clic ne passe pas
+  let wishAllLot = null;        // ce que le second clic exécutera
+  let wishAllSens = '';         // sens de l'écriture en cours, pour son libellé
+  let wishAllNote = '';         // compte rendu de la dernière opération
+  let wishAllNoteTitre = '';    // ce que ce compte rendu mérite comme explication
+  let wishAllNoteAt = 0;
+
+  /** Un compte rendu n'a de valeur que s'il dit aussi quoi faire ensuite. */
+  function wishDire(note, titre) {
+    wishAllNote = note;
+    wishAllNoteTitre = titre;
+    wishAllNoteAt = Date.now();
+  }
+
+  const onGlobal = () => location.pathname.startsWith('/global-collection');
+
+  /*
+   * Ce qui est tapé n'est pas ce qui est affiché
+   * --------------------------------------------
+   * Le champ de la page ne cherche pas en frappant : il faut valider par
+   * « Rechercher ». Mesuré — taper n'émet aucune requête, la validation en
+   * émet une seule. Un bouton qui se fierait au champ agirait donc sur un mot
+   * que l'écran ne montre pas encore : on croit souhaiter ce qu'on voit, on
+   * souhaite ce qu'on vient de taper. C'est le piège que tout le reste du
+   * bouton cherche à éviter.
+   *
+   * La seule source qui ne mente pas est la requête elle-même. On l'observe au
+   * passage, sans rien changer d'elle — nos propres lectures portent un
+   * drapeau pour ne pas s'observer soi-même et se croire affichées.
+   */
+  let wishVue = { q: '', at: 0 };
+  let wishLitPourNous = false;
+  let wishProxyOn = false;
+
+  function installWishProxy() {
+    if (wishProxyOn) return;
+    wishProxyOn = true;
+    const passe = window.fetch;
+    window.fetch = function (input) {
+      try {
+        if (!wishLitPourNous) {
+          const url = typeof input === 'string' ? input : (input && input.url) || '';
+          if (url.includes('/api/cards?')) {
+            const p = new URL(url, location.origin).searchParams;
+            // La liste de souhaits passe par le même point d'entrée : ce n'est
+            // pas une recherche, elle ne dit rien de ce qui est affiché ici.
+            if (!p.get('wishlist')) wishVue = { q: (p.get('q') || '').trim(), at: Date.now() };
+          }
+        }
+      } catch (_) {
+        /* observer ne doit jamais coûter la requête observée */
+      }
+      return passe.apply(this, arguments);
+    };
+  }
+
+  /*
+   * L'état de la barre du site, lu dans le DOM parce qu'il ne vit nulle part
+   * ailleurs : la recherche ne passe pas par l'URL, et les raretés sont un
+   * filtre React. `ring-2` est la marque que le site pose sur un filtre actif,
+   * `opacity-50` sur un filtre éteint.
+   */
+  function wishBarre() {
+    const champ = document.querySelector(SEARCH_SELECTOR);
+    const row = document.querySelector(FILTER_ROW);
+    const actifs = new Set();
+    let surSouhaits = false;
+    if (row) {
+      for (const b of row.children) {
+        const t = (b.textContent || '').trim();
+        const actif = /ring-2/.test(b.className || '');
+        if (RARETES.includes(t)) { if (actif) actifs.add(t); continue; }
+        if (/liste de souhaits/i.test(t) && actif) surSouhaits = true;
+      }
+    }
+    /*
+     * `q` est ce que le serveur a renvoyé, donc ce que l'écran montre ; `tape`
+     * est ce qui attend dans le champ. Le bouton agit sur le premier et
+     * s'éteint quand les deux divergent.
+     */
+    return {
+      q: wishVue.q,
+      tape: champ ? champ.value.trim() : '',
+      raretes: actifs,
+      surSouhaits,
+    };
+  }
+
+  /*
+   * Énumérer une recherche. `total` vaut `null` en recherche — c'est
+   * `searchHasMore` qui borne, page après page. Les raretés se filtrent ici
+   * plutôt que côté serveur : le filtre du site est multi-sélection, et un
+   * seul chemin de lecture vaut mieux que deux qui doivent s'accorder.
+   *
+   * `ownedCardIds` n'est rendu que pour les cartes de la page : on l'accumule
+   * au fil des pages, ce qui le rend exact sur exactement ce qu'on a lu.
+   */
+  async function lireRecherche(q, raretes, deja, place, dansLaListe) {
+    const cartes = [];
+    const possedees = new Set();
+    let tronque = false;
+    let freine = 0;
+    let deborde = false;
+    let net = 0;   // ce qui serait réellement écrit, compté au fil de la lecture
+    wishLitPourNous = true;   // nos pages ne sont pas ce que la page affiche
+    try {
+      for (let page = 0; page < WISH_Q_PAGES; page++) {
+        if (page) await sleep(WISH_PAGE_GAP);
+        /*
+         * `wishlist=1` se combine avec `q` côté serveur — vérifié. Un retrait
+         * lit donc ta liste, pas le catalogue : « Beckham » y rend une carte
+         * au lieu de vingt-deux, et deux pages suffisent là où soixante
+         * auraient été lues pour n'en garder presque rien.
+         */
+        const d = await api(
+          `/api/cards?page=${page}&q=${encodeURIComponent(q)}${dansLaListe ? '&wishlist=1' : ''}`,
+        );
+        /*
+         * Un serveur qui freine ne dit pas « fin de liste ». Confondre les
+         * deux ferait armer sur un lot amputé, en annonçant un compte qui
+         * aurait l'air d'être le bon — le pire des deux mondes. On sort en le
+         * disant.
+         */
+        if (d.status === 429 || d.status === 403 || d.retryMs) {
+          freine = d.status;
+          break;
+        }
+        const lot = (d.data && d.data.cards) || [];
+        if (!lot.length) {
+          // Une page vide sur une réponse en erreur n'est pas une fin de liste.
+          tronque = d.status !== 200;
+          break;
+        }
+        for (const id of (d.data && d.data.ownedCardIds) || []) possedees.add(id);
+        for (const c of lot) {
+          if (raretes.size && !raretes.has(c.rarity)) continue;
+          cartes.push({ id: c.id, t: c.wikipedia_title || c.title || c.id, r: c.rarity || '?' });
+          if (deja && !deja.has(c.id) && !possedees.has(c.id)) net++;
+        }
+        /*
+         * Refuser au bout de soixante pages, c'est faire attendre trente
+         * secondes pour dire non. Dès que le net dépasse la place disponible,
+         * la suite de la lecture ne peut plus changer la réponse : on sort.
+         */
+        if (place != null && net > place) {
+          deborde = true;
+          break;
+        }
+        if (!d.data.searchHasMore) break;
+        if (page === WISH_Q_PAGES - 1) tronque = true;
+        wishAllBusy = `lecture ${page + 1}`;
+        paintWishAll();
+      }
+    } finally {
+      wishLitPourNous = false;
+    }
+    return { cartes, possedees, tronque, freine, deborde };
+  }
+
+  /** Les `card_id` déjà souhaités, lus dans la table plutôt que dans le cache. */
+  async function wishlistIds() {
+    const lignes = await sbGet('wishlist_items?select=card_id&limit=5000');
+    return Array.isArray(lignes) ? new Set(lignes.map((l) => l.card_id)) : null;
+  }
+
+  /*
+   * Sans recherche, la cible d'un retrait est la liste entière — mais la barre
+   * peut porter des raretés actives, et le bouton ne doit jamais retirer plus
+   * que ce qui est affiché. La rareté de chaque souhait vit déjà dans le volet
+   * Souhaits ; on s'y adosse plutôt que de relire le catalogue.
+   *
+   * Une carte que ce volet ne connaît pas est écartée, pas incluse : se
+   * tromper en retirant moins se rattrape d'un clic, l'inverse non.
+   */
+  async function souhaitsParRarete(ids, raretes) {
+    if (!raretes.size) return [...ids];
+    const wish = await refreshWishlist(false);
+    const connues = (wish && wish.cards) || {};
+    return [...ids].filter((id) => connues[id] && raretes.has(connues[id].r));
+  }
+
+  /*
+   * Premier clic : lire et armer. Second clic, dans les six secondes : écrire.
+   * Le compte annoncé est le compte NET — ni ce que tu possèdes déjà, ni ce
+   * que tu souhaites déjà. Armer sur le brut ferait promettre 345 pour en
+   * écrire 30.
+   */
+  async function wishAllClick() {
+    if (wishAllBusy) return;
+
+    if (Date.now() < wishAllArme && wishAllLot) {
+      // Un double-clic n'est pas une confirmation : il n'a rien lu.
+      if (Date.now() - wishAllArmeA < WISH_ARME_MIN_MS) return;
+      const lot = wishAllLot;
+      wishAllArme = 0;
+      wishAllLot = null;
+      await wishAllEcrire(lot);
+      return;
+    }
+
+    const barre = wishBarre();
+    /*
+     * Ces deux refus doublent l'extinction du bouton. Un compte rendu encore
+     * affiché le laisse cliquable quelques secondes, et c'est précisément
+     * l'instant où l'on retape une recherche sans la valider.
+     */
+    if (barre.tape !== barre.q) return;           // recherche tapée, pas encore cherchée
+    if (!barre.q && !barre.surSouhaits) return;   // rien d'affiché à souhaiter
+
+    wishAllBusy = 'lecture';
+    wishAllNote = '';
+    paintWishAll();
+    try {
+      const deja = await wishlistIds();
+      if (!deja) {
+        wishDire(
+          prefs.db ? 'base illisible' : 'option décochée',
+          prefs.db
+            ? 'Ta liste de souhaits n’a pas pu être lue, et sans elle le bouton écrirait en '
+              + 'double. Réessaie ; si ça dure, décoche puis recoche « Accès direct à la base ».'
+            : 'Coche « Accès direct à la base » dans les réglages du panneau.',
+        );
+        return;
+      }
+      /*
+       * La place restante n'est un critère d'arrêt que pour un ajout : un
+       * retrait ne remplit rien, il vide.
+       */
+      const place = WISH_SUIVI_MAX - deja.size;
+      const { cartes, possedees, tronque, freine, deborde } = barre.q
+        ? await lireRecherche(
+          barre.q, barre.raretes, deja, barre.surSouhaits ? null : place, barre.surSouhaits,
+        )
+        : { cartes: [], possedees: new Set(), tronque: false, freine: 0, deborde: false };
+
+      if (freine) {
+        wishDire(
+          `serveur freiné · ${freine || 'attente'}`,
+          'Le serveur a demandé de lever le pied pendant la lecture. Rien n’a été écrit, et le '
+            + 'compte aurait été faux. Laisse passer une minute et reclique.',
+        );
+        return;
+      }
+
+      if (barre.surSouhaits) {
+        /*
+         * Vue « Liste de souhaits » : le bouton retire au lieu d'ajouter, sur
+         * exactement le même critère. Sans recherche, c'est la liste entière —
+         * le compte armé le dit, et c'est le seul moyen de la vider.
+         */
+        const cible = barre.q
+          ? cartes.filter((c) => deja.has(c.id)).map((c) => c.id)
+          : await souhaitsParRarete(deja, barre.raretes);
+        wishAllLot = { sens: 'retirer', ids: cible, tronque };
+      } else {
+        const neuves = cartes.filter((c) => !deja.has(c.id) && !possedees.has(c.id));
+        /*
+         * Le plafond ne se rattrape pas en tronquant : garder « les 1 200
+         * premières par ordre alphabétique » n'est le choix de personne. On
+         * refuse, et on dit combien il reste de place — à toi de resserrer,
+         * par une recherche plus étroite ou par une rareté.
+         */
+        if (deborde || neuves.length > place) {
+          const reste = Math.max(0, place);
+          wishDire(
+            place <= 0 ? 'liste pleine'
+              : deborde ? 'recherche trop large'
+                : `${neuves.length - place} de trop`,
+            `Le volet Souhaits ne surveille que ${WISH_SUIVI_MAX} cartes : au-delà, tu remplirais `
+              + 'une liste dont la fin ne serait plus regardée, ce qui est pire que de ne rien '
+              + `ajouter. Tu en souhaites déjà ${deja.size}, il reste donc ${reste} places, et `
+              + (deborde
+                ? 'cette recherche en demande davantage — la lecture s’est arrêtée dès qu’elle '
+                  + 'a débordé, rien n’a été écrit. '
+                : `celle-ci en demande ${neuves.length}. `)
+              + 'Resserre la recherche, ou coche une rareté.',
+          );
+          wishAllLot = null;
+          return;
+        }
+        wishAllLot = { sens: 'ajouter', ids: neuves.map((c) => c.id), tronque };
+      }
+
+      if (!wishAllLot.ids.length) {
+        wishDire(
+          barre.surSouhaits ? 'rien à retirer' : 'rien de neuf',
+          barre.surSouhaits
+            ? 'Aucune carte de cette vue n’est dans ta liste de souhaits.'
+            : 'Tout ce que cette recherche renvoie est déjà souhaité, ou déjà dans ta collection.',
+        );
+        wishAllLot = null;
+        return;
+      }
+      wishAllArmeA = Date.now();
+      wishAllArme = Date.now() + WISH_ARME_MS;
+      setTimeout(() => {
+        if (Date.now() < wishAllArme) return;
+        wishAllArme = 0;
+        wishAllLot = null;
+        paintWishAll();
+      }, WISH_ARME_MS + 100);
+    } finally {
+      wishAllBusy = '';
+      paintWishAll();
+    }
+  }
+
+  async function wishAllEcrire(lot) {
+    const uid = sbUserId();
+    if (!uid) {
+      wishDire(
+        'session illisible',
+        'Ta session n’a pas pu être lue dans cet onglet. Recharge la page ; si ça persiste, '
+          + 'reconnecte-toi au site.',
+      );
+      paintWishAll();
+      return;
+    }
+    wishAllBusy = 'ecriture';
+    wishAllSens = lot.sens;
+    paintWishAll();
+
+    let faits = 0;
+    let echec = null;
+    try {
+      if (lot.sens === 'ajouter') {
+        for (let i = 0; i < lot.ids.length; i += WISH_LOT_ADD) {
+          const tranche = lot.ids.slice(i, i + WISH_LOT_ADD)
+            .map((card_id) => ({ user_id: uid, card_id }));
+          const r = await sbWrite('POST', 'wishlist_items', tranche);
+          if (!r.ok) { echec = r; break; }
+          faits += tranche.length;
+        }
+      } else {
+        for (let i = 0; i < lot.ids.length; i += WISH_LOT_DEL) {
+          const tranche = lot.ids.slice(i, i + WISH_LOT_DEL);
+          const filtre = `user_id=eq.${uid}&card_id=in.(${tranche.join(',')})`;
+          const r = await sbWrite('DELETE', `wishlist_items?${filtre}`);
+          if (!r.ok) { echec = r; break; }
+          faits += tranche.length;
+        }
+      }
+    } finally {
+      wishAllBusy = '';
+      /*
+       * Le volet Souhaits lit une liste mise en cache un quart d'heure : sans
+       * cette péremption, il surveillerait l'ancienne pendant tout ce temps,
+       * c'est-à-dire précisément quand la nouvelle vient d'être posée.
+       */
+      state.wish.at = 0;
+      refreshWishlist(true).catch(() => {});
+      wishDire(
+        echec
+          ? `${faits} sur ${lot.ids.length} — ${echec.status ? `statut ${echec.status}` : echec.raison}`
+          : `${faits} ${lot.sens === 'ajouter' ? 'ajoutées' : 'retirées'}`,
+        echec
+          ? `L’écriture s’est arrêtée en chemin : ${faits} cartes sont bien passées, le reste non. `
+            + 'Recliquer reprend là où ça s’est arrêté — ce qui est déjà écrit est écarté du '
+            + 'compte suivant.'
+          : 'Le site ne redessine pas ses cœurs tout seul — actualise la page pour les voir. '
+            + 'Le volet Souhaits, lui, est déjà à jour.',
+      );
+      paintWishAll();
+    }
+  }
+
+  function injectWishAll() {
+    if (!onGlobal()) return;
+    installWishProxy();
+    const row = document.querySelector(FILTER_ROW);
+    if (!row) return;
+
+    let btn = row.querySelector('[data-wm-wish-all]');
+    if (!btn) {
+      btn = document.createElement('button');
+      btn.dataset.wmWishAll = '1';
+      // Mêmes classes que les filtres du site : la géométrie reste la sienne.
+      btn.className = 'px-3 py-1 rounded-full text-xs font-semibold transition-all cursor-pointer';
+      btn.addEventListener('click', wishAllClick);
+      row.appendChild(btn);
+    }
+    paintWishAll(btn);
+  }
+
+  function paintWishAll(btn) {
+    const b = btn || document.querySelector('[data-wm-wish-all]');
+    if (!b) return;
+
+    const barre = wishBarre();
+    const retire = barre.surSouhaits;
+    let texte;
+    let titre;
+    let actif = true;
+
+    /*
+     * Un lot armé porte son sens avec lui. Si la vue change entre les deux
+     * clics — la bascule « Liste de souhaits » est à deux pastilles de là —
+     * le lot ne correspond plus à ce que l'écran montre : on désarme plutôt
+     * que d'exécuter sur un critère que l'utilisateur ne voit plus.
+     */
+    if (wishAllArme && wishAllLot && wishAllLot.sens !== (retire ? 'retirer' : 'ajouter')) {
+      wishAllArme = 0;
+      wishAllLot = null;
+    }
+
+    if (wishAllBusy.startsWith('lecture')) {
+      const p = wishAllBusy.split(' ')[1];
+      texte = `Lecture${p ? ` · ${p} pages` : '…'}`;
+      titre = 'Énumération de la recherche — 50 cartes par page';
+      actif = false;
+    } else if (wishAllBusy === 'ecriture') {
+      texte = wishAllSens === 'retirer' ? 'Retrait…' : 'Écriture…';
+      titre = 'Envoi à la liste de souhaits';
+      actif = false;
+    } else if (wishAllArme && wishAllLot) {
+      const n = wishAllLot.ids.length;
+      texte = wishAllLot.sens === 'retirer' ? `Retirer ${n} ?` : `Souhaiter ${n} ?`;
+      titre = wishAllLot.tronque
+        ? `Recherche trop large : lecture arrêtée à ${WISH_Q_PAGES} pages, ces ${n} cartes n’en `
+          + 'sont qu’une partie. Reclique pour confirmer.'
+        : 'Reclique pour confirmer. Le bouton se désarme tout seul en six secondes.';
+    } else if (wishAllNote && Date.now() - wishAllNoteAt < WISH_NOTE_MS) {
+      texte = wishAllNote;
+      titre = wishAllNoteTitre;
+    } else if (!prefs.db) {
+      texte = retire ? 'Tout retirer' : 'Tout souhaiter';
+      titre = 'Le site ne publie aucune route d’API pour la liste de souhaits : son propre client '
+        + 'écrit dans la base. Coche « Accès direct à la base » dans les réglages du panneau '
+        + 'pour que ce bouton puisse en faire autant.';
+      actif = false;
+    } else if (barre.tape !== barre.q) {
+      /*
+       * Divergence entre le champ et l'écran : le site n'a pas encore cherché
+       * ce qui est tapé. Agir maintenant porterait sur autre chose que ce qui
+       * est montré — précisément l'erreur que le bouton doit rendre
+       * impossible.
+       */
+      texte = 'Valide la recherche';
+      titre = `Le champ dit « ${barre.tape || '(vide)'} », l’écran montre `
+        + `${barre.q ? `« ${barre.q} »` : 'le catalogue'}. Clique « Rechercher » — le bouton `
+        + 'agit sur ce qui est affiché, jamais sur ce qui est seulement tapé.';
+      actif = false;
+    } else if (retire) {
+      texte = 'Tout retirer';
+      titre = barre.q
+        ? `Retirer de tes souhaits les cartes de la recherche « ${barre.q} »`
+          + (barre.raretes.size ? `, raretés ${[...barre.raretes].join(' ')}` : '')
+        : 'Vider la liste de souhaits entière. Le compte s’affiche avant, et il faut recliquer.';
+    } else if (!barre.q) {
+      texte = 'Tout souhaiter';
+      titre = 'Cherche quelque chose d’abord — « BMW », « Peugeot », un réalisateur. Le bouton '
+        + 'souhaite ce que la recherche affiche, jamais le catalogue.';
+      actif = false;
+    } else {
+      texte = 'Tout souhaiter';
+      titre = `Mettre en souhait les cartes de « ${barre.q} »`
+        + (barre.raretes.size ? `, raretés ${[...barre.raretes].join(' ')}` : '')
+        + '. Les cartes que tu possèdes ou souhaites déjà sont écartées, et le compte exact '
+        + 's’affiche avant toute écriture.';
+    }
+
+    b.textContent = texte;
+    b.title = titre;
+    b.disabled = !actif;
+    b.style.cssText = !actif
+      ? 'color:#626B7A;background:transparent;opacity:.35;cursor:default'
+      : wishAllArme
+        ? 'background:#F5A524;color:#1A1206'
+        : `background:${NEW_TAG_COLOR}30;color:${NEW_TAG_COLOR}`;
   }
 
   /*
@@ -7250,7 +7822,7 @@
       sell.refusVentes = sonde.status;
       sell.refusVentesN = 1;
       sell.note = sonde.status === 403
-        ? 'le marché des cartes est réservé aux comptes PRO (403) — coche « Lecture directe de '
+        ? 'le marché des cartes est réservé aux comptes PRO (403) — coche « Accès direct à '
           + 'la base » dans les réglages : la cote passe alors par la table des enchères, '
           + 'sans l’abonnement'
         : `le serveur a refusé le marché des cartes (statut ${sonde.status || 'réseau'})`;
@@ -7380,7 +7952,7 @@
        * pas vers une page d'abonnement.
        */
       sell.note = sell.refusVentes === 403
-        ? 'le marché des cartes est réservé aux comptes PRO (403) — coche « Lecture directe de '
+        ? 'le marché des cartes est réservé aux comptes PRO (403) — coche « Accès direct à '
           + 'la base » dans les réglages : la cote passe alors par la table des enchères, '
           + 'sans l’abonnement'
         : sell.refusVentesN
@@ -8230,7 +8802,7 @@
             bridé_jusqu_à: p.activity_blocked_until || null }
         : state.dbNote || 'profil illisible';
     } else {
-      rapport.compte = 'coche « Lecture directe de la base » dans les réglages pour lire '
+      rapport.compte = 'coche « Accès direct à la base » dans les réglages pour lire '
         + 'is_pro et les sanctions du compte';
     }
 
