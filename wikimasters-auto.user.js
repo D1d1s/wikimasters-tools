@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WikiMasters Tools
 // @namespace    https://www.wiki-masters.com/
-// @version      2.5.0
+// @version      2.6.0
 // @description  Boîte à outils WikiMasters : ouverture automatique des paquets, suivi des tirages, cote des cartes et revente.
 // @match        https://www.wiki-masters.com/*
 // @match        https://wiki-masters.com/*
@@ -49,7 +49,7 @@
    * disait 1.67 : de quoi chercher longtemps pourquoi un correctif « n'arrive
    * pas ». À tenir à jour avec `@version` en tête de fichier.
    */
-  const VERSION = '2.5.0';
+  const VERSION = '2.6.0';
 
   const CFG = {
     /*
@@ -73,7 +73,14 @@
     // figerait haut pour toute la session, et un nouvel assouplissement du jeu
     // passerait inaperçu.
     probeAfterHits: 40,
-    probeRelax: 0.9,
+    /*
+     * Part de l'ÉCART au plancher de sécurité reprise à chaque détente — pas un
+     * pourcentage de la valeur. Mesuré : à 0,35, revenir d'un plancher de 40 s
+     * demande 520 paquets contre 1 480 avec l'ancienne règle, et un plancher
+     * réellement mesuré à 2 s met toujours 200 paquets à s'effacer. Plus il est
+     * absurde, plus vite il retombe ; près du but, il ne bouge presque plus.
+     */
+    probeRelax: 0.35,
 
     // Une seule remise en vente à la fois, espacée au hasard dans cet
     // intervalle : dix annonces publiées dans la même seconde se remarquent, et
@@ -162,10 +169,11 @@
     guild: { at: 0 },      // relevé de guilde, voir refreshGuild
     karmaVu: {},           // karma réellement observé par rareté, mesuré
     maCollection: null,    // { at, cartes } — lecture complète, gardée une heure
-    aSouhaiter: null,      // dernière liste proposée à la guilde
+    aSouhaiter: null,      // lot en cours, mémorisé — voir saveLot
     publiees: [],          // cartes déjà publiées : le lot suivant en sort d'autres
     guildSeen: {},         // souhaits déjà signalés : id -> horodatage
-    guildNote: '',         // dernier don signalé, visible sans notification
+    guildNote: '',         // dernier don signalé, affiché dans l'onglet Guilde
+    guildNoteAt: 0,        // ... et daté, pour ne pas laisser traîner une alerte périmée
     guildSilence: false,   // premier tour après armement : enregistrer sans alerter
     bids: { at: 0, list: [] },
     slots: { used: 0, max: 10, at: 0 },  // emplacements de vente occupés
@@ -264,11 +272,36 @@
      * cadence, sans qu'aucune décrue de 250 ms ne le rattrape avant des
      * dizaines d'ouvertures. On repart donc du départ et on re-sonde.
      */
-    if (Number.isFinite(s.probeFloorMs)) {
-      state.probeFloorMs = Math.min(CFG.ceilDelayMs, Math.max(0, s.probeFloorMs));
-    }
-    if (Number.isFinite(s.delayMs) && Number.isFinite(s.probeFloorMs)) {
-      state.delayMs = Math.min(CFG.ceilDelayMs, Math.max(floorMs(), s.delayMs));
+    /*
+     * Un plancher écrit par l'ancienne règle n'est pas une mesure : il enflait
+     * à CHAQUE refus d'une série, alors qu'une série ne renseigne qu'une fois.
+     * Sept refus d'affilée le portaient à 40 s — près du plafond — sans que le
+     * serveur ait jamais refusé un délai de 40 s. Ces valeurs-là sont des
+     * artefacts, on les jette une bonne fois ; le prochain refus réel le
+     * réapprendra proprement. Même raisonnement que pour le délai d'avant 1.77
+     * juste en dessous.
+     */
+    /*
+     * Le DÉLAI part avec le plancher. Vu sur un compte réel : plancher remis à
+     * zéro mais délai laissé à 40 s, il redescend alors de 250 ms par paquet
+     * réussi — cent cinquante-sept paquets, soit huit heures, pour revenir d'un
+     * chiffre qui n'avait jamais rien mesuré. Les deux sont le même artefact ;
+     * le premier refus réel les rétablira ensemble.
+     *
+     * Le marqueur porte un nom neuf. Une première version ne remettait que le
+     * plancher et posait déjà `planchersRelus` : là où elle est passée, la
+     * migration complète n'aurait jamais pu s'exécuter. Un marqueur à demi
+     * consommé ne se rattrape pas — il se remplace.
+     */
+    if (!s.debitRecalibre) {
+      saveStore({ debitRecalibre: true, probeFloorMs: 0, delayMs: CFG.startDelayMs });
+    } else {
+      if (Number.isFinite(s.probeFloorMs)) {
+        state.probeFloorMs = Math.min(CFG.ceilDelayMs, Math.max(0, s.probeFloorMs));
+      }
+      if (Number.isFinite(s.delayMs) && Number.isFinite(s.probeFloorMs)) {
+        state.delayMs = Math.min(CFG.ceilDelayMs, Math.max(floorMs(), s.delayMs));
+      }
     }
     if (Number.isFinite(s.cadenceMs)) state.cadenceMs = s.cadenceMs;
     // Le maximum du compteur de pitié s'accumule d'une session à l'autre : c'est
@@ -281,6 +314,7 @@
     // servables déjà vus — l'alerte perdrait son sens dès la deuxième ouverture.
     if (s.guildSeen && typeof s.guildSeen === 'object') state.guildSeen = s.guildSeen;
     if (Array.isArray(s.publiees)) state.publiees = s.publiees;
+    restoreLot(s.lot);
     if (['ench', 'vent', 'rel', 'souh'].includes(s.mktSub)) prefs.mktSub = s.mktSub;
     // Reprise de l'ancien réglage à étiquette unique.
     if (typeof s.sellHideTag === 'string' && s.sellHideTag) sellPrefs.hideTags = [s.sellHideTag];
@@ -288,10 +322,40 @@
     if (typeof s.sellHideTagged === 'boolean') sellPrefs.hideTagged = s.sellHideTagged;
     if (s.bids && Array.isArray(s.bids.list)) state.bids = s.bids;
     if (Array.isArray(s.journal)) state.journal = s.journal;
-    if (s.asks && typeof s.asks === 'object') state.asks = s.asks;
+    /*
+     * Un prix demandé n'est effacé que par la notification qui tranche la
+     * vente — et `/api/notifications` n'en garde que cinquante. Une
+     * notification manquée laissait donc l'entrée à vie. On oublie ce qui
+     * n'aura plus jamais d'issue à confronter.
+     */
+    if (s.asks && typeof s.asks === 'object') {
+      for (const [titre, a] of Object.entries(s.asks)) {
+        if (a && Number.isFinite(a.at) && Date.now() - a.at < ASK_TTL) state.asks[titre] = a;
+      }
+    }
     if (s.lastListing && typeof s.lastListing === 'object') state.lastListing = s.lastListing;
     if (s.myAuctions && typeof s.myAuctions === 'object') state.myAuctions = s.myAuctions;
-    if (s.watch && typeof s.watch === 'object') state.watch = s.watch;
+    /*
+     * Une carte en pause ne repart jamais d'elle-même : sans purge, le volet
+     * Relances devient un cimetière que seul « Tout arrêter » vide. Au-delà de
+     * `WATCH_PAUSE_TTL`, l'inscription a perdu son sens — la carte a été vendue
+     * ailleurs, retirée à la main, ou n'existe plus.
+     */
+    if (s.watch && typeof s.watch === 'object') {
+      for (const [card, w] of Object.entries(s.watch)) {
+        if (!w) continue;
+        /*
+         * Mise en pause par une version qui ne datait pas l'événement. Sans
+         * horodatage, la purge ne pouvait pas s'y appliquer : ces cartes-là
+         * étaient immortelles, et un compte réel en portait sept. On les date
+         * de maintenant — elles ont donc sept jours à partir de la mise à
+         * jour, plutôt que l'éternité.
+         */
+        if (w.paused && !Number.isFinite(w.pausedAt)) w.pausedAt = Date.now();
+        if (w.paused && Date.now() - w.pausedAt > WATCH_PAUSE_TTL) continue;
+        state.watch[card] = w;
+      }
+    }
     // Un créneau écrit sous un intervalle plus long ne doit pas geler la
     // reprise : au plus loin, il vaut un écart complet à partir de maintenant.
     if (Number.isFinite(s.nextRelistAt)) {
@@ -339,6 +403,15 @@
     persistStats();
     // Sans cela le filtre « Nouveaux » resterait actif sur un ensemble vide.
     onlyNew = false;
+    /*
+     * Et la pastille de rareté isolée aussi, pour la même raison — elle ne
+     * l'était pas. Les pastilles disparaissaient avec l'historique, mais le
+     * filtre restait armé : le journal se vidait sans dire pourquoi, sous un
+     * « Voir les 0 R dans la collection → » qui ne menait nulle part. Aucune
+     * pastille à recliquer pour le désarmer, puisqu'il n'y en avait plus.
+     */
+    prefs.logRarity = null;
+    saveStore({ logRarity: null });
     refreshCollection();
     render();
   }
@@ -1709,9 +1782,37 @@
     }
 
     out.ecartees = ecartees;
-    out.dejaSouhaitees = dejaSouhaitees.size;
-    out.dejaPubliees = dejaPubliees.size;
     return out;
+  }
+
+  /*
+   * Le lot survit au rechargement de page — et il le faut.
+   *
+   * Il ne vivait qu'en mémoire, alors que `publiees` — les cartes déjà
+   * annoncées — est mémorisé. Au rechargement, le panneau affichait donc
+   * « Aucun lot en cours » au-dessus de cinq titres déjà postés dans le tchat,
+   * en proposait cinq AUTRES, et `suivreLot` n'avait plus rien à marquer : le
+   * lot suivant ne s'enchaînait jamais. Et ce n'est pas un cas de bord — le
+   * guetteur recharge la page de lui-même toutes les cinq minutes dès que
+   * l'onglet passe en arrière-plan.
+   *
+   * `ecartees` voyage à part : c'est une propriété posée sur le tableau, et
+   * `JSON.stringify` n'en garde que les indices.
+   */
+  function saveLot() {
+    saveStore({
+      lot: state.aSouhaiter && state.aSouhaiter.length
+        ? { cartes: state.aSouhaiter, ecartees: state.aSouhaiter.ecartees || 0 }
+        : null,
+    });
+  }
+
+  function restoreLot(l) {
+    if (!l || !Array.isArray(l.cartes) || !l.cartes.length) return;
+    const lot = l.cartes.filter((c) => c && c.id && c.titre);
+    if (!lot.length) return;
+    lot.ecartees = Number.isFinite(l.ecartees) ? l.ecartees : 0;
+    state.aSouhaiter = lot;
   }
 
   /**
@@ -1750,13 +1851,41 @@
    * fenêtre se referme. C'est donc l'alerte qui ferme la boucle.
    *
    * Deux filtres, et ils comptent autant que l'alerte elle-même :
-   *   - les raretés au bon rendement seulement (R, SR, PC). Signaler une
-   *     Légendaire servable serait signaler ce que tu as décidé de ne pas
-   *     donner — du bruit, et le genre de bruit qui fait couper l'option.
+   *   - `RARETES_UTILES` seulement. Signaler une Légendaire servable serait
+   *     signaler ce que tu as décidé de ne pas donner — du bruit, et le genre
+   *     de bruit qui fait couper l'option.
    *   - jamais une carte étiquetée ou en favori, même règle que la liste
    *     proposée : ce que tu gardes ne se signale pas comme donnable.
    */
   const GUILD_SEEN_MAX = 400;
+
+  /**
+   * Un registre « déjà vu » ne doit pas gonfler indéfiniment : on garde les
+   * `max` plus récents. Les valeurs sont des horodatages — une entrée écrite
+   * par une version antérieure vaut 1, elle sort donc en premier, ce qui est
+   * exactement l'effet voulu.
+   */
+  function bornerVus(registre, max) {
+    const ids = Object.keys(registre);
+    if (ids.length <= max) return registre;
+    const gardes = ids.sort((a, b) => registre[b] - registre[a]).slice(0, max);
+    const frais = {};
+    for (const id of gardes) frais[id] = registre[id];
+    return frais;
+  }
+
+  /**
+   * La dernière chose signalée par la guilde, datée. Elle n'était écrite nulle
+   * part de visible : sans notification bureau — décochée par défaut — un lot
+   * qui s'enchaînait tout seul ne se voyait pas. L'onglet Guilde l'affiche
+   * maintenant, et l'oublie une fois périmée.
+   */
+  const GUILD_NOTE_TTL = 600000;   // même fenêtre que la note du Marché
+
+  function noteGuilde(texte) {
+    state.guildNote = texte;
+    state.guildNoteAt = Date.now();
+  }
 
   async function signalerDons(servables) {
     if (!prefs.watchGuild) return;
@@ -1798,14 +1927,7 @@
     // sans ça, une Légendaire écartée reviendrait à chaque tour de veille.
     for (const s of servables) state.guildSeen[s.id] = Date.now();
 
-    // Le registre ne doit pas gonfler indéfiniment : on garde les plus récents.
-    const ids = Object.keys(state.guildSeen);
-    if (ids.length > GUILD_SEEN_MAX) {
-      const gardes = ids.sort((a, b) => state.guildSeen[b] - state.guildSeen[a]).slice(0, GUILD_SEEN_MAX);
-      const frais = {};
-      for (const id of gardes) frais[id] = state.guildSeen[id];
-      state.guildSeen = frais;
-    }
+    state.guildSeen = bornerVus(state.guildSeen, GUILD_SEEN_MAX);
     saveStore({ guildSeen: state.guildSeen });
 
     if (!neufs.length) return;
@@ -1816,7 +1938,7 @@
     const corps = neufs.length === 1
       ? `${premier.titre} → ${premier.pour} · +${karmaDe(premier.rarete)} karma`
       : neufs.slice(0, 3).map((s) => `${s.rarete} ${s.titre}`).join(' · ');
-    state.guildNote = `${titre} — ${corps}`;
+    noteGuilde(`${titre} — ${corps}`);
     notifyBid(titre, corps);
     render();
   }
@@ -1852,10 +1974,11 @@
       const suivant = await suggestWishes(LOT_SOUHAITS, false);
       if (suivant && suivant.length) {
         state.aSouhaiter = suivant;
-        state.guildNote = 'Lot épuisé — le suivant est prêt à publier.';
+        noteGuilde('Lot épuisé — le suivant est prêt à publier.');
         notifyBid('Lot donné', 'Le lot suivant est prêt à copier.');
       }
     }
+    saveLot();
     render();
   }
 
@@ -2551,8 +2674,26 @@
   /*
    * Tes ventes. Pas de badge à surveiller ici : ce qui compte est l'échéance,
    * et le passage d'« aucune offre » à une première mise.
+   *
+   * Le relevé est appelé de trois endroits — le tour du guetteur (15 s), le
+   * bouton « rafraîchir », et le tick des relances — et il coûte jusqu'à
+   * treize requêtes séquentielles sur le chemin de repli. Sans garde, deux
+   * appelants se croisaient et doublaient le trafic PRÉCISÉMENT quand le
+   * serveur ralentit, c'est-à-dire quand il faut lever le pied. Le tour manqué
+   * n'est pas perdu : les échéances sont absolues, la ligne précédente reste
+   * juste, et `reconcileWatch` refuse déjà d'agir sur un relevé périmé.
    */
   async function scanSales() {
+    if (scanSales.busy) return;
+    scanSales.busy = true;
+    try {
+      await scanSalesVraiment();
+    } finally {
+      scanSales.busy = false;
+    }
+  }
+
+  async function scanSalesVraiment() {
     const list = await fetchMySales();
     if (!list) return;
     const before = new Map((state.sales.list || []).map((s) => [s.title, s]));
@@ -2654,6 +2795,9 @@
 
   const awayLongEnough = () => hiddenSince && Date.now() - hiddenSince > AWAY_BEFORE_RELOAD;
 
+  // Un tour de guetteur encore en vol : le suivant passe son chemin.
+  let tickBusy = false;
+
   function bidTick() {
     if (!prefs.watchBids) return;
 
@@ -2663,12 +2807,24 @@
      * pendant que tu consultes le Marché est insupportable, et c'est ce qu'il
      * faisait. Il ne reprend la main qu'en arrière-plan.
      */
-    // Les ventes viennent de l'API : ni onglet ni page particulière.
-    (async () => {
-      await scanSales();
-      await syncJournal();
-      await reconcileWatch();
-    })();
+    /*
+     * Les ventes viennent de l'API : ni onglet ni page particulière. La chaîne
+     * porte son propre drapeau — les trois relevés en ont chacun un, mais rien
+     * n'empêchait le tour SUIVANT de démarrer sur un tour encore en vol, et
+     * d'empiler des chaînes qui se marchent dessus.
+     */
+    if (!tickBusy) {
+      tickBusy = true;
+      (async () => {
+        try {
+          await scanSales();
+          await syncJournal();
+          await reconcileWatch();
+        } finally {
+          tickBusy = false;
+        }
+      })();
+    }
 
     /*
      * L'écran reste la seule source pour DÉCOUVRIR une annonce trop ancienne
@@ -3137,9 +3293,9 @@
    * décision. On guette donc sa disparition et on repart.
    *
    * C'est bien **toi** qui coches : le script ne touche jamais à la case, il
-   * observe seulement que l'invite a quitté la page. Un plafond de dix minutes
-   * évite qu'un onglet oublié redémarre tout seul beaucoup plus tard, dans un
-   * contexte que tu n'as plus en tête.
+   * observe seulement que l'invite a quitté la page. La veille s'arrête au bout
+   * d'une heure, pour qu'un onglet oublié ne redémarre pas tout seul beaucoup
+   * plus tard, dans un contexte que tu n'as plus en tête.
    */
   const HUMAN_WAIT_MS = 3600000;   // on veille une heure : au-delà, l'onglet est oublié
   const HUMAN_NAG_MS = 30000;      // rappel sonore tant que la case attend
@@ -3199,16 +3355,34 @@
     setTimeout(restore, 120000);
   }
 
+  /*
+   * UN contexte audio, gardé.
+   *
+   * Il en naissait un par bip, jamais fermé. Le rappel de vérification humaine
+   * sonne toutes les trente secondes pendant jusqu'à une heure : cent vingt
+   * contextes, alors que le navigateur en plafonne le nombre par document.
+   * Passé la limite, la construction lève, le `catch` avale, et l'alerte
+   * s'éteignait EN SILENCE — exactement dans la situation qu'elle sert, quand
+   * tu n'es pas devant l'écran et que la réserve se remplit.
+   */
+  let audio = null;
+
   function beep() {
     try {
-      const ctx = new (window.AudioContext || window.webkitAudioContext)();
-      const osc = ctx.createOscillator();
-      const gain = ctx.createGain();
+      if (!audio) audio = new (window.AudioContext || window.webkitAudioContext)();
+      // Un contexte né hors d'un geste de l'utilisateur arrive suspendu.
+      if (audio.state === 'suspended') audio.resume();
+      const osc = audio.createOscillator();
+      const gain = audio.createGain();
       osc.frequency.value = 880;
       gain.gain.value = 0.05;
-      osc.connect(gain).connect(ctx.destination);
+      osc.connect(gain).connect(audio.destination);
+      // Les nœuds ne se libèrent pas tout seuls tant qu'ils restent branchés.
+      osc.onended = () => {
+        try { gain.disconnect(); } catch (_) {}
+      };
       osc.start();
-      osc.stop(ctx.currentTime + 0.25);
+      osc.stop(audio.currentTime + 0.25);
     } catch (_) {
       /* pas de son disponible : le panneau et le titre suffisent */
     }
@@ -3330,7 +3504,7 @@
     state.packsReadAt = Date.now();
 
     if (!sbToken()) {
-      state.dbNote = 'Pas de session Supabase lisible — reconnecte-toi au site.';
+      state.dbNote = 'Session du jeu illisible — reconnecte-toi au site.';
       render();
       return null;
     }
@@ -3338,9 +3512,19 @@
     const rep = await sbRpc('get_my_profile', {});
     const p = Array.isArray(rep) ? rep[0] : rep;
     if (!p || typeof p !== 'object') {
-      // Fonction absente, renommée, ou refusée : on le dit une fois plutôt que
-      // de réessayer en silence toutes les minutes sans que rien n'apparaisse.
-      state.dbNote = 'get_my_profile : aucune réponse exploitable (essaie wmSchema() dans la console).';
+      /*
+       * Fonction absente, renommée, ou refusée : on le dit une fois plutôt que
+       * de réessayer en silence toutes les minutes sans que rien n'apparaisse.
+       *
+       * Mais on le dit à qui de droit. Le panneau annonce la CONSÉQUENCE et le
+       * geste qui la lève ; le nom de la fonction serveur et l'invite à taper
+       * dans la console s'adressent à qui écrit le script, pas à qui l'utilise
+       * — ils vont donc en console, où `diagCote()` les attend déjà.
+       */
+      state.dbNote = 'La base n’a pas répondu — la réserve reste estimée. '
+        + 'Décoche puis recoche « Lecture directe » pour réessayer.';
+      console.info('[WikiMasters Tools] get_my_profile : aucune réponse exploitable.'
+        + ' Voir wmSchema() pour les tables lisibles.');
       render();
       return null;
     }
@@ -3429,11 +3613,21 @@
     }
     if (state.balance != null) extra.push(`${state.balance} wikibidous`);
 
+    /*
+     * Le repli n'énumérait plus les colonnes trouvées à l'écran. C'était une
+     * trace de mise au point — le schéma d'une table du jeu — affichée dans un
+     * onglet de réglages, où elle n'apprend rien à personne et ressemble à une
+     * fuite. Elle part en console, à côté du reste du diagnostic.
+     */
+    if (!lu) {
+      console.info('[WikiMasters Tools] get_my_profile ne porte pas les paquets — colonnes reçues :',
+        Object.keys(p).slice(0, 12).join(', '));
+    }
     const etat = lu
       ? `Réserve lue en base : ${state.reserve == null ? '?' : state.reserve}/${MAX_RESERVE}` +
         ` · cadence ${fmtClock(state.cadenceMs)}${p.is_pro ? ' (PRO)' : ''}` +
         (extra.length ? ` · ${extra.join(' · ')}` : '')
-      : `get_my_profile ne porte pas les paquets — colonnes : ${Object.keys(p).slice(0, 12).join(', ')}`;
+      : 'La base ne renvoie pas le compte de paquets — la réserve reste estimée.';
     state.dbNote = alertes.length ? `⚠ ${alertes.join(' · ')} — ${etat}` : etat;
 
     /*
@@ -3508,13 +3702,18 @@
     }
   }
 
-  /** Un bonus rend les mêmes cartes qu'une ouverture normale — sinon on le signale. */
+  /**
+   * Un bonus rend les mêmes cartes qu'une ouverture normale — sinon on le
+   * signale. Un code HTTP nu ne dit rien à qui utilise l'outil : l'écran
+   * annonce que le paquet n'a pas pu être pris, le statut va en console.
+   */
   function absorbBonus({ status, data }, label) {
     if (status === 200 && data && Array.isArray(data.cards)) {
       record(data.cards, label);
       state.bonusNote = `${label} réclamé`;
     } else {
-      state.bonusNote = `${label} : réponse ${status} non exploitée`;
+      state.bonusNote = `${label} : indisponible pour l'instant`;
+      console.info(`[WikiMasters Tools] ${label} — réponse ${status} non exploitée`);
     }
     render();
   }
@@ -3597,15 +3796,24 @@
          * un mur déjà rencontré.
          *
          * Ce mur bouge, lui : le jeu a déjà assoupli son débit une fois. Après
-         * une longue série sans refus on rabote donc le plancher appris de
-         * 10 %, ce qui fait redescendre le délai d'un cran. Si c'était trop
-         * tôt, le 429 suivant le remonte immédiatement — au pire un aller-
-         * retour tous les quarante paquets.
+         * une longue série sans refus on rabote donc le plancher appris, ce qui
+         * fait redescendre le délai d'un cran. Si c'était trop tôt, le 429
+         * suivant le remonte — au pire un aller-retour tous les quarante paquets.
+         *
+         * On mord une PART DE L'ÉCART au plancher de sécurité, pas un
+         * pourcentage de la valeur. Les deux se valent près du but ; loin, non :
+         * à 10 % de la valeur, revenir de 40 s demandait 1 520 paquets sans le
+         * moindre refus, soit trois jours de fonctionnement continu — un
+         * plancher appris par accident s'installait donc à demeure. En part
+         * d'écart, plus il est absurde, plus vite il retombe, et près du
+         * plancher de sécurité il ne bouge presque plus : c'est là qu'il faut
+         * être prudent, pas à 40 s.
          */
         state.delayMs = Math.max(floorMs(), state.delayMs - CFG.decayMs);
         if (state.probeFloorMs && ++state.cleanHits >= CFG.probeAfterHits) {
           state.cleanHits = 0;
-          const relaxed = Math.round(state.probeFloorMs * CFG.probeRelax);
+          const ecart = state.probeFloorMs - CFG.floorDelayMs;
+          const relaxed = state.probeFloorMs - Math.max(CFG.decayMs, Math.round(ecart * CFG.probeRelax));
           state.probeFloorMs = relaxed <= CFG.floorDelayMs ? 0 : relaxed;
         }
         saveStore({ delayMs: state.delayMs, probeFloorMs: state.probeFloorMs });
@@ -3660,7 +3868,20 @@
       if (status === 429) {
         state.throttles += 1;
         state.cleanHits = 0;
-        state.probeFloorMs = Math.min(CFG.ceilDelayMs, Math.round(state.delayMs * 1.1));
+        /*
+         * Seul le PREMIER refus d'une série renseigne sur le débit soutenable.
+         * Les suivants tombent alors qu'on recule déjà : ce n'est pas une
+         * mesure nouvelle, c'est le même incident qui se prolonge. Les compter
+         * faisait enfler le plancher en composé — sept refus d'affilée le
+         * portaient à 40 s, soit près du plafond, d'où l'on ne redescendait
+         * qu'en 1 520 paquets sans le moindre refus.
+         *
+         * Le délai courant, lui, continue de doubler : c'est le recul, et il
+         * doit bien répondre à chaque refus.
+         */
+        if (state.throttles === 1) {
+          state.probeFloorMs = Math.min(CFG.ceilDelayMs, Math.round(state.delayMs * 1.1));
+        }
         state.delayMs = Math.min(CFG.ceilDelayMs, Math.round(state.delayMs * CFG.growth));
         saveStore({ delayMs: state.delayMs, probeFloorMs: state.probeFloorMs });
         if (state.throttles > CFG.maxThrottleRetries) {
@@ -3673,7 +3894,15 @@
         continue;
       }
 
-      return stop(`Réponse inattendue (${status}) : ${JSON.stringify(data).slice(0, 120)}`, true);
+      /*
+       * La charge utile allait à l'écran — 120 caractères de réponse serveur
+       * bruts, dans la ligne d'état, celle qu'on voit depuis tous les onglets.
+       * On ne sait pas ce que le serveur y met, et l'utilisateur n'en fait
+       * rien : le panneau dit que la boucle s'arrête et sur quel statut, la
+       * réponse va en console pour qui saura la lire.
+       */
+      console.info(`[WikiMasters Tools] réponse inattendue (${status}) :`, data);
+      return stop(`Réponse inattendue du serveur (${status}) — boucle arrêtée.`, true);
     }
   }
 
@@ -3831,6 +4060,20 @@
    * Le tout vit dans un Shadow DOM : le CSS du site ne peut pas le déformer,
    * et le nôtre ne fuit pas sur le site.
    */
+  /*
+   * Plancher typographique : 10 px.
+   *
+   * Le panneau est dense à dessein — 300 px de large, il tient de l'outil, pas
+   * de la page — et 10 à 12 px y sont la bonne échelle. Mais cinq règles
+   * descendaient à 9 px : les pastilles de compte des volets, les étiquettes du
+   * Marché, la numérotation du lot de guilde et sa ligne de méta. C'est en
+   * dessous de ce qui se lit, et ces mêmes règles portaient le ton le plus
+   * faible de la palette — les deux difficultés cumulées au même endroit.
+   *
+   * Le palier de 9 px est donc supprimé, pas la densité : 10 et 11 px restent
+   * l'échelle du panneau, et c'est un choix, pas un oubli. Si un jour une règle
+   * redescend sous 10 px, c'est ce commentaire qu'il faut contredire.
+   */
   const PANEL_CSS = `
     :host { all: initial; }
     * { box-sizing: border-box; margin: 0; }
@@ -3841,7 +4084,19 @@
       --line: rgba(255,255,255,.07);
       --text: #F1F4F8;
       --muted: #949DAD;
-      --dim: #626B7A;
+      /*
+       * #626B7A tombait à 3,59:1 sur le fond du panneau — mesuré au pixel sur
+       * un rendu réel, translucidité comprise — soit sous le plancher WCAG AA
+       * de 4,5:1. Or c'est le ton des textes de 9 à 11 px : le plus petit
+       * portait le plus faible contraste, les deux difficultés au même endroit.
+       *
+       * #717C8D atteint 4,57:1 à teinte et saturation identiques (218°, 11 %),
+       * et 4,54:1 sur le fond légèrement plus clair de la Revente — une seule
+       * valeur pour les deux palettes. Il reste une fois et demie moins
+       * contrasté que « --muted » : la hiérarchie des trois niveaux de gris
+       * tient, elle se lit simplement jusqu'au bout.
+       */
+      --dim: #717C8D;
       --live: #35D68F;
       --warn: #F0A94B;
       --sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI Variable", "Segoe UI", sans-serif;
@@ -3863,7 +4118,10 @@
        le décompte fait danser tout ce qui l'entoure à chaque seconde. */
     .status b, .legend b, .fig b, .goal .cnt, .bids { font-variant-numeric: tabular-nums; }
 
-    .head { display: flex; align-items: center; gap: 9px; padding: 13px 14px; cursor: grab; }
+    /* « touch-action: none » : sans lui, le navigateur préempte le geste pour
+       faire défiler la page et le panneau ne suit jamais le doigt. */
+    .head { display: flex; align-items: center; gap: 9px; padding: 13px 14px; cursor: grab;
+            touch-action: none; }
     .head:active { cursor: grabbing; }
     .panel:not(.folded) .head { border-bottom: 1px solid var(--line); }
 
@@ -3872,6 +4130,22 @@
     .panel.warn .mark { background: var(--warn); box-shadow: 0 0 0 3px rgba(240,169,75,.18); }
 
     .title { font-size: 13px; font-weight: 600; letter-spacing: -.01em; }
+    /*
+     * La version ne vivait que dans la console : « console.info » au démarrage et
+     * « __wmAuto.version ». Or c'est LE numéro qu'on cite pour demander de l'aide,
+     * et la mise à jour se fait toute seule, en silence, sous 24 h — rien
+     * n'indiquait donc sur quoi on tournait.
+     *
+     * « user-select: text » à dessein : l'hôte porte « user-select: none »
+     * pour que le glissé ne surligne pas la page. Affiché sans cette exception,
+     * le numéro n'aurait pas été copiable, ce qui lui retire l'essentiel de son
+     * intérêt.
+     */
+    .ver {
+      flex: none; color: var(--dim); font-size: 10px; font-weight: 500;
+      font-variant-numeric: tabular-nums; letter-spacing: 0;
+      -webkit-user-select: text; user-select: text; cursor: text;
+    }
     /* Replié, l'en-tête doit suffire : il affiche le compte à rebours. */
     /* Le décompte vit dans l'onglet Paquets ; ailleurs il remonte dans l'en-tête
        pour rester sous les yeux sans dupliquer l'affichage. */
@@ -3909,7 +4183,10 @@
     .bar { height: 3px; border-radius: 2px; background: var(--raise); margin-top: -8px; overflow: hidden; }
     .bar i { display: block; height: 100%; border-radius: 2px; background: var(--live);
              width: 0; transition: width .5s linear; }
-    .bar.idle { opacity: 0; }
+    /* « display: none » et non « opacity: 0 » : effacée, la barre gardait ses
+       3 px et son « gap ». Avec le ruban vide juste en dessous, ça faisait une
+       vingtaine de pixels de rien entre le statut et les compteurs. */
+    .bar.idle { display: none; }
 
     /* La réserve n'apparaît que si elle contient quelque chose : le script la
        vide en continu, une jauge permanente n'afficherait jamais rien. */
@@ -3921,6 +4198,9 @@
     /* Ruban des derniers tirages : une encoche par carte, teintée par rareté.
        Les communes restent sourdes, donc une trouvaille saute aux yeux. */
     .ribbon { display: flex; gap: 2px; align-items: flex-end; height: 18px; }
+    /* Sa hauteur est fixe pour que les encoches ne fassent pas sauter la mise
+       en page ; sans tirage, elle n'a rien à réserver. */
+    .ribbon:empty { display: none; }
     .tick { flex: 1; min-width: 2px; border-radius: 1px; background: var(--c); height: 40%; opacity: .35; }
     .tick.hi { height: 100%; opacity: 1; }
     .tick.mid { height: 70%; opacity: .8; }
@@ -4005,8 +4285,15 @@
       color: var(--dim); font-size: 10px; font-weight: 600; text-decoration: none;
       cursor: pointer; opacity: 0; transition: .14s;
     }
-    .row:hover .go { opacity: 1; }
+    /* Au survol, mais aussi au focus : un contour dessiné autour d'un élément
+       transparent ne dit rien à qui navigue au clavier. */
+    .row:hover .go, .row .go:focus-visible { opacity: 1; }
     .row .go:hover { background: var(--raise); color: var(--text); }
+    /* Un écran tactile n'a pas de survol : les deux raccourcis y étaient
+       simplement inatteignables. On les y montre en retrait. */
+    @media (hover: none) {
+      .row .go { opacity: .55; }
+    }
 
     .bids { display: flex; gap: 10px; align-items: baseline; font-size: 12px; text-decoration: none; cursor: pointer; }
     .bids .lead { color: var(--text); }
@@ -4031,7 +4318,7 @@
     .subs button.on { color: var(--text); background: var(--raise); }
     .subs .cnt {
       flex: none; padding: 1px 4px; border-radius: 999px; background: rgba(255,255,255,.08);
-      color: var(--muted); font: 600 9px/1.4 var(--sans); font-variant-numeric: tabular-nums;
+      color: var(--muted); font: 600 10px/1.4 var(--sans); font-variant-numeric: tabular-nums;
       font-style: normal;
     }
     .subs .cnt.hot { background: color-mix(in srgb, var(--warn) 22%, transparent); color: var(--warn); }
@@ -4079,7 +4366,7 @@
     .mkt li.done .dot { background: var(--dim); }
     .mkt .t { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
               font-size: 11px; color: var(--text); }
-    .mkt .tag { flex: none; font-size: 9px; color: var(--live); }
+    .mkt .tag { flex: none; font-size: 10px; color: var(--live); }
     .mkt li.out .tag { color: var(--warn); }
     .mkt .v { flex: none; font-size: 11px; color: var(--muted); font-variant-numeric: tabular-nums; }
     .mkt .e { flex: none; min-width: 40px; text-align: right; font-size: 10px; color: var(--dim);
@@ -4130,6 +4417,12 @@
              font-size: 10px; line-height: 1.5; color: var(--dim); }
     .gskip b { color: var(--muted); font-weight: 600; }
 
+    /* Le dernier événement signalé. Il vaut ce que vaut une notification qu'on
+       aurait ratée : présent, discret, et il s'efface de lui-même. */
+    .gnote { margin-bottom: 7px; padding: 6px 9px; border-radius: 8px;
+             background: color-mix(in srgb, var(--live) 9%, transparent);
+             color: var(--live); font-size: 10px; line-height: 1.45; }
+
     /*
      * Le bloc qui porte le levier : ce n'est pas une statistique, c'est un
      * geste — copier une liste et la coller dans le canal de la guilde. Il est
@@ -4174,16 +4467,16 @@
     .glot { list-style: none; margin: 6px 0 0; padding: 0; display: grid; gap: 3px; }
     .glot li { display: flex; align-items: baseline; gap: 6px; font-size: 11px; color: var(--muted); }
     .glot .num {
-      flex: none; width: 13px; font-style: normal; font-size: 9px; text-align: center;
+      flex: none; width: 14px; font-style: normal; font-size: 10px; text-align: center;
       color: var(--dim); font-variant-numeric: tabular-nums;
     }
     .glot b { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis;
               white-space: nowrap; font-weight: 500; color: var(--text); }
-    .glot span { flex: none; font-size: 9px; color: var(--dim); }
+    .glot span { flex: none; font-size: 10px; color: var(--dim); }
     .glot .prete b { color: var(--c); }
     .glot .prete span { color: var(--live); }
     .glot .fait b { color: var(--dim); text-decoration: line-through; }
-    .gmeta { margin-top: 6px; font-size: 9px; color: var(--dim); }
+    .gmeta { margin-top: 6px; font-size: 10px; color: var(--dim); }
 
 
     .mkfoot { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 8px;
@@ -4213,6 +4506,10 @@
       .mkt .tag { display: none; }
       .relist .suivi .w { display: none; }
       .subs button { font-size: 10px; gap: 3px; }
+      /* L'en-tête porte déjà le titre, le décompte, replier et Start : à la
+         borne basse, la version le ferait passer à la ligne. Elle reste en
+         toutes lettres au pied des Réglages. */
+      .ver { display: none; }
     }
 
     .relist[hidden] { display: none; }
@@ -4254,8 +4551,10 @@
     .relist .st { flex: none; font-size: 10px; color: var(--dim); }
     .relist li.ok .st { color: var(--live); }
     .relist li.pause .st { color: var(--warn); }
+    /* 20 px, pas 16 : ✕ retire la carte du suivi, et c'était la plus petite
+       cible du panneau — collée à ↻, qui lui ne fait rien de définitif. */
     .relist .x {
-      flex: none; width: 16px; height: 16px; padding: 0; line-height: 1;
+      flex: none; width: 20px; height: 20px; padding: 0; line-height: 1;
       font: 10px/1 var(--sans); color: var(--dim); background: transparent;
       border: 0; border-radius: 4px; cursor: pointer;
     }
@@ -4319,6 +4618,38 @@
     /* Le Marché empile plus de blocs que les autres onglets : ils se serrent. */
     .tab[data-tab="marche"].on { gap: 10px; }
     .panel.folded .tabs { display: none; }
+    /*
+     * Les Réglages étaient six cases à plat, dans un ordre qui mélangeait ce
+     * que le panneau FAIT à ta place et ce qu'il se contente de LIRE — les
+     * notifications tombaient entre deux réclamations automatiques. La
+     * distinction existait dans les valeurs par défaut, et dans le commentaire
+     * qui les justifie ; elle n'était nulle part à l'écran. Deux intertitres
+     * suffisent, sans rien déplacer d'autre.
+     */
+    .sect { color: var(--dim); font-size: 10px; font-weight: 600;
+            letter-spacing: .04em; text-transform: uppercase; }
+    /* Le titre appartient au groupe qu'il ouvre : il s'en rapproche, et le
+       second s'écarte du groupe précédent — sinon les six cases restent une
+       liste unique avec deux lignes de texte dedans. */
+    .sect + .opt, .sect + .tune { margin-top: -8px; }
+    .sect.suite { margin-top: 2px; padding-top: 12px; border-top: 1px solid var(--line); }
+    /* Trois relevés qui se lisent ensemble : espacés du gap de l'onglet plus
+       leur propre marge, ils se dispersaient en pavé gris. */
+    .tune + .tune { margin-top: -7px; }
+    /* Ce que le panneau ne fera jamais seul, dit là où on cherche ce qu'il fait. */
+    .note-vente { margin-top: -2px; color: var(--dim); font-size: 10px; line-height: 1.5; }
+    .note-vente b { color: var(--muted); font-weight: 600; }
+
+    /* Le pied de l'onglet Réglages : la version, en toutes lettres et
+       sélectionnable. L'en-tête la porte aussi, mais il l'escamote sur un
+       panneau étroit — ici elle est toujours là. */
+    .apropos {
+      margin-top: 2px; padding-top: 10px; border-top: 1px solid var(--line);
+      color: var(--dim); font-size: 10px; line-height: 1.5;
+      -webkit-user-select: text; user-select: text;
+    }
+    .apropos b { color: var(--muted); font-weight: 600; font-variant-numeric: tabular-nums; }
+
     .opt { display: flex; gap: 9px; align-items: center; padding: 5px 0; cursor: pointer; color: var(--muted); font-size: 12px; }
     .opt:hover { color: var(--text); }
     .opt input { accent-color: var(--live); margin: 0; width: 14px; height: 14px; }
@@ -4340,8 +4671,10 @@
     .panel { position: relative; }
     /* Poignée de redimensionnement : largeur du panneau et hauteur du journal. */
     .grip {
-      position: absolute; right: 2px; bottom: 2px; width: 14px; height: 14px;
-      cursor: nwse-resize; z-index: 5;
+      /* 18 px plutôt que 14 : la poignée se vise au doigt depuis qu'elle
+         répond au tactile, et 14 px ne s'attrapent pas. */
+      position: absolute; right: 2px; bottom: 2px; width: 18px; height: 18px;
+      cursor: nwse-resize; z-index: 5; touch-action: none;
       background:
         linear-gradient(135deg, transparent 45%, var(--dim) 45%, var(--dim) 55%, transparent 55%),
         linear-gradient(135deg, transparent 70%, var(--dim) 70%, var(--dim) 80%, transparent 80%);
@@ -4380,6 +4713,7 @@
         <div class="head" data-head>
           <span class="mark"></span>
           <span class="title">WikiMasters Tools</span>
+          <span class="ver" title="Version installée. Les mises à jour se font seules, sous 24 h environ.">${VERSION}</span>
           <b class="mini" data-mini></b>
           <button class="icon" data-fold title="Replier">–</button>
           <button class="run" data-toggle>Start</button>
@@ -4436,12 +4770,17 @@
           </section>
 
           <section class="tab" data-tab="reglages">
+            <div class="sect">Ce qu'il fait à ta place</div>
             <label class="opt"><input type="checkbox" data-opt-autostart> Démarrer automatiquement</label>
             <label class="opt" title="Après une vérification humaine, repart dès que tu as coché la case — sans repasser par Start. Le script ne coche jamais la case lui-même."><input type="checkbox" data-opt-autoresume> Reprise après vérification</label>
-            <label class="opt"><input type="checkbox" data-opt-notify> Notifications bureau</label>
             <label class="opt"><input type="checkbox" data-opt-bonus> Réclamer les paquets bonus</label>
             <label class="opt" title="Clique le bouton Réclamer du site pour chaque succès débloqué, quand tu es sur la page Succès"><input type="checkbox" data-opt-autoclaim> Réclamer les récompenses de succès</label>
+            <div class="sect suite">Ce qu'il lit et te signale</div>
             <label class="opt" title="Lit tes propres lignes dans la base du jeu, avec la session déjà ouverte dans cet onglet : réserve exacte et liste complète des ventes, là où l'API du site ne renvoie plus que des compteurs. Le jeton n'est ni stocké, ni journalisé, ni exporté."><input type="checkbox" data-opt-db> Lecture directe de la base</label>
+            <label class="opt"><input type="checkbox" data-opt-notify> Notifications bureau</label>
+            <div class="note-vente">Mettre en vente et donner restent à ta main. Les relances
+              automatiques se cochent dans <b>Marché</b>, et le panneau ne donne jamais seul.</div>
+            <div class="sect suite">Ce qu'il mesure</div>
             <div class="tune" data-tuning></div>
             <div class="tune" data-bonusnote></div>
             <div class="tune" data-dbnote></div>
@@ -4449,6 +4788,9 @@
               <button data-csv>Export CSV</button>
               <button data-json>Export JSON</button>
             </div>
+            <div class="apropos">WikiMasters Tools <b>${VERSION}</b> — mise à jour
+              automatique, sous 24 h environ. C'est ce numéro qu'on te demandera
+              sur le Discord.</div>
           </section>
         </div>
       </div>`;
@@ -4586,6 +4928,22 @@
       if (row) return void goFilteredTo('/marketplace', row.dataset.open);
     });
 
+    /*
+     * Entrée et Espace sur une ligne valent le clic. On repasse par `click()`
+     * plutôt que de rejouer la navigation : la décision de « où mène cette
+     * ligne » reste écrite à un seul endroit, juste au-dessus.
+     *
+     * `preventDefault` sur Espace est indispensable — sans lui, la barre fait
+     * défiler le corps du panneau en même temps qu'elle active la ligne.
+     */
+    ui.market.addEventListener('keydown', (e) => {
+      if (e.key !== 'Enter' && e.key !== ' ') return;
+      const ligne = e.target.closest('[data-auction], [data-open]');
+      if (!ligne) return;
+      e.preventDefault();
+      ligne.click();
+    });
+
     ui.mkfoot.addEventListener('click', (e) => {
       if (e.target.closest('[data-mk-refresh]')) refreshMarket();
     });
@@ -4711,7 +5069,10 @@
         if (refaire) {
           bouton.textContent = '…';
           const neuf = await suggestWishes(LOT_SOUHAITS, true);
-          if (neuf && neuf.length) state.aSouhaiter = neuf;
+          if (neuf && neuf.length) {
+            state.aSouhaiter = neuf;
+            saveLot();
+          }
           renderGuild();
           return;
         }
@@ -4737,6 +5098,7 @@
             bouton.textContent = 'Collection illisible — active la lecture de la base';
             return;
           }
+          saveLot();
           renderGuild();
           return;
         }
@@ -4852,35 +5214,49 @@
     requestAnimationFrame(clampPanel);
   }
 
-  /** Glisser la poignée élargit le panneau et allonge le journal. */
+  /*
+   * Glisser la poignée élargit le panneau et allonge le journal.
+   *
+   * En `pointer*` et non en `mouse*` : les seconds ne parlent qu'à la souris,
+   * si bien que sur un écran tactile le panneau ne se déplaçait ni ne se
+   * redimensionnait. Le défaut se payait justement là où il coûte le plus —
+   * sous 640 px le panneau démarre REPLIÉ, donc le premier geste attendu
+   * était celui qui ne répondait pas.
+   *
+   * `setPointerCapture` remplace les écouteurs posés sur la fenêtre : les
+   * événements suivants reviennent à la poignée même si le doigt en sort, et
+   * ils se libèrent tout seuls au relâchement. Un contact interrompu — appel
+   * entrant, geste système — émet `pointercancel`, qu'il faut traiter comme
+   * une fin : sans lui le panneau resterait collé au doigt.
+   */
   function makeResizable() {
     let x0 = 0, y0 = 0, w0 = 0, h0 = 0, actif = false;
+    const hauteurJournal = () =>
+      parseInt(getComputedStyle(ui.panel).getPropertyValue('--logh')) || 128;
 
-    ui.grip.addEventListener('mousedown', (e) => {
+    ui.grip.addEventListener('pointerdown', (e) => {
       actif = true;
       x0 = e.clientX;
       y0 = e.clientY;
       w0 = ui.box.offsetWidth;
-      h0 = parseInt(getComputedStyle(ui.panel).getPropertyValue('--logh')) || 128;
+      h0 = hauteurJournal();
+      ui.grip.setPointerCapture(e.pointerId);
       e.preventDefault();
       e.stopPropagation(); // sinon l'en-tête croirait qu'on déplace le panneau
     });
 
-    addEventListener('mousemove', (e) => {
+    ui.grip.addEventListener('pointermove', (e) => {
       if (!actif) return;
       applySize({ w: w0 + (e.clientX - x0), h: h0 + (e.clientY - y0) });
     });
 
-    addEventListener('mouseup', () => {
+    const fini = () => {
       if (!actif) return;
       actif = false;
-      saveStore({
-        size: {
-          w: ui.box.offsetWidth,
-          h: parseInt(getComputedStyle(ui.panel).getPropertyValue('--logh')) || 128,
-        },
-      });
-    });
+      saveStore({ size: { w: ui.box.offsetWidth, h: hauteurJournal() } });
+    };
+    ui.grip.addEventListener('pointerup', fini);
+    ui.grip.addEventListener('pointercancel', fini);
   }
 
   /*
@@ -4954,20 +5330,21 @@
     if (nom === 'guilde') refreshGuild();
   }
 
-  /** Le panneau se déplace à la souris ; sa position est mémorisée. */
+  /** Le panneau se déplace au doigt comme à la souris ; sa position est mémorisée. */
   function makeDraggable() {
     let dx = 0, dy = 0, dragging = false;
 
-    ui.head.addEventListener('mousedown', (e) => {
+    ui.head.addEventListener('pointerdown', (e) => {
       if (e.target.closest('button')) return; // les boutons gardent leur rôle
       dragging = true;
       dx = e.clientX - ui.box.offsetLeft;
       dy = e.clientY - ui.box.offsetTop;
+      ui.head.setPointerCapture(e.pointerId);
       ui.head.style.cursor = 'grabbing';
       e.preventDefault();
     });
 
-    addEventListener('mousemove', (e) => {
+    ui.head.addEventListener('pointermove', (e) => {
       if (!dragging) return;
       const left = e.clientX - dx;
       const top = e.clientY - dy;
@@ -4977,12 +5354,16 @@
       });
     });
 
-    addEventListener('mouseup', () => {
+    // `pointercancel` autant que `pointerup` : un geste système interrompu
+    // laisserait sinon le panneau accroché au doigt.
+    const fini = () => {
       if (!dragging) return;
       dragging = false;
       ui.head.style.cursor = 'grab';
       saveStore({ pos: panelPos() });
-    });
+    };
+    ui.head.addEventListener('pointerup', fini);
+    ui.head.addEventListener('pointercancel', fini);
   }
 
   // ------------------------------------------------------------------- rendu
@@ -5065,11 +5446,15 @@
        * n'est tombé, l'annoncer laisserait croire à une limite constatée là où
        * il n'y a qu'une borne de sécurité jamais atteinte.
        */
-      const mur = state.probeFloorMs
-        ? ` · plancher mesuré ${(state.probeFloorMs / 1000).toFixed(1)} s`
-        : '';
+      /*
+       * Virgule décimale, comme partout ailleurs dans le panneau. Ces deux
+       * valeurs étaient les seules à sortir en `toFixed` brut : « 40.0 s » au
+       * milieu de chiffres tous formatés en français.
+       */
+      const secondes = (ms) => `${(ms / 1000).toFixed(1).replace('.', ',')} s`;
+      const mur = state.probeFloorMs ? ` · plancher mesuré ${secondes(state.probeFloorMs)}` : '';
       ui.tuning.textContent =
-        `Délai ${(state.delayMs / 1000).toFixed(1)} s${mur} · régénération ${fmtClock(state.cadenceMs)}`;
+        `Délai ${secondes(state.delayMs)}${mur} · régénération ${fmtClock(state.cadenceMs)}`;
       ui.bonusnote.textContent = state.bonusNote;
       ui.dbnote.textContent = state.dbNote;
     }
@@ -5234,7 +5619,18 @@
       file.get(s.carte).pours.push(s.pour);
     }
 
-    paint(ui.gdons, file.size
+    /*
+     * Le dernier événement signalé, tant qu'il est d'actualité. Il n'était
+     * écrit nulle part de visible : sans notification bureau — décochée par
+     * défaut — un lot qui s'enchaînait tout seul ne se voyait pas, et la
+     * variable qui le portait n'avait aucun lecteur. Même traitement que la
+     * note du Marché : datée, donc elle s'efface au lieu de vieillir à l'écran.
+     */
+    const note = state.guildNote && Date.now() - state.guildNoteAt < GUILD_NOTE_TTL
+      ? `<div class="gnote">${esc(state.guildNote)}</div>`
+      : '';
+
+    paint(ui.gdons, note + (file.size
       ? `<div class="rh sub">Hors lot, à donner aussi</div>` +
         [...file.values()].map((s) => `
           <div class="gdon" style="--c:${RARITY_COLOR[s.rarete] || '#8C8275'}"
@@ -5244,7 +5640,7 @@
               ? `→ ${esc(s.pours[0])}`
               : `${s.pours.length} demandeurs`} · <b>+${karmaDe(s.rarete)} karma</b></div>
           </div>`).join('')
-      : '');
+      : ''));
   }
 
   /**
@@ -5264,7 +5660,14 @@
       return;
     }
     const [top, ...rest] = rows;
-    const unit = GOAL_UNIT[top.g.of] || 'cartes';
+    /*
+     * Accord au singulier. Les unités sont écrites au pluriel — « cartes »,
+     * « Légendaires », « Peu Communes » — et le dernier palier avant l'arrivée
+     * en affichait forcément un : « 1 Légendaires restantes », vu à l'écran.
+     * Toutes se réduisent en retirant le « s » final.
+     */
+    const accord = (n, mot) => (n === 1 ? mot.replace(/s$/, '') : mot);
+    const unit = accord(top.left, GOAL_UNIT[top.g.of] || 'cartes');
 
     /*
      * La vitesse se mesure sur la croissance réelle de la collection entre
@@ -5277,14 +5680,19 @@
      * dont il découle ne se vérifie pas. « 4 h » à 180 cartes/h se comprend et
      * se conteste ; « 4 h » seul ne dit pas s'il faut le croire.
      */
+    /*
+     * « à », et pas une espace. Les deux nombres se touchaient — « ~4,2 j
+     * 0,1/h » — et se lisaient comme une seule valeur, alors que le second
+     * est justement là pour qu'on puisse contester le premier.
+     */
     const eta = top.eta != null
-      ? ` · ~${fmtSpan(top.eta)} <span class="rate">${fmtRate(top.rate)}/h</span>`
+      ? ` · ~${fmtSpan(top.eta)} <span class="rate">à ${fmtRate(top.rate)}/h</span>`
       : '';
 
     const suite = rest.length ? `<div class="more">${rest.map((r) => `
       <span class="g" title="${esc(r.g.name)} — ${r.have.toLocaleString('fr-FR')} / ${r.g.at.toLocaleString('fr-FR')} ${GOAL_UNIT[r.g.of] || ''}">
         <b>+${r.g.reward}</b> ${esc(r.g.name)}
-        <i>${r.left.toLocaleString('fr-FR')} ${GOAL_UNIT[r.g.of] || ''}${r.eta != null ? ` · ~${fmtSpan(r.eta)}` : ''}</i>
+        <i>${r.left.toLocaleString('fr-FR')} ${accord(r.left, GOAL_UNIT[r.g.of] || '')}${r.eta != null ? ` · ~${fmtSpan(r.eta)}` : ''}</i>
       </span>`).join('')}</div>` : '';
 
     paint(ui.goal, `
@@ -5294,7 +5702,7 @@
         <span class="cnt">${top.have.toLocaleString('fr-FR')} / ${top.g.at.toLocaleString('fr-FR')}</span>
       </div>
       <div class="track"><i style="width:${Math.min(100, top.part * 100).toFixed(1)}%"></i></div>
-      <div class="left">${top.left.toLocaleString('fr-FR')} ${unit} restantes${eta}</div>
+      <div class="left">${top.left.toLocaleString('fr-FR')} ${unit} restante${top.left === 1 ? '' : 's'}${eta}</div>
       ${suite}`);
   }
 
@@ -5361,13 +5769,41 @@
    * La fraîcheur d'un relevé, en trois caractères : l'en-tête n'a pas la place
    * d'une phrase, et « il y a 15 min » y poussait le titre sur deux lignes.
    * La phrase entière reste en infobulle.
+   *
+   * Mais `fmtSpan` rend « 24 h 25 » — la forme exacte d'une heure de la
+   * journée. Posé en coin, à droite de « Succès N / 51 », ça se lisait comme
+   * une horloge et non comme une ancienneté ; l'infobulle disait juste, encore
+   * fallait-il survoler un chiffre qu'on croyait avoir compris.
+   *
+   * Un âge n'a pas besoin des minutes passé la première heure : les retirer
+   * lève l'ambiguïté ET raccourcit, ce que la contrainte de place demandait.
    */
-  const fmtAge = (at) => (!at ? '—' : Date.now() - at < 60000 ? 'à jour' : fmtSpan(Date.now() - at));
+  const fmtAge = (at) => {
+    if (!at) return '—';
+    const ms = Date.now() - at;
+    if (ms < 60000) return 'à jour';
+    const m = Math.floor(ms / 60000);
+    if (m < 60) return `${m} min`;
+    if (m < 2880) return `${Math.floor(m / 60)} h`;
+    return fmtSpan(ms);   // au-delà de deux jours, fmtSpan compte déjà en jours
+  };
   const ageTitle = (at) =>
     at ? `Dernier relevé ${Date.now() - at < 60000 ? "à l'instant" : `il y a ${fmtSpan(Date.now() - at)}`}`
        : 'Jamais relevé';
 
   const MKT_SOON_MS = 300000;   // même seuil que l'alerte « bientôt terminée »
+
+  /*
+   * Une ligne du Marché mène à sa page d'enchère : c'est la navigation
+   * principale de l'onglet. C'étaient pourtant des `<li>` nus, cliqués par
+   * délégation — ni bouton, ni lien, ni `tabindex` : rien à atteindre au
+   * clavier, et rien qui s'annonce comme actionnable.
+   *
+   * `role="button"` + `tabindex="0"` suffisent, à condition que la touche
+   * agisse aussi — c'est le rôle du gestionnaire `keydown` posé sur `ui.market`,
+   * qui repasse par le clic pour n'avoir qu'une seule décision à maintenir.
+   */
+  const LIGNE_ACTIVE = 'role="button" tabindex="0"';
 
   /*
    * Une ligne par enchère ou par vente. Ce qui finit en premier se lit en
@@ -5401,7 +5837,7 @@
         const cible = x.auction
           ? `data-auction="${esc(x.auction)}" title="${esc(x.title)} — ouvrir la page de l'enchère"`
           : `data-open="${esc(x.title)}" title="${esc(x.title)} — chercher sur le Marché"`;
-        return `<li class="${cls}" ${cible}>
+        return `<li class="${cls}" ${cible} ${LIGNE_ACTIVE}>
           <span class="dot"></span>
           <span class="t">${esc(x.title)}</span>
           ${tag}
@@ -5438,6 +5874,7 @@
   const WISH_MAX_PAGES = 12;       // garde-fou si `total` mentait
   const WISH_SCAN_PAGES = 8;       // ~400 annonces, la fenêtre récente du marché
   const WISH_SCAN_MS = 100000;     // sous les deux minutes que couvrent ces pages
+  const WISH_SEEN_MAX = 800;       // annonces retenues : deux balayages de recul
 
   async function refreshWishlist(force) {
     if (!force && Date.now() - state.wish.at < WISH_TTL_MS) return state.wish;
@@ -5516,7 +5953,15 @@
     const list = [...avant.values()].filter((h) => h.end == null || h.end > Date.now());
 
     const nouvelles = trouvees.filter((h) => !state.wishSeen[h.auction]);
-    for (const h of trouvees) state.wishSeen[h.auction] = 1;
+    /*
+     * Horodaté et borné, comme le registre des souhaits de guilde. Il ne
+     * portait qu'un `1`, donc rien ne permettait de le purger : une entrée par
+     * annonce croisée, ~400 par balayage, toutes les 100 s, mémorisées à vie.
+     * Un stockage saturé fait échouer TOUS les `saveStore` — donc aussi les
+     * stats, le journal des ventes et le suivi des relances, sans un mot.
+     */
+    for (const h of trouvees) state.wishSeen[h.auction] = Date.now();
+    state.wishSeen = bornerVus(state.wishSeen, WISH_SEEN_MAX);
 
     state.wishHits = { at: Date.now(), list };
     saveStore({ wishHits: state.wishHits, wishSeen: state.wishSeen });
@@ -5543,7 +5988,7 @@
       .map(({ x, ms }) => {
         const fini = ms != null && ms <= 0;
         const cls = [fini ? 'done' : ms != null && ms <= MKT_SOON_MS ? 'soon' : ''].filter(Boolean).join(' ');
-        return `<li class="${cls}" data-auction="${esc(x.auction)}"
+        return `<li class="${cls}" data-auction="${esc(x.auction)}" ${LIGNE_ACTIVE}
             title="${esc(x.title)} — ouvrir la page de l'enchère"
             style="--c:${RARITY_COLOR[x.rarity] || '#8C8275'}">
           <span class="dot"></span>
@@ -5620,10 +6065,19 @@
                 : 'Cartes de ta liste de souhaits actuellement aux enchères' },
     });
 
+    /*
+     * La Revente ne dépend d'aucun volet, ni de la surveillance : elle lit ta
+     * collection et le marché des cartes, rien d'autre. Elle n'apparaissait
+     * pourtant que dans « Ventes », et disparaissait donc des trois quarts de
+     * l'onglet — ainsi que de tout l'onglet quand la surveillance est décochée,
+     * alors qu'elle n'a rien à voir avec elle. C'est une des trois grandes
+     * fonctions de l'outil : elle reste sous les yeux tant qu'on est au Marché.
+     */
+    ui.revente.hidden = false;
+
     // Les deux volets de relevé n'ont de sens que si le guetteur tourne.
     if (!prefs.watchBids && sub !== 'rel' && sub !== 'souh') {
       ui.relist.hidden = true;
-      ui.revente.hidden = sub !== 'vent';
       paint(ui.market,
         `<div class="mkoff"><b>Surveillance désactivée.</b> Coche ` +
         `« Surveillance » en bas de cet onglet pour suivre ici tes mises, ` +
@@ -5704,7 +6158,6 @@
             `cartes depuis <em>Toutes les cartes</em> sur le site.</div>`);
 
     ui.relist.hidden = sub !== 'rel';
-    ui.revente.hidden = sub !== 'vent';
     paint(ui.market, sub === 'ench' ? corpsEnch
       : sub === 'vent' ? corpsVentes
         : sub === 'souh' ? corpsSouh : '');
@@ -6131,6 +6584,19 @@
   const SLOTS_FRESH_MS = 20000;  // durée de validité du compte d'emplacements
   const SETTLE_MS = 60000;       // délai laissé au serveur pour trancher une enchère close
   const IDLE_RELIST_MS = 15000;  // repos quand un tour n'a rien à replacer
+  /*
+   * Une carte en pause ne repart jamais d'elle-même : sans oubli, le volet
+   * Relances devenait un cimetière que seul « Tout arrêter » vidait. Une
+   * semaine d'immobilité veut dire que l'inscription a perdu son objet — carte
+   * vendue ailleurs, retirée à la main, ou disparue de la collection.
+   */
+  const WATCH_PAUSE_TTL = 604800000;   // 7 jours
+  /*
+   * Un prix demandé attend l'issue que la notification apporte — et
+   * `/api/notifications` n'en garde que cinquante. Une notification manquée
+   * laissait l'entrée à vie, sans rien à quoi la confronter.
+   */
+  const ASK_TTL = 604800000;           // 7 jours
 
   /*
    * Une carte, une annonce à la fois. Le relevé des ventes ne suffisait pas à
@@ -6344,6 +6810,7 @@
           w.fails = (w.fails || 0) + 1;
           if (w.fails >= WATCH_FAILS) {
             w.paused = true;
+            w.pausedAt = Date.now();   // au-delà de WATCH_PAUSE_TTL, on oublie
             logRelist(w.title, 'refus', w.price, 'introuvable en collection — suivi en pause');
           }
           bouge = true;
@@ -6374,6 +6841,7 @@
           w.fails = (w.fails || 0) + 1;
           if (w.fails >= WATCH_FAILS) {
             w.paused = true;
+            w.pausedAt = Date.now();
             logRelist(w.title, 'refus', w.price,
               String((res.data && res.data.error) || res.status) + ' — suivi en pause');
           }
@@ -6406,7 +6874,22 @@
     return n;
   }
 
+  /*
+   * Même garde que `scanSales`, et pour la même raison : appelé par le tour du
+   * guetteur, par « rafraîchir » et à l'ouverture de la Revente. Deux passages
+   * concurrents inscriraient en plus deux fois la même carte invendue.
+   */
   async function syncJournal() {
+    if (syncJournal.busy) return;
+    syncJournal.busy = true;
+    try {
+      await syncJournalVraiment();
+    } finally {
+      syncJournal.busy = false;
+    }
+  }
+
+  async function syncJournalVraiment() {
     let notifs;
     try {
       const d = await api('/api/notifications');
@@ -6463,30 +6946,47 @@
    */
   const MARKET_TTL = 600000;
 
+  /**
+   * Une page REFUSÉE n'est pas une fin de marché — la même confusion que celle
+   * qui vidait la cote, et elle n'avait pas été corrigée ici.
+   *
+   * `r.json()` sans contrôle de statut : un 429 — fréquent, la boucle
+   * d'ouverture tourne en parallèle — rend un JSON d'erreur, `auctions` y est
+   * absent, la page passait pour vide et le balayage s'arrêtait là. La carte de
+   * concurrence était alors tronquée EN SILENCE, et le filtre « Sans
+   * concurrence », coché par défaut, présentait comme seul vendeur des cartes
+   * qui avaient des concurrents — l'inverse exact de ce qu'on lui demande.
+   *
+   * @returns {Promise<Map|null>} null si une page n'a pas été reçue :
+   *   l'appelant garde alors le relevé précédent plutôt qu'un compte faux.
+   */
   async function fetchCompetition() {
     const counts = new Map();
     for (let base = 0; base < 400; base += 8) {
       const lot = await Promise.all(
         Array.from({ length: 8 }, (_, k) =>
           fetch(`/api/marketplace?page=${base + k}&limit=50`, { credentials: 'same-origin' })
-            .then((r) => r.json())
+            .then((r) => (r.ok ? r.json() : null))
             .catch(() => null)
         )
       );
       let fini = false;
+      let manque = false;
       for (const d of lot) {
-        const a = (d && d.auctions) || [];
-        if (!a.length) { fini = true; continue; }
-        for (const x of a) counts.set(x.card_id, (counts.get(x.card_id) || 0) + 1);
-        if (a.length < 50) fini = true;
+        if (!d || !Array.isArray(d.auctions)) { manque = true; continue; }
+        if (!d.auctions.length) { fini = true; continue; }
+        for (const x of d.auctions) counts.set(x.card_id, (counts.get(x.card_id) || 0) + 1);
+        if (d.auctions.length < 50) fini = true;
       }
+      if (manque) return null;
       if (fini) break;
     }
     return counts;
   }
 
   const sell = { open: false, scanning: false, done: 0, total: 0, read: 0, rows: [], at: 0, tags: [],
-                 checked: new Set(), themes: {}, comp: new Map(), compAt: 0,
+                 checked: new Set(), themes: {}, comp: new Map(), compAt: 0, compTronque: false,
+                 prunedAt: 0,   // dernière vérification de ce qui est encore possédé
                  // Pourquoi le tableau est vide — ou incomplet — quand il l'est.
                  note: '', refus: 0, tronque: false, freinages: 0,
                  // Refus rencontrés sur l'historique des ventes, carte par carte.
@@ -6660,6 +7160,14 @@
     sell.scanning = true;
     sell.done = 0;
     sell.read = 0;
+    /*
+     * `total` aussi — il ne l'était pas, et c'est lui que `renderSell` teste
+     * pour distinguer « lecture de la collection » de « cotation ». Au second
+     * relevé il valait encore celui du premier : la Revente annonçait
+     * « cotation 0 / N » figé pendant les deux minutes de lecture, soit
+     * exactement le compteur bloqué sur zéro qu'on avait voulu supprimer.
+     */
+    sell.total = 0;
     renderSell();
 
     /*
@@ -6751,8 +7259,11 @@
     }
     if (!Array.isArray(sonde.data && sonde.data.sales) && avgOf(sonde.data) == null) {
       sell.scanning = false;
-      sell.note = 'le serveur répond sans historique ni moyenne (champs reçus : '
-        + `${Object.keys(sonde.data || {}).join(', ') || 'aucun'})`;
+      // Même partage qu'ailleurs : l'écran dit qu'il n'y a rien à coter, la
+      // liste des champs reçus — une trace de mise au point — va en console.
+      sell.note = 'le serveur ne donne ni historique de ventes ni moyenne : rien à coter';
+      console.info('[WikiMasters Tools] marché d’une carte — champs reçus :',
+        Object.keys(sonde.data || {}).join(', ') || 'aucun');
       renderSell();
       return;
     }
@@ -6794,33 +7305,12 @@
           const d = await r.json();
           const px = (d.sales || []).map((s) => s.final_price).filter(Number.isFinite);
           if (px.length) {
-            const sorted = px.slice().sort((a, b) => a - b);
-            rows.push({
-              id: c.id, t: c.t, r: c.r, tags: c.tags, n: px.length,
-              theme: themeOf(c.cat), vues: c.vues || 0,
-              moy: Math.round(px.reduce((a, b) => a + b, 0) / px.length),
-              // La médiane résiste aux ventes aberrantes, fréquentes ici.
-              med: sorted[Math.floor(sorted.length / 2)],
-          q3: sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * 0.75))],
-              // 3e quartile : on vend à la patience, pas au prix courant.
-              q3: sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * 0.75))],
-              min: sorted[0], max: sorted[sorted.length - 1],
-            });
+            rows.push(coteRow(c, px));
           } else {
-            /*
-             * Pas d'historique, mais une moyenne : c'est ce que le site donne
-             * sans l'abonnement. Une seule valeur, donc médiane et 3e quartile
-             * valent la moyenne — et `seule` le dit, pour que le tableau ne
-             * fasse pas passer une estimation pour une statistique.
-             */
+            // Pas d'historique, mais une moyenne : ce que le site donne sans
+            // l'abonnement. Une seule valeur, et `coteSeule` le dit.
             const seule = avgOf(d);
-            if (seule != null) {
-              rows.push({
-                id: c.id, t: c.t, r: c.r, tags: c.tags, n: 0, seule: true,
-                theme: themeOf(c.cat), vues: c.vues || 0,
-                moy: seule, med: seule, q3: seule, min: seule, max: seule,
-              });
-            }
+            if (seule != null) rows.push(coteSeule(c, seule));
           }
         } catch (_) {
           /* carte ignorée */
@@ -6905,6 +7395,9 @@
     sell.checked = new Set(cards.map((c) => c.id));
     sell.at = Date.now();
     sell.tags = [...new Set(cards.flatMap((c) => c.tags))];
+    // Le relevé vient de lire la collection entière : inutile que la prochaine
+    // ouverture de la Revente la relise pour savoir ce qui est encore possédé.
+    if (!sell.tronque) sell.prunedAt = Date.now();
     sell.scanning = false;
     saveCote();
     renderSell();
@@ -6980,24 +7473,42 @@
    * `checked` évite de redemander une carte sans historique de ventes : elle
    * n'entre pas dans `rows`, on la redemanderait donc indéfiniment.
    */
-  /** Statistiques d'une série de prix — identiques quelle que soit la source. */
+  /**
+   * Statistiques d'une série de prix — identiques quelle que soit la source.
+   * Le relevé complet en avait sa propre copie, avec une clé `q3` écrite deux
+   * fois : une ligne de cote ne se calcule qu'ici.
+   */
   function coteRow(c, px) {
     const sorted = px.slice().sort((a, b) => a - b);
     return {
       id: c.id, t: c.t || c.title, r: c.r || c.rarity, tags: c.tags || [], n: px.length,
       theme: themeOf(c.cat || ''), vues: c.vues || 0,
       moy: Math.round(px.reduce((a, b) => a + b, 0) / px.length),
+      // La médiane résiste aux ventes aberrantes, fréquentes ici.
       med: sorted[Math.floor(sorted.length / 2)],
+      // 3e quartile : on vend à la patience, pas au prix courant.
       q3: sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * 0.75))],
       min: sorted[0], max: sorted[sorted.length - 1],
     };
   }
 
+  /**
+   * La cote quand le site ne rend qu'une moyenne — ce que voit un compte sans
+   * abonnement. Une seule valeur, donc médiane et 3e quartile la valent, et
+   * `seule` le dit : le tableau ne doit pas faire passer une estimation pour
+   * une statistique.
+   */
+  const coteSeule = (c, moy) => ({
+    id: c.id, t: c.t || c.title, r: c.r || c.rarity, tags: c.tags || [], n: 0, seule: true,
+    theme: themeOf(c.cat || ''), vues: c.vues || 0,
+    moy, med: moy, q3: moy, min: moy, max: moy,
+  });
+
   /*
-   * Les ventes closes d'un lot de cartes, en UNE requête.
+   * La cote d'un lot de cartes, lue en base.
    *
-   * `/api/marketplace/cards/<id>/sales` en demande une par carte : cinq par
-   * paquet ouvert. Tant que la boucle attendait six secondes entre deux
+   * `/api/marketplace/cards/<id>/sales` demande une requête par carte : cinq
+   * par paquet ouvert. Tant que la boucle attendait six secondes entre deux
    * paquets, ça passait inaperçu ; à une seconde, ce trafic est six fois plus
    * dense — et c'est le débit cumulé, tous endpoints confondus, qui déclenche
    * la garde anti-automatisation du site.
@@ -7005,25 +7516,6 @@
    * Le critère de « vendue » est `final_price` non nul, et non une valeur de
    * `status` : vérifié en comparant les deux sources sur la même carte, elles
    * rendent la même liste de prix.
-   */
-  async function dbSales(ids) {
-    if (!ids.length) return null;
-    const rows = await sbGet(
-      `auctions?card_id=in.(${ids.join(',')})&final_price=not.is.null` +
-      `&select=card_id,final_price&order=settled_at.desc&limit=1000`
-    );
-    if (!Array.isArray(rows)) return null;
-    const parCarte = new Map(ids.map((id) => [id, []]));
-    for (const r of rows) {
-      if (!Number.isFinite(r.final_price)) continue;
-      const l = parCarte.get(r.card_id);
-      if (l) l.push(r.final_price);
-    }
-    return parCarte;
-  }
-
-  /*
-   * La cote de TOUTE la collection, lue en base.
    *
    * C'est la découverte qui a débloqué les comptes sans abonnement : l'onglet
    * Marché d'une carte est vendu avec le PRO, et `/api/marketplace/cards/<id>/
@@ -7037,6 +7529,10 @@
    * `limit` borne chaque réponse : un lot qui la touche est peut-être tronqué,
    * et une moyenne calculée sur une moitié de ventes serait fausse sans le
    * dire. On le recoupe alors en deux, jusqu'à passer sous la borne.
+   *
+   * Il y avait à côté une seconde fonction pour les petits lots, avec la même
+   * requête mais SANS cette recoupe : un lot qui touchait la borne tronquait en
+   * silence. Un seul chemin, celui qui sait se recouper.
    *
    * @returns {Promise<Map|null>} null si la base n'est pas lisible : l'appelant
    *   retombe sur l'API du site.
@@ -7083,7 +7579,7 @@
     let ajout = 0;
 
     // Chemin direct : un aller-retour pour tout le lot.
-    const lot = await dbSales(todo.map((c) => c.id));
+    const lot = await dbSalesBulk(todo.map((c) => c.id));
     if (lot) {
       for (const c of todo) {
         sell.checked.add(c.id);
@@ -7112,9 +7608,7 @@
           // Même repli que le relevé complet : sans historique, la moyenne seule.
           const seule = avgOf(d);
           if (seule == null) continue;
-          sell.rows.push({ id: c.id, t: c.t, r: c.r, tags: c.tags || [], n: 0, seule: true,
-                           theme: themeOf(c.cat || ''), vues: c.vues || 0,
-                           moy: seule, med: seule, q3: seule, min: seule, max: seule });
+          sell.rows.push(coteSeule(c, seule));
           ajout += 1;
         } catch (_) {
           sell.checked.delete(c.id);
@@ -7132,18 +7626,30 @@
   /*
    * La cote se périme lentement, la possession change vite : une carte vendue
    * restait listée parce que le cache ne savait pas qu'elle avait quitté la
-   * collection. À l'ouverture on revérifie donc ce que tu possèdes encore,
-   * sans refaire le relevé des prix — c'est lui qui prend des minutes.
+   * collection. On revérifie donc ce que tu possèdes encore, sans refaire le
+   * relevé des prix — c'est lui qui prend des minutes.
+   *
+   * Mais la vérification n'était bornée par rien, et elle part à CHAQUE
+   * ouverture de la Revente : deux cent quarante requêtes pour rouvrir un
+   * panneau qu'on venait de fermer. La possession bouge vite à l'échelle de la
+   * cote, pas à celle du clic — dix minutes suffisent, et un relevé complet
+   * repousse l'échéance puisqu'il vient de lire la collection entière.
    */
+  const PRUNE_TTL = 600000;
+
   async function pruneSold() {
     if (sell.scanning || !sell.rows.length) return;
+    if (Date.now() - sell.prunedAt < PRUNE_TTL) return;
     let cards;
     try {
       cards = await fetchCollection();
     } catch (_) {
       return; // réseau : on garde la liste telle quelle plutôt que de la vider
     }
-    if (!cards.length) return;
+    // Lecture vide ou tronquée : on ne conclut rien. Retirer une carte que le
+    // serveur n'a pas rendue reviendrait à effacer sa cote pour une coupure.
+    if (!cards.length || sell.tronque) return;
+    sell.prunedAt = Date.now();
     const owned = new Set(cards.map((c) => c.id));
     const before = sell.rows.length;
     sell.rows = sell.rows.filter((r) => owned.has(r.id));
@@ -7158,7 +7664,19 @@
   async function refreshCompetition() {
     if (Date.now() - sell.compAt < MARKET_TTL) return;
     try {
-      sell.comp = await fetchCompetition();
+      const c = await fetchCompetition();
+      /*
+       * Relevé interrompu : on garde le précédent, et on le DIT. Écraser avec
+       * un compte incomplet ferait passer pour « sans concurrence » des cartes
+       * dont les annonces n'ont simplement pas été lues — or c'est le filtre
+       * coché par défaut, celui sur lequel se décide quoi mettre en vente.
+       */
+      sell.compTronque = !c;
+      if (!c) {
+        renderSell();
+        return;
+      }
+      sell.comp = c;
       sell.compAt = Date.now();
       renderSell();
     } catch (_) {
@@ -7186,6 +7704,22 @@
     sell.open = false;
     renderSell();
   }
+
+  /*
+   * Échap ferme la Revente. C'est une modale plein écran — `inset: 0`, au
+   * sommet de la pile — et elle ne se fermait qu'au ✕ ou au clic sur le fond :
+   * le réflexe qu'a tout le monde devant une modale ne donnait rien.
+   *
+   * L'écouteur est posé sur la fenêtre du site, pas sur l'ombre : le focus
+   * peut très bien être resté dans la page derrière. Il ne fait rien quand la
+   * Revente est fermée, et laisse passer les combinaisons — Échap seul.
+   */
+  addEventListener('keydown', (e) => {
+    if (e.key !== 'Escape' || !sell.open) return;
+    if (e.ctrlKey || e.altKey || e.metaKey || e.shiftKey) return;
+    e.preventDefault();
+    closeSell();
+  });
 
   function buildSellUI() {
     const host = document.createElement('div');
@@ -7232,8 +7766,15 @@
               background: rgba(255,255,255,.06); color: #949DAD; cursor: pointer; font: 500 12px ui-sans-serif, system-ui, sans-serif; }
         .bar button:hover { color: #F1F4F8; }
         .scroll { overflow: auto; }
-        table { width: 100%; border-collapse: collapse; }
-        th { position: sticky; top: 0; background: #0D0F13; text-align: left; color: #626B7A;
+        /*
+         * « min-width » : le conteneur était prêt à défiler, mais une table en
+         * « width: 100% » sans plancher se comprime au lieu de le déclencher.
+         * Neuf colonnes — rareté, carte, thème, ventes, en vente, prix visé,
+         * médiane, amplitude, action — s'écrasaient donc en silence sur une
+         * fenêtre étroite. Elles défilent maintenant.
+         */
+        table { width: 100%; min-width: 720px; border-collapse: collapse; }
+        th { position: sticky; top: 0; background: #0D0F13; text-align: left; color: #717C8D;
              font-size: 11px; font-weight: 500; padding: 9px 12px; border-bottom: 1px solid rgba(255,255,255,.07); }
         td { padding: 8px 12px; border-bottom: 1px solid rgba(255,255,255,.04); font-variant-numeric: tabular-nums; }
         tr:hover td { background: rgba(255,255,255,.03); }
@@ -7241,22 +7782,22 @@
         .t { max-width: 340px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
         .num { text-align: right; }
         .med { font-weight: 650; }
-        .amp { color: #626B7A; font-size: 11px; }
+        .amp { color: #717C8D; font-size: 11px; }
         .th { color: #949DAD; font-size: 11px; white-space: nowrap; }
         .free { color: #35D68F; }
         .busy { color: #F0A94B; }
         /* Peu de ventes : le prix visé n'est pas un prix de marché. */
         .thin { color: #F0A94B; cursor: help; }
-        .th .liq { color: #626B7A; margin-left: 6px; }
+        .th .liq { color: #717C8D; margin-left: 6px; }
         .tag { padding: 1px 6px; border-radius: 999px; background: rgba(53,214,143,.15); color: #35D68F; font-size: 10px; }
         .go { padding: 5px 11px; border: 1px solid rgba(255,255,255,.12); border-radius: 7px;
               background: none; color: #F1F4F8; cursor: pointer; font: 500 11px ui-sans-serif, system-ui, sans-serif; }
         .go:hover { background: rgba(53,214,143,.15); border-color: #35D68F; color: #35D68F; }
         /* Une carte étiquetée n'a pas de bouton : rien à cliquer par mégarde. */
         .protege { display: inline-block; padding: 5px 9px; border: 1px dashed rgba(255,255,255,.14);
-                   border-radius: 7px; color: #626B7A; font: 500 11px ui-sans-serif, system-ui, sans-serif; }
-        .note { padding: 12px 18px; color: #626B7A; font-size: 11px; border-top: 1px solid rgba(255,255,255,.07); }
-        .empty { padding: 40px; text-align: center; color: #626B7A; }
+                   border-radius: 7px; color: #717C8D; font: 500 11px ui-sans-serif, system-ui, sans-serif; }
+        .note { padding: 12px 18px; color: #717C8D; font-size: 11px; border-top: 1px solid rgba(255,255,255,.07); }
+        .empty { padding: 40px; text-align: center; color: #717C8D; }
         .slots { color: #35D68F; font-weight: 600; }
         /* Autant de lignes surlignées que d'emplacements libres : ce sont les
            cartes à lister maintenant, sans avoir à compter soi-même. */
@@ -7269,7 +7810,7 @@
                       white-space: nowrap; color: #F1F4F8; }
         .journal .ok { color: #35D68F; }
         .journal .ko { color: #F0A94B; }
-        .journal .ask { color: #626B7A; font-variant-numeric: tabular-nums; }
+        .journal .ask { color: #717C8D; font-variant-numeric: tabular-nums; }
       </style>
       <div class="wrap" data-wrap>
         <div class="box">
@@ -7424,9 +7965,17 @@
     const valeur = rows.reduce((a, x) => a + (x.q3 || x.med), 0);
     const libres = state.slots.at ? state.slots.max - state.slots.used : null;
     const age = sell.at ? ` · cote il y a ${fmtSpan(Date.now() - sell.at)}` : '';
+    /*
+     * Un relevé de concurrence interrompu se dit. Le filtre « sans
+     * concurrence » repose entièrement dessus : le laisser passer pour complet
+     * ferait proposer comme exclusives des cartes qu'on n'a pas fini de lire.
+     */
     const conc = sell.compAt
-      ? ` · concurrence il y a ${fmtSpan(Date.now() - sell.compAt)}`
-      : ' · relevé de la concurrence en cours…';
+      ? ` · concurrence il y a ${fmtSpan(Date.now() - sell.compAt)}` +
+        (sell.compTronque ? ' (dernier relevé interrompu — le serveur a freiné)' : '')
+      : sell.compTronque
+        ? ' · relevé de la concurrence interrompu — « sans concurrence » n’est pas fiable'
+        : ' · relevé de la concurrence en cours…';
     sellUI.sum.textContent = `${rows.length} cartes · ~${valeur.toLocaleString('fr-FR')} wb${age}${conc}`
       + (sell.note ? ` · ${sell.note}` : '');
 
