@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WikiMasters Tools
 // @namespace    https://www.wiki-masters.com/
-// @version      2.7.0
+// @version      2.7.1
 // @description  Boîte à outils WikiMasters : ouverture automatique des paquets, suivi des tirages, cote des cartes et revente.
 // @match        https://www.wiki-masters.com/*
 // @match        https://wiki-masters.com/*
@@ -33,23 +33,125 @@
   'use strict';
 
   /*
-   * Une seule instance par page. Renommer `@name` fait que Tampermonkey
-   * installe un SECOND script au lieu de renommer le premier : les deux
-   * s'injectent alors et le panneau apparaît en double. Ce drapeau est posé
-   * avant tout le reste — JavaScript étant mono-thread, la première instance
-   * chargée gagne et les suivantes s'arrêtent net.
-   */
-  if (window.__wmToolsLoaded) return;
-  window.__wmToolsLoaded = true;
-
-  /*
    * Une seule source pour le numéro de version : il vivait en trois exemplaires
    * — l'en-tête, la ligne de console et la poignée de diagnostic — et deux
    * d'entre eux avaient dérivé. La console annonçait 1.66 pendant que l'en-tête
    * disait 1.67 : de quoi chercher longtemps pourquoi un correctif « n'arrive
    * pas ». À tenir à jour avec `@version` en tête de fichier.
+   *
+   * Il est lu par le garde juste en dessous, d'où sa place en tête.
    */
-  const VERSION = '2.7.0';
+  const VERSION = '2.7.1';
+
+  /*
+   * Une seule instance par page — et savoir laquelle
+   * ------------------------------------------------
+   * Renommer `@name` fait que Tampermonkey installe un SECOND script au lieu
+   * de renommer le premier : les deux s'injectent alors et le panneau
+   * apparaît en double. Ce drapeau est donc posé avant tout le reste —
+   * JavaScript étant mono-thread, la première instance chargée gagne et les
+   * suivantes s'arrêtent net.
+   *
+   * S'arrêter EN SILENCE était le défaut, et il s'est vu en vrai : quelqu'un
+   * met à jour, actualise la page, et voit toujours l'ancien panneau — parce
+   * qu'un script d'avant le renommage tenait encore la page et gagnait la
+   * course. Tampermonkey annonçait la nouvelle version, l'écran montrait
+   * l'ancienne, et rien ne reliait les deux. Une mise à jour qui ne change
+   * rien sans dire pourquoi est indiagnosticable à distance : c'est la panne
+   * la plus coûteuse du projet, et celle-ci ne laissait même pas de trace.
+   *
+   * L'instance qui se retire l'annonce donc. Elle sait souvent qui l'a
+   * devancée : la poignée de diagnostic de l'autre porte son numéro, dès lors
+   * qu'il est allé au bout de son exécution.
+   *
+   * On n'avertit que si l'autre est PLUS ANCIEN, ou si son numéro est
+   * illisible. Deux copies d'une même version se recouvrent sans dommage —
+   * le panneau affiché est le bon, il n'y a rien à signaler.
+   */
+  if (window.__wmToolsLoaded) {
+    const autre = (window.__wmAuto && window.__wmAuto.version) || null;
+    if (!autre || plusVieux(autre, VERSION)) signalerDoublon(autre);
+    return;
+  }
+  window.__wmToolsLoaded = true;
+
+  /** `a` est-il antérieur à `b` ? Comparaison segment par segment. */
+  function plusVieux(a, b) {
+    const na = String(a).split('.').map((n) => parseInt(n, 10) || 0);
+    const nb = String(b).split('.').map((n) => parseInt(n, 10) || 0);
+    for (let i = 0; i < Math.max(na.length, nb.length); i++) {
+      const x = na[i] || 0;
+      const y = nb[i] || 0;
+      if (x !== y) return x < y;
+    }
+    return false;
+  }
+
+  /*
+   * Le bandeau est autonome : l'instance qui l'affiche ne monte pas le
+   * panneau, donc rien de ce qui suit dans ce fichier n'existe pour elle. Ni
+   * gabarit partagé, ni variable de thème — seulement de quoi être lu.
+   *
+   * En haut au centre, parce que le panneau de l'autre instance vit en bas à
+   * droite : se recouvrir aurait caché celui des deux qui explique.
+   *
+   * Refermé, il se tait pour la session. Il revient à la visite suivante tant
+   * que le doublon est là — le taire pour de bon rendrait au problème
+   * exactement le silence qui le rendait introuvable.
+   */
+  function signalerDoublon(autre) {
+    try {
+      if (sessionStorage.getItem('wm-doublon-tu')) return;
+    } catch (_) {
+      /* stockage refusé : on avertit quand même, c'est le sens du bandeau */
+    }
+
+    const poser = () => {
+      if (!document.body || document.getElementById('wm-doublon')) return;
+
+      const boite = document.createElement('div');
+      boite.id = 'wm-doublon';
+      boite.style.cssText =
+        'position:fixed;top:12px;left:50%;transform:translateX(-50%);z-index:2147483000;'
+        + 'max-width:560px;padding:12px 14px;border-radius:10px;'
+        + 'background:rgba(13,15,19,.96);border:1px solid rgba(255,255,255,.10);'
+        + 'border-left:3px solid #F5A524;box-shadow:0 8px 28px rgba(0,0,0,.45);'
+        + 'color:#F1F4F8;font:13px/1.45 ui-sans-serif,system-ui,sans-serif';
+
+      const titre = document.createElement('div');
+      titre.textContent = 'Deux versions de WikiMasters Tools sont installées';
+      titre.style.cssText = 'font-weight:700;margin-bottom:5px';
+
+      const corps = document.createElement('div');
+      corps.style.cssText = 'color:#C7CEDA';
+      corps.textContent =
+        `Une ancienne (${autre || 'numéro illisible'}) a pris la page avant la ${VERSION}, `
+        + 'et c\'est elle que tu vois — celle-ci s\'est retirée pour ne pas afficher deux '
+        + 'panneaux. Ouvre le tableau de bord Tampermonkey, supprime le script qui n\'est '
+        + `pas en ${VERSION}, puis actualise la page.`;
+
+      const fermer = document.createElement('button');
+      fermer.textContent = 'Compris';
+      fermer.style.cssText =
+        'margin-top:9px;padding:5px 12px;border-radius:7px;cursor:pointer;'
+        + 'border:1px solid rgba(255,255,255,.14);background:rgba(255,255,255,.06);'
+        + 'color:#F1F4F8;font:600 12px ui-sans-serif,system-ui,sans-serif';
+      fermer.addEventListener('click', () => {
+        try {
+          sessionStorage.setItem('wm-doublon-tu', '1');
+        } catch (_) {
+          /* rien à retenir : il reviendra au prochain chargement */
+        }
+        boite.remove();
+      });
+
+      boite.append(titre, corps, fermer);
+      document.body.appendChild(boite);
+    };
+
+    if (document.body) poser();
+    else document.addEventListener('DOMContentLoaded', poser, { once: true });
+  }
 
   const CFG = {
     /*
