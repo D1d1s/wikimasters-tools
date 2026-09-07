@@ -1,5 +1,3 @@
-<img src="panneau.png" alt="Le panneau WikiMasters Tools" width="300" align="right">
-
 # WikiMasters Tools
 
 **Un panneau qui joue pendant que vous faites autre chose.**
@@ -14,6 +12,10 @@ Rien envoyé nulle part.
 ### → [Installer](https://raw.githubusercontent.com/D1d1s/wikimasters-tools/main/wikimasters-auto.user.js) · [Discord](https://discord.gg/m5NHPSSk6B)
 
 ⚠️ Lisez les quatre étapes avant de cliquer. La deuxième, tout le monde la rate.
+
+<p align="center">
+  <img src="panneau.png" alt="Le panneau WikiMasters Tools" width="290">
+</p>
 
 ---
 
