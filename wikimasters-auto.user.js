@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WikiMasters Tools
 // @namespace    https://www.wiki-masters.com/
-// @version      2.9.1
+// @version      2.9.2
 // @description  Boîte à outils WikiMasters : ouverture automatique des paquets, suivi des tirages, cote des cartes et revente.
 // @match        https://www.wiki-masters.com/*
 // @match        https://wiki-masters.com/*
@@ -41,7 +41,7 @@
    *
    * Il est lu par le garde juste en dessous, d'où sa place en tête.
    */
-  const VERSION = '2.9.1';
+  const VERSION = '2.9.2';
 
   /*
    * Une seule instance par page — et savoir laquelle
@@ -4518,7 +4518,29 @@
     }
     .rate { margin-top: -10px; color: var(--dim); font-size: 11px; }
 
-    .chips { display: flex; flex-wrap: wrap; gap: 5px; }
+    /*
+     * Les six raretés doivent tenir sur une ligne. Elles débordaient de 4,5 px
+     * sur les 260 disponibles — donc dès qu'un joueur avait tiré une
+     * Légendaire, la sixième pastille passait seule à la ligne et le panneau
+     * gagnait 22 px de haut pour rien. Mesuré à 300 px, la largeur par défaut.
+     *
+     * La gouttière passe à 4 px et le rembourrage des pastilles à 8 px : 17 px
+     * regagnés. Mesuré à 300 px, sur les six pastilles :
+     *
+     *     L 1 UR 3 SR 8 R 22 PC 44 C 97     une ligne, 12,5 px de marge
+     *     L 2 UR 3 SR 8 R 21 PC 44 C 102    une ligne,  7,9 px
+     *     L 4 UR 12 SR 30 R 105 PC 210 C 480   deux lignes, -14,8 px
+     *
+     * Donc : la session ordinaire tient, y compris quand les communes passent
+     * les 100. Une longue session, elle, repasse à deux lignes, et on s'y
+     * arrête : gagner ces 15 px demanderait 7 px de rembourrage et 3 px de
+     * gouttière, ce qui souderait les pastilles entre elles pour un cas qui
+     * n'est pas le plus fréquent. flex-wrap est là pour ça.
+     *
+     * (Pas d'accent grave dans ce commentaire : il vit dans un littéral de
+     * gabarit, et le premier fermerait la chaîne.)
+     */
+    .chips { display: flex; flex-wrap: wrap; gap: 4px; }
     .openrar {
       margin-top: -6px; padding: 0; border: 0; background: none; text-align: left;
       color: var(--dim); font: 11px var(--sans); cursor: pointer; transition: .16s;
@@ -4529,7 +4551,7 @@
        la plus lumineuse. On rétablit la hiérarchie par l'opacité, comme le site
        le fait par l'intensité de son halo. */
     .chip {
-      padding: 3px 9px; border-radius: 999px; color: var(--c);
+      padding: 3px 8px; border-radius: 999px; color: var(--c);
       background: color-mix(in srgb, var(--c) 15%, transparent);
       border: 0; font: 600 11px var(--sans); cursor: pointer; transition: .16s;
       opacity: var(--w, 1);
