@@ -68,7 +68,8 @@ votre liste de souhaits mises aux enchères, et la remise en vente automatique d
 invendus.
 
 **🏰 Guilde** — les dons possibles, classés, avec le calcul qui dit si donner
-rapporte plus que vendre.
+rapporte plus que vendre. Et **quels de vos souhaits sont déjà chez vos amis**,
+Légendaires en tête, avec la page d'échange ouverte au bon nom en un clic.
 
 **Et dans les pages du jeu** — un filtre *Nouveaux* dans votre collection, un tri
 **par valeur réelle** de toute la collection, un bouton **Tout souhaiter** qui met
