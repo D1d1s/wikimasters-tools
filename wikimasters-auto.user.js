@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WikiMasters Tools
 // @namespace    https://www.wiki-masters.com/
-// @version      2.8.0
+// @version      2.9.0
 // @description  Boîte à outils WikiMasters : ouverture automatique des paquets, suivi des tirages, cote des cartes et revente.
 // @match        https://www.wiki-masters.com/*
 // @match        https://wiki-masters.com/*
@@ -41,7 +41,7 @@
    *
    * Il est lu par le garde juste en dessous, d'où sa place en tête.
    */
-  const VERSION = '2.8.0';
+  const VERSION = '2.9.0';
 
   /*
    * Une seule instance par page — et savoir laquelle
@@ -151,6 +151,66 @@
 
     if (document.body) poser();
     else document.addEventListener('DOMContentLoaded', poser, { once: true });
+  }
+
+  /*
+   * Savoir qu'on est en retard
+   * --------------------------
+   * Tampermonkey décide seul quand vérifier — jamais plus d'une fois par heure,
+   * en pratique une fois par jour. Rien ne le dit à l'écran : entre la
+   * publication et l'installation, l'utilisateur ignore simplement qu'une
+   * version corrige ce qu'il subit. La 2.9.0 rend au prix de vente son sens ;
+   * la savoir disponible vaut autant que l'avoir écrite.
+   *
+   * Le panneau va donc lire lui-même le numéro en ligne. Trois mesures, prises
+   * sur le site avant d'écrire ceci :
+   *
+   *   - `wiki-masters.com` n'envoie AUCUNE politique de sécurité de contenu,
+   *     ni en-tête ni balise : `fetch` vers GitHub passe depuis la page, sans
+   *     `@grant`, donc sans toucher au bac à sable actuel.
+   *   - le raw GitHub honore les requêtes partielles — HTTP 206 — : 400 octets
+   *     suffisent à lire l'en-tête, au lieu des 400 Ko du fichier.
+   *   - il se met en cache cinq minutes : une publication est visible aussitôt.
+   *
+   * Ce que ça ne fait PAS : installer. Aucune API ne permet à un script de se
+   * mettre à jour lui-même, et le sien reste `@grant none`. Le gain n'est pas
+   * l'automatisation, c'est de savoir — ensuite un clic ouvre la page
+   * d'installation de Tampermonkey, qui propose la mise à jour.
+   *
+   * Une panne ici ne doit RIEN changer : pas de message, pas d'état modifié,
+   * pas de trace. Le pire cas est celui d'aujourd'hui — on attend Tampermonkey.
+   */
+  const MAJ_URL =
+    'https://raw.githubusercontent.com/D1d1s/wikimasters-tools/main/wikimasters-auto.user.js';
+  const MAJ_TOUTES_LES_MS = 3600000;   // une fois par heure : le cache dure cinq minutes
+  const MAJ_OCTETS = 400;              // de quoi couvrir l'en-tête, jamais le corps
+  const MAJ_PREMIER_DELAI = 20000;     // laisser la page se poser avant de sortir
+
+  async function chercherMaj() {
+    if (Date.now() - (state.majAt || 0) < MAJ_TOUTES_LES_MS) return;
+    // L'horodatage est posé AVANT l'appel : un réseau qui pend ne doit pas
+    // laisser le tour suivant repartir aussitôt.
+    state.majAt = Date.now();
+    saveStore({ majAt: state.majAt });
+    try {
+      const r = await fetch(MAJ_URL, {
+        headers: { Range: `bytes=0-${MAJ_OCTETS}` },
+        cache: 'no-store',
+      });
+      if (r.status !== 200 && r.status !== 206) return;
+      const tete = await r.text();
+      const dispo = (tete.match(/@version\s+(\S+)/) || [])[1];
+      /*
+       * On ne retient que ce qui est PLUS RÉCENT. Un numéro illisible, égal, ou
+       * plus ancien — le temps qu'un cache se vide — ne doit pas allumer un
+       * bandeau qui enverrait réinstaller ce qui est déjà là.
+       */
+      if (!dispo || !plusVieux(VERSION, dispo)) return;
+      state.majDispo = dispo;
+      render();
+    } catch (_) {
+      /* hors ligne, bloqué, rien : on attend Tampermonkey, comme avant */
+    }
   }
 
   const CFG = {
@@ -263,6 +323,8 @@
     blockedReserve: null,  // réserve au moment du blocage, pour chiffrer la perte
     bonusCheckedAt: 0,
     bonusNote: '',
+    majAt: 0,              // dernière vérification du numéro en ligne
+    majDispo: '',          // version publiée, si elle est plus récente que la nôtre
     packsReadAt: 0,        // dernier relevé de la réserve lu en base
     dbNote: '',            // ce que la base a répondu, pour le voir sans la console
     pity: null,            // compteur de pitié courant, tel que le porte le profil
@@ -470,6 +532,13 @@
       state.nextRelistAt = Math.min(s.nextRelistAt, Date.now() + CFG.relistGapMs[1]);
     }
     if (Array.isArray(s.relistLog)) state.relistLog = s.relistLog;
+    /*
+     * L'heure de la dernière vérification survit au rechargement : sans elle,
+     * ouvrir dix onglets ferait dix requêtes. Un horodatage venu du futur —
+     * horloge reculée, stockage recopié — vaut « jamais vérifié » plutôt que de
+     * bloquer la vérification pour toujours.
+     */
+    if (Number.isFinite(s.majAt) && s.majAt <= Date.now()) state.majAt = s.majAt;
     if (s.sales && Array.isArray(s.sales.list)) state.sales = s.sales;
     /*
      * Les emplacements de vente n'étaient pas mémorisés : au rechargement, le
@@ -904,13 +973,30 @@
     const b = btn || document.querySelector('[data-wm-value-sort]');
     if (!b) return;
 
+    /*
+     * « Prix », et non « Valeur ».
+     *
+     * Chaque carte du site porte déjà deux nombres, attaque et défense, qui
+     * servent aux batailles. Poser « Valeur ↓ » au milieu de leurs filtres
+     * laissait croire à un tri sur ces statistiques-là, alors qu'il porte sur
+     * le prix de revente. Le mot juste lève l'ambiguïté à lui seul.
+     */
     if (valueBusy) {
       const pct = valueTotal ? Math.min(99, Math.round((valueRead / valueTotal) * 100)) : 0;
-      b.textContent = `Valeur ↓ · lecture ${pct} %`;
-      b.title = 'Lecture de la collection entière — N pages, une quinzaine de secondes';
+      b.textContent = `Prix ↓ · lecture ${pct} %`;
+      /*
+       * Le nombre de pages venait d'une constante — « N pages » — c'est-à-dire
+       * de la collection de qui a écrit la ligne. Sur un compte qui débute, il
+       * y en a quatre ; sur celui-là, elles sont maintenant N. On annonce ce
+       * qu'on lit vraiment, et rien tant qu'on ne le sait pas encore.
+       */
+      b.title = valueTotal
+        ? `Lecture de la collection entière — ${Math.ceil(valueTotal / COLLECTION_PAGE)
+            .toLocaleString('fr-FR')} pages, quelques secondes`
+        : 'Lecture de la collection entière — quelques secondes';
     } else if (sell.scanning) {
       const pct = sell.total ? Math.min(99, Math.round((sell.done / sell.total) * 100)) : 0;
-      b.textContent = `Valeur ↓ · cote ${pct} %`;
+      b.textContent = `Prix ↓ · cote ${pct} %`;
       b.title = 'Relevé des prix en cours dans la Revente — le tri s’allumera dès qu’il sera fini';
     } else if (sell.refusVentes === 403 && !sell.rows.length) {
       /*
@@ -919,10 +1005,10 @@
        * n'y a alors aucun prix à classer, et proposer un relevé qui échouera
        * encore serait se moquer du monde.
        */
-      b.textContent = 'Valeur ↓ · cote bloquée';
-      b.title = 'L’API du marché est réservée aux comptes PRO (403). Coche « Accès direct à '
-        + 'la base » dans les réglages : la cote se relève alors sur la table des enchères, '
-        + 'sans abonnement, et ce tri redevient possible.';
+      b.textContent = 'Prix ↓ · réservé aux comptes PRO';
+      b.title = 'Le site réserve les prix aux comptes PRO. Cochez « Accès direct à '
+        + 'la base » dans les réglages : les prix redeviennent lisibles sans abonnement, '
+        + 'et ce tri avec eux.';
     } else if (!sell.rows.length) {
       /*
        * La cote vit dans le `localStorage` : elle est donc vide sur un
@@ -931,23 +1017,23 @@
        * sans quoi il ouvre la Revente sans qu'on comprenne pourquoi : un
        * libellé identique à l'état qui trie promettait un tri, pas un relevé.
        */
-      b.textContent = 'Valeur ↓ · cote à relever';
-      b.title = 'Le classement a besoin du prix de tes cartes, et rien n’a encore été relevé sur '
+      b.textContent = 'Prix ↓ · à relever';
+      b.title = 'Le classement a besoin du prix de vos cartes, et rien n’a encore été relevé sur '
         + 'ce navigateur. Le clic ouvre la Revente, qui lance le relevé — plusieurs minutes. '
         + 'Le tri s’allume ensuite.';
     } else {
-      b.textContent = 'Valeur ↓';
+      b.textContent = 'Prix ↓';
       b.title = byValue
         ? 'Collection entière triée par moyenne des ventes — les cartes jamais vendues passent '
-          + `derrière. Classement établi il y a ${fmtSpan(Date.now() - valueAt)} : éteins puis `
-          + 'rallume pour le refaire.'
+          + `derrière. Classement établi il y a ${fmtSpan(Date.now() - valueAt)} : éteignez puis `
+          + 'rallumez pour le refaire.'
         : valueFail
           ? sell.tronque
-            ? 'Lecture de la collection incomplète — le serveur a freiné'
-              + `${sell.refus ? ` (statut ${sell.refus})` : ''}. Réessaie, au besoin boucle à l’arrêt.`
+            ? 'Lecture de la collection incomplète — le serveur a ralenti l’outil. '
+              + 'Réessayez, au besoin boucle à l’arrêt.'
             : sell.refus
-              ? `Le serveur a refusé la lecture de ta collection (statut ${sell.refus}) — réessaie`
-              : 'La lecture de la collection a échoué — réessaie'
+              ? 'Le serveur a refusé de lire votre collection — réessayez'
+              : 'La lecture de la collection a échoué — réessayez'
           : 'Trier toute la collection par moyenne des ventes, la plus chère en tête';
     }
 
@@ -1631,7 +1717,7 @@
    */
   window.wmSchema = async function (filtre) {
     const token = sbToken();
-    if (!token) return 'Aucun jeton lisible — es-tu connecté au site ?';
+    if (!token) return 'Aucun jeton lisible — êtes-vous connecté au site ?';
     const res = await fetch(`${sbUrl()}/`, {
       credentials: 'omit',
       headers: { apikey: SB_ANON, Authorization: `Bearer ${token}`, Accept: 'application/openapi+json' },
@@ -2137,10 +2223,17 @@
   async function refreshGuild(force) {
     if (!force && Date.now() - (state.guild.at || 0) < GUILD_FRESH_MS) return;
 
-    let home, lb;
+    /*
+     * Un seul appel. Le classement des guildes partait aussi, toutes les cinq
+     * minutes, pour remplir `rang`, `membres`, `total`, `batailles`, `wb`,
+     * `chef` et `chefTotal` — sept champs dont AUCUN n'avait de lecteur depuis
+     * que le tableau de bord de guilde a été retiré. La collecte avait survécu
+     * à son affichage. Sur un outil qu'on surveille pour son nombre de
+     * requêtes, c'était une requête sur deux, pour rien.
+     */
+    let home;
     try {
       home = await api('/api/guilds/home');
-      lb = await api('/api/guilds/leaderboard');
     } catch (_) {
       return;   // réseau : le relevé précédent reste affiché, avec son âge
     }
@@ -2148,11 +2241,6 @@
     if (!h || !h.guild) return;
 
     const souhaits = Array.isArray(h.wishlist) ? h.wishlist : [];
-    const parRarete = {};
-    for (const w of souhaits) {
-      const r = (w.card && w.card.rarity) || '?';
-      parRarete[r] = (parRarete[r] || 0) + 1;
-    }
 
     /*
      * Ce que je peux servir maintenant. `can_donate` est calculé par le serveur
@@ -2171,31 +2259,28 @@
         copies: (w.owned_copy_ids || []).length,
       }));
 
-    const entrees = (lb.status === 200 && lb.data && lb.data.entries) || [];
-    const nous = entrees.find((x) => x.guild_id === h.guild.id) || null;
-    const tete = entrees[0] || null;
-
     const avant = state.guild;
     const dernier = (h.recent_donations || [])[0];
+    /*
+     * Le relevé ne porte plus que ce qui est lu quelque part. Il transportait
+     * neuf champs de plus — nom de la guilde, répartition des souhaits par
+     * rareté, leur nombre, rang, membres, score total, score de batailles,
+     * wikibidous, nom et score de la guilde de tête — dont pas un n'avait de
+     * lecteur depuis le retrait du tableau de bord.
+     *
+     * Ce qui reste n'est pas affiché non plus, mais se mesure : `karma` et
+     * `dons` alimentent `apprendKarma`, qui déduit ce que vaut un don de chaque
+     * rareté ; `moi` sert à `suivreLot` pour savoir qu'un don est parti.
+     */
     const apres = {
       at: Date.now(),
-      nom: h.guild.name || '',
       karma: h.guild.karma_this_week || 0,
       dons: h.guild.donations_this_week || 0,
-      souhaits: souhaits.length,
-      parRarete,
-      servables,
       moi: h.my_contribution || null,
+      servables,
       // Les cartes déjà réclamées par quelqu'un : inutile de les faire souhaiter
       // une seconde fois, elles sont couvertes.
       cartesSouhaitees: souhaits.map((w) => w.card && w.card.id).filter(Boolean),
-      rang: nous ? nous.rank : null,
-      membres: nous ? nous.member_count : (h.my_contribution && h.my_contribution.eligible_count) || 0,
-      total: nous ? nous.total_score : null,
-      batailles: nous ? nous.score_battles : null,
-      wb: nous ? nous.score_wb : null,
-      chef: tete && tete.guild_name,
-      chefTotal: tete && tete.total_score,
     };
 
     // Le relevé lui-même n'est pas mémorisé : il périme en cinq minutes, et un
@@ -2853,7 +2938,7 @@
     for (const v of list) {
       const prev = before.get(v.title);
       if (v.offered && prev && !prev.offered) {
-        notifyBid('Première mise sur ta vente', `${v.title} — ${v.bid} wb`);
+        notifyBid('Première mise sur votre vente', `${v.title} — ${v.bid} wb`);
       }
       if (
         leftNow(v) != null && leftNow(v) <= BIDS.endingSoonMs &&
@@ -3484,7 +3569,7 @@
       clearInterval(id);
       state.blockedAt = 0;
       if (!prefs.autoResume) {
-        return setStatus('Vérification passée — clique Start pour reprendre.');
+        return setStatus('Vérification passée — cliquez Start pour reprendre.');
       }
       setStatus('Vérification passée — reprise.');
       start();
@@ -3639,6 +3724,9 @@
    * prochaine échéance est donc calculable sans jamais essuyer un refus.
    */
   const REGEN_ANCHORS = ['packs_last_regen_at', 'last_pack_regen_at'];
+
+  // Dernier profil journalisé, pour ne pas répéter la même ligne chaque minute.
+  let dernierProfil = '';
   const CADENCE_PRO = 180000;
   const CADENCE_FREE = 600000;
   const PACKS_FRESH_MS = 60000;
@@ -3656,7 +3744,7 @@
     state.packsReadAt = Date.now();
 
     if (!sbToken()) {
-      state.dbNote = 'Session du jeu illisible — reconnecte-toi au site.';
+      state.dbNote = 'Session du jeu illisible — reconnectez-vous au site.';
       render();
       return null;
     }
@@ -3674,7 +3762,7 @@
        * — ils vont donc en console, où `diagCote()` les attend déjà.
        */
       state.dbNote = 'La base n’a pas répondu — la réserve reste estimée. '
-        + 'Décoche puis recoche « Accès direct » pour réessayer.';
+        + 'Décochez puis recochez « Accès direct » pour réessayer.';
       console.info('[WikiMasters Tools] get_my_profile : aucune réponse exploitable.'
         + ' Voir wmSchema() pour les tables lisibles.');
       render();
@@ -3755,15 +3843,25 @@
     }
 
     /*
-     * Le compteur de pitié s'affiche avec le maximum jamais observé. Tant qu'on
-     * ne sait pas ce qu'il fait, c'est la paire qui informe : une valeur seule
-     * ne dit rien, une valeur suivie d'un plafond stable dit le palier.
+     * Le compteur de pitié et le solde partent en console.
+     *
+     * `pity_counter` est une colonne que le site n'affiche nulle part et dont
+     * on ne sait pas encore ce qu'elle commande : la montrer dans des réglages,
+     * sous un mot que le jeu n'emploie pas, c'est du travail en cours exposé à
+     * qui joue. Le solde, lui, est déjà écrit en haut de chaque page du site —
+     * le répéter ici n'apprend rien et périme entre deux relevés.
+     *
+     * Une seule ligne par changement : ce relevé passe toutes les minutes tant
+     * que la boucle tourne, et une console qui répète la même ligne soixante
+     * fois par heure n'est pas plus lisible qu'un panneau qui l'affiche.
      */
-    const extra = [];
-    if (state.pity != null) {
-      extra.push(`pitié ${state.pity}${state.pityMax > state.pity ? ` (max vu ${state.pityMax})` : ''}`);
+    const empreinte = `${state.pity}/${state.pityMax}/${state.balance}`;
+    if (empreinte !== dernierProfil) {
+      dernierProfil = empreinte;
+      console.info('[WikiMasters Tools] profil', {
+        pitié: state.pity, pitié_max: state.pityMax, solde: state.balance,
+      });
     }
-    if (state.balance != null) extra.push(`${state.balance} wikibidous`);
 
     /*
      * Le repli n'énumérait plus les colonnes trouvées à l'écran. C'était une
@@ -3775,11 +3873,18 @@
       console.info('[WikiMasters Tools] get_my_profile ne porte pas les paquets — colonnes reçues :',
         Object.keys(p).slice(0, 12).join(', '));
     }
+    /*
+     * Ce qui reste à l'écran doit s'adresser à qui joue : combien de paquets
+     * l'attendent, à quel rythme ils reviennent, et si son compte est PRO —
+     * trois choses qu'il peut vérifier et qui changent ce qu'il fait. « Réserve
+     * lue en base » décrivait par quel chemin l'outil l'avait appris, ce qui ne
+     * regarde que l'outil.
+     */
     const etat = lu
-      ? `Réserve lue en base : ${state.reserve == null ? '?' : state.reserve}/${MAX_RESERVE}` +
-        ` · cadence ${fmtClock(state.cadenceMs)}${p.is_pro ? ' (PRO)' : ''}` +
-        (extra.length ? ` · ${extra.join(' · ')}` : '')
-      : 'La base ne renvoie pas le compte de paquets — la réserve reste estimée.';
+      ? `${state.reserve == null ? '?' : state.reserve} paquet${state.reserve === 1 ? '' : 's'}` +
+        ` en réserve sur ${MAX_RESERVE} · un de plus toutes les ` +
+        `${fmtClock(state.cadenceMs)}${p.is_pro ? ' (compte PRO)' : ''}`
+      : 'Le compte de paquets n’est pas lisible : la réserve reste estimée.';
     state.dbNote = alertes.length ? `⚠ ${alertes.join(' · ')} — ${etat}` : etat;
 
     /*
@@ -3918,7 +4023,14 @@
       try {
         res = await openPack();
       } catch (err) {
-        return stop(`Réseau indisponible : ${err.message}`, true);
+        /*
+         * Le message d'exception du navigateur — « Failed to fetch », et pire
+         * selon le cas — partait tel quel dans la ligne d'état. Il ne dit rien
+         * de plus que « ça n'est pas passé », et pas dans la même langue que le
+         * reste du panneau. Il va en console, où il sert.
+         */
+        console.warn('[WikiMasters Tools] appel réseau échoué :', err);
+        return stop('Le site est injoignable — vérifiez votre connexion, puis relancez.', true);
       }
 
       const { status, data, retryMs } = res;
@@ -4006,7 +4118,7 @@
       }
 
       if (status === 401) {
-        return stop('Session expirée — reconnecte-toi puis relance.', true);
+        return stop('Session expirée — reconnectez-vous puis relancez.', true);
       }
 
       /*
@@ -4054,7 +4166,7 @@
        * réponse va en console pour qui saura la lire.
        */
       console.info(`[WikiMasters Tools] réponse inattendue (${status}) :`, data);
-      return stop(`Réponse inattendue du serveur (${status}) — boucle arrêtée.`, true);
+      return stop('Le site a répondu autre chose que prévu — arrêt par précaution.', true);
     }
   }
 
@@ -4167,7 +4279,9 @@
     loop(epoch).catch((err) => {
       // Une boucle périmée qui casse ne doit pas arrêter la boucle courante.
       if (err.message !== 'stopped' && epoch === loopEpoch) {
-        stop(`Erreur : ${err.message}`, true);
+        // Le détail de l'exception en console, le fait à l'écran.
+        console.error('[WikiMasters Tools] la boucle s’est arrêtée sur une erreur :', err);
+        stop('Quelque chose s’est mal passé — boucle arrêtée. Relancez avec Start.', true);
       }
     });
   }
@@ -4281,7 +4395,16 @@
     .panel.live .mark { background: var(--live); box-shadow: 0 0 0 3px rgba(53,214,143,.18); }
     .panel.warn .mark { background: var(--warn); box-shadow: 0 0 0 3px rgba(240,169,75,.18); }
 
-    .title { font-size: 13px; font-weight: 600; letter-spacing: -.01em; }
+    /*
+     * Le titre se COUPE plutôt que de passer à la ligne. Mesuré au pixel dans
+     * le panneau réel : la pastille de mise à jour, ajoutée dans un en-tête
+     * déjà plein, faisait passer « WikiMasters Tools » sur deux étages — et à
+     * 260 px, la borne basse de la poignée, même la flèche seule suffisait à
+     * le faire. Un titre tronqué en « WikiMaste… » se lit encore ; un en-tête
+     * qui double de hauteur déplace tout ce qui est en dessous.
+     */
+    .title { font-size: 13px; font-weight: 600; letter-spacing: -.01em;
+             min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     /*
      * La version ne vivait que dans la console : « console.info » au démarrage et
      * « __wmAuto.version ». Or c'est LE numéro qu'on cite pour demander de l'aide,
@@ -4298,6 +4421,21 @@
       font-variant-numeric: tabular-nums; letter-spacing: 0;
       -webkit-user-select: text; user-select: text; cursor: text;
     }
+    /*
+     * La pastille de mise à jour. Elle est verte — la seule chose de l'en-tête
+     * qui appelle un geste — et ne paraît que lorsqu'une version plus récente
+     * est en ligne. Contrairement au numéro de version, elle survit à la borne
+     * basse : à 260 px, c'est encore ce qu'il y a de plus utile à montrer.
+     */
+    .maj {
+      flex: none; padding: 1px 6px; border-radius: 999px;
+      background: rgba(53,214,143,.16); color: var(--live);
+      font-size: 10px; font-weight: 600; letter-spacing: 0;
+      font-variant-numeric: tabular-nums; text-decoration: none; cursor: pointer;
+    }
+    .maj:hover { background: rgba(53,214,143,.28); }
+    .maj[hidden] { display: none; }
+
     /* Replié, l'en-tête doit suffire : il affiche le compte à rebours. */
     /* Le décompte vit dans l'onglet Paquets ; ailleurs il remonte dans l'en-tête
        pour rester sous les yeux sans dupliquer l'affichage. */
@@ -4521,6 +4659,10 @@
     .mkt .tag { flex: none; font-size: 10px; color: var(--live); }
     .mkt li.out .tag { color: var(--warn); }
     .mkt .v { flex: none; font-size: 11px; color: var(--muted); font-variant-numeric: tabular-nums; }
+    /* Un souhait sous la médiane de sa cote, ou au-dessus de son prix visé.
+       La flèche double la couleur : le verdict se lit sans distinguer les tons. */
+    .mkt .v.bon { color: var(--live); }
+    .mkt .v.cher { color: var(--warn); }
     .mkt .e { flex: none; min-width: 40px; text-align: right; font-size: 10px; color: var(--dim);
               font-variant-numeric: tabular-nums; }
     /* Une échéance proche est la seule chose qui appelle un geste tout de suite. */
@@ -4710,9 +4852,13 @@
     .relist .act { flex: none; font-size: 10px; color: var(--dim); }
     .relist li.ok .act { color: var(--live); }
     .relist li.refus .act { color: var(--warn); }
+    /* Une baisse de prix n'est ni un succès ni un échec : c'est un ajustement,
+       et elle se lit donc au même niveau que le titre, sans couleur d'alerte. */
+    .relist li.baisse .act { color: var(--muted); }
     .relist .dot { width: 5px; height: 5px; flex: none; border-radius: 50%; background: var(--dim); }
     .relist li.ok .dot { background: var(--live); }
     .relist li.refus .dot { background: var(--warn); }
+    .relist li.baisse .dot { background: var(--muted); }
     .relist .t { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
                  font-size: 11px; color: var(--text); }
     .relist .p { flex: none; font-size: 11px; color: var(--muted); font-variant-numeric: tabular-nums; }
@@ -4720,6 +4866,8 @@
     /* Le motif d'un refus tenait dans une infobulle : invisible, donc inutile.
        Il prend sa propre ligne, sous le titre auquel il se rapporte. */
     .relist .why { flex-basis: 100%; margin: -2px 0 1px 13px; font-size: 10px; line-height: 1.4; color: var(--warn); }
+    /* Le motif d'une baisse explique, il n'alerte pas. */
+    .relist li.baisse .why { color: var(--dim); }
     .relist .empty { font-size: 11px; color: var(--dim); line-height: 1.45; }
     .relist li.wait .dot { background: var(--dim); }
     .relist li.pause .dot { background: var(--warn); opacity: .5; }
@@ -4889,7 +5037,8 @@
         <div class="head" data-head>
           <span class="mark"></span>
           <span class="title">WikiMasters Tools</span>
-          <span class="ver" title="Version installée. Les mises à jour se font seules, sous 24 h environ.">${VERSION}</span>
+          <span class="ver" data-ver title="Version installée. Les mises à jour se font seules ; dès qu'une nouvelle version existe, une pastille verte paraît ici.">${VERSION}</span>
+          <a class="maj" data-maj hidden target="_blank" rel="noopener" href="${MAJ_URL}"></a>
           <b class="mini" data-mini></b>
           <button class="icon" data-fold title="Replier">–</button>
           <button class="run" data-toggle>Start</button>
@@ -4909,8 +5058,8 @@
           <div class="ribbon" data-ribbon title="Derniers tirages, teintés par rareté"></div>
 
           <div class="rule figs">
-            <span class="fig"><b data-packs>0</b><span>paquets</span></span>
-            <span class="fig"><b data-cards>0</b><span>cartes</span></span>
+            <span class="fig"><b data-packs>0</b><span data-packs-unit>paquets</span></span>
+            <span class="fig"><b data-cards>0</b><span data-cards-unit>cartes</span></span>
             <button class="reset" data-reset title="Remet les compteurs à zéro et vide le journal des tirages. Deux clics : le premier demande confirmation.">Réinitialiser</button>
           </div>
           <div class="rate" data-rate></div>
@@ -4926,20 +5075,20 @@
             <nav class="subs" data-subs></nav>
             <div class="mkt" data-market></div>
             <div class="relist" data-relist></div>
-            <button class="revente" data-revente>Revente — cote de mes cartes</button>
+            <button class="revente" data-revente>Revente — cote de vos cartes</button>
             <div class="mkfoot" data-mkfoot></div>
             <div class="mopt">
-              <label class="opt" title="Relève enchères et ventes. Ne touche à rien tant que tu regardes : il ne change d’onglet et ne recharge qu’en arrière-plan, après une minute d’absence.">
+              <label class="opt" title="Relève enchères et ventes. Ne touche à rien tant que vous regardez : il ne change d’onglet et ne recharge qu’en arrière-plan, après une minute d’absence.">
                 <input type="checkbox" data-opt-bids> Surveillance</label>
-              <label class="opt" title="Une vente terminée sans acheteur est relancée au même prix et pour la même durée">
+              <label class="opt" title="Une vente terminée sans acheteur est relancée pour la même durée. Au deuxième invendu d'affilée, le prix baisse d'un quart — sans jamais descendre sous la médiane des ventes réelles de la carte.">
                 <input type="checkbox" data-opt-relist> Relances auto</label>
-              <label class="opt" title="Signale les cartes de ta liste de souhaits mises aux enchères. Lit le marché récent, sans rien y publier.">
+              <label class="opt" title="Signale les cartes de votre liste de souhaits mises aux enchères. Lit le marché récent, sans rien y publier.">
                 <input type="checkbox" data-opt-wish> Souhaits</label>
             </div>
           </section>
 
           <section class="tab" data-tab="guilde">
-            <label class="opt" title="Relève les souhaits de la guilde toutes les 5 minutes, même hors de cet onglet, et te prévient dès qu'un souhait porte sur une de tes Super Rares ou Ultra Rares. Les cartes étiquetées et les favoris ne déclenchent jamais d'alerte.">
+            <label class="opt" title="Relève les souhaits de la guilde toutes les 5 minutes, même hors de cet onglet, et vous prévient dès qu'un souhait porte sur une de vos Super Rares ou Ultra Rares. Les cartes étiquetées et les favoris ne déclenchent jamais d'alerte.">
               <input type="checkbox" data-opt-gwatch> Alerter sur mes SR / UR demandées</label>
             <div class="gwish" data-gwish></div>
             <div data-gdons></div>
@@ -4947,27 +5096,23 @@
           </section>
 
           <section class="tab" data-tab="reglages">
-            <div class="sect">Ce qu'il fait à ta place</div>
+            <div class="sect">Ce qu'il fait à votre place</div>
             <label class="opt"><input type="checkbox" data-opt-autostart> Démarrer automatiquement</label>
-            <label class="opt" title="Après une vérification humaine, repart dès que tu as coché la case — sans repasser par Start. Le script ne coche jamais la case lui-même."><input type="checkbox" data-opt-autoresume> Reprise après vérification</label>
+            <label class="opt" title="Après une vérification humaine, repart dès que vous avez coché la case — sans repasser par Start. Le script ne coche jamais la case lui-même."><input type="checkbox" data-opt-autoresume> Reprise après vérification</label>
             <label class="opt"><input type="checkbox" data-opt-bonus> Réclamer les paquets bonus</label>
-            <label class="opt" title="Clique le bouton Réclamer du site pour chaque succès débloqué, quand tu es sur la page Succès"><input type="checkbox" data-opt-autoclaim> Réclamer les récompenses de succès</label>
-            <div class="sect suite">Ce qu'il lit et te signale</div>
-            <label class="opt" title="Lit tes propres lignes dans la base du jeu, avec la session déjà ouverte dans cet onglet : réserve exacte et liste complète des ventes, là où l'API du site ne renvoie plus que des compteurs. Une seule écriture passe par là, jamais toute seule : le bouton « Tout souhaiter » de la page Toutes les cartes, parce que le site n'expose aucune route d'API pour la liste de souhaits et que son propre client écrit dans cette table. Le jeton n'est ni stocké, ni journalisé, ni exporté."><input type="checkbox" data-opt-db> Accès direct à la base</label>
+            <label class="opt" title="Le panneau appuie sur le bouton Réclamer du site pour chaque succès débloqué, quand vous êtes sur la page Succès"><input type="checkbox" data-opt-autoclaim> Réclamer les récompenses de succès</label>
+            <div class="sect suite">Ce qu'il lit et vous signale</div>
+            <label class="opt" title="Lit vos propres données de jeu avec la session déjà ouverte dans cet onglet : nombre exact de paquets et liste complète de vos ventes, que le site ne donne plus autrement. Les prix restent lisibles sans compte PRO. Rien n'est écrit sans un geste de votre part, rien n'est envoyé ailleurs."><input type="checkbox" data-opt-db> Accès direct à la base</label>
             <label class="opt"><input type="checkbox" data-opt-notify> Notifications bureau</label>
-            <div class="note-vente">Mettre en vente et donner restent à ta main. Les relances
+            <div class="note-vente">Mettre en vente et donner restent à votre main. Les relances
               automatiques se cochent dans <b>Marché</b>, et le panneau ne donne jamais seul.</div>
-            <div class="sect suite">Ce qu'il mesure</div>
-            <div class="tune" data-tuning></div>
+            <div class="sect suite">Ce qu'il a constaté</div>
             <div class="tune" data-bonusnote></div>
             <div class="tune" data-dbnote></div>
-            <div class="acts">
-              <button data-csv>Export CSV</button>
-              <button data-json>Export JSON</button>
-            </div>
             <div class="apropos">WikiMasters Tools <b>${VERSION}</b> — mise à jour
-              automatique, sous 24 h environ. C'est ce numéro qu'on te demandera
-              sur le Discord.</div>
+              automatique. Dès qu'une version plus récente est en ligne, une
+              pastille verte paraît à côté du titre : un clic dessus la propose.
+              C'est ce numéro qu'on vous demandera sur le Discord.</div>
           </section>
         </div>
       </div>`;
@@ -4988,12 +5133,13 @@
       ribbon: q('[data-ribbon]'),
       packs: q('[data-packs]'),
       cards: q('[data-cards]'),
+      packsUnit: q('[data-packs-unit]'),
+      cardsUnit: q('[data-cards-unit]'),
       rate: q('[data-rate]'),
       rar: q('[data-rar]'),
       openRar: q('[data-open-rar]'),
       log: q('[data-log]'),
       reset: q('[data-reset]'),
-      tuning: q('[data-tuning]'),
       bonusnote: q('[data-bonusnote]'),
       dbnote: q('[data-dbnote]'),
       gwish: q('[data-gwish]'),
@@ -5017,11 +5163,11 @@
       mkfoot: q('[data-mkfoot]'),
       goal: q('[data-goal]'),
       achv: q('[data-achv]'),
+      ver: q('[data-ver]'),
       grip: q('[data-grip]'),
       mini: q('[data-mini]'),
+      maj: q('[data-maj]'),
       revente: q('[data-revente]'),
-      csv: q('[data-csv]'),
-      json: q('[data-json]'),
     });
 
 
@@ -5159,8 +5305,12 @@
       }, 4000);
     });
     ui.revente.addEventListener('click', openSell);
-    ui.csv.addEventListener('click', exportCsv);
-    ui.json.addEventListener('click', exportJson);
+    /*
+     * Les deux boutons d'export ont quitté les réglages. Personne n'ouvre un
+     * CSV de ses tirages, et ils occupaient une ligne entière au milieu des
+     * options qui, elles, changent le comportement de l'outil. Ils restent
+     * atteignables où ils ont leur place : `__wmAuto.exportCsv()` en console.
+     */
 
     // Le titre d'un tirage ouvre la collection filtrée sur cette carte.
     // L'écriture est synchrone, donc faite avant que l'onglet ne s'ouvre.
@@ -5275,7 +5425,7 @@
          * doit en être absente maintenant, pas à l'expiration du cache.
          */
         if (!state.aSouhaiter || !state.aSouhaiter.length) {
-          bouton.textContent = 'Lecture de ta collection…';
+          bouton.textContent = 'Lecture de votre collection…';
           state.aSouhaiter = await suggestWishes(LOT_SOUHAITS, true);
           if (!state.aSouhaiter) {
             bouton.textContent = 'Collection illisible — active la lecture de la base';
@@ -5583,8 +5733,37 @@
     renderStatus();
     renderRibbon();
 
-    ui.packs.textContent = state.packs;
-    ui.cards.textContent = state.cards;
+    /*
+     * La pastille de mise à jour, quand il y en a une. Le lien EST le geste :
+     * l'ouvrir fait afficher à Tampermonkey sa page d'installation, qui propose
+     * la mise à jour. C'est le même lien que le README et le Discord donnent.
+     */
+    ui.maj.hidden = !state.majDispo;
+    /*
+     * Les deux ne cohabitent pas : la pastille prend la place du numéro plutôt
+     * que de s'ajouter à lui. L'en-tête porte déjà titre, version, décompte,
+     * repli et Start — mesuré, un élément de plus le faisait passer sur deux
+     * lignes dès 320 px. Et « ↑ 2.10.0 » dit déjà tout ce que « 2.9.0 » disait,
+     * puisque son infobulle porte la version installée. Le numéro en toutes
+     * lettres reste au pied des Réglages, où on va le chercher pour le citer.
+     */
+    ui.ver.hidden = !!state.majDispo;
+    if (state.majDispo) {
+      ui.maj.textContent = `↑ ${state.majDispo}`;
+      ui.maj.title = `Version ${state.majDispo} disponible — vous êtes en ${VERSION}. `
+        + 'Ouvrir ce lien fait proposer la mise à jour par Tampermonkey, '
+        + 'puis actualisez la page.';
+    }
+
+    ui.packs.textContent = state.packs.toLocaleString('fr-FR');
+    ui.cards.textContent = state.cards.toLocaleString('fr-FR');
+    /*
+     * « 1 paquets » : le compteur le plus gros du panneau était le seul texte
+     * à ne pas s'accorder, alors que `renderGoal` a une fonction écrite pour
+     * ça — et pour la même raison, vue à l'écran.
+     */
+    ui.packsUnit.textContent = state.packs === 1 ? 'paquet' : 'paquets';
+    ui.cardsUnit.textContent = state.cards === 1 ? 'carte' : 'cartes';
 
     const elapsed = Date.now() - state.since;
     ui.rate.textContent = state.packs ? `depuis ${fmtSpan(elapsed)}` : '';
@@ -5606,7 +5785,7 @@
              title="${
                prefs.logRarity === r
                  ? 'Cliquer à nouveau pour réafficher toutes les raretés'
-                 : `Trier le journal sur tes ${byRarity[r]} carte(s) ${r}`
+                 : `Trier le journal sur vos ${byRarity[r]} carte(s) ${r}`
              }">${r} ${byRarity[r]}</button>`
       )
       .join(''));
@@ -5625,19 +5804,11 @@
 
     if (prefs.tab === 'reglages') {
       /*
-       * Le plancher appris n'apparaît qu'une fois mesuré : tant qu'aucun 429
-       * n'est tombé, l'annoncer laisserait croire à une limite constatée là où
-       * il n'y a qu'une borne de sécurité jamais atteinte.
+       * Le réglage du limiteur — délai courant, plancher appris, cadence de
+       * régénération — vivait ici, sous un titre « Ce qu'il mesure ». C'est le
+       * réglage interne de l'outil : il ne dit rien à qui joue, et il n'appelle
+       * aucun geste. Il part en console, avec le reste du diagnostic.
        */
-      /*
-       * Virgule décimale, comme partout ailleurs dans le panneau. Ces deux
-       * valeurs étaient les seules à sortir en `toFixed` brut : « 40.0 s » au
-       * milieu de chiffres tous formatés en français.
-       */
-      const secondes = (ms) => `${(ms / 1000).toFixed(1).replace('.', ',')} s`;
-      const mur = state.probeFloorMs ? ` · plancher mesuré ${secondes(state.probeFloorMs)}` : '';
-      ui.tuning.textContent =
-        `Délai ${secondes(state.delayMs)}${mur} · régénération ${fmtClock(state.cadenceMs)}`;
       ui.bonusnote.textContent = state.bonusNote;
       ui.dbnote.textContent = state.dbNote;
     }
@@ -5699,7 +5870,7 @@
         return `<div class="row" style="--c:${col}" title="Tirage ${e.rarity}${pitie}">
             <span class="r">${e.rarity}</span>
             <a class="n" href="/collection" data-card="${esc(e.title)}" data-target="/collection"
-               title="Voir cette carte dans ta collection">${esc(e.title)}</a>
+               title="Voir cette carte dans votre collection">${esc(e.title)}</a>
             ${prix}
             <a class="go" href="/collection" data-card="${esc(e.title)}" data-cote="1"
                title="Voir sa cote : ventes, moyenne, min/max">M</a>
@@ -5767,22 +5938,35 @@
         return `<li class="prete" style="--c:${RARITY_COLOR[c.rarete]}">${num}${nom}
           <span>à donner → ${esc(parCarte.get(c.id))}</span></li>`;
       }
-      if (reclamees.has(c.id)) return `<li>${num}${nom}<span>souhaitée, pas encore servable</span></li>`;
+      // « pas encore servable » : le mot n'existe ni dans le jeu ni ailleurs.
+      // Ce qui se passe est que quelqu'un l'a demandée et que le site n'ouvre
+      // pas encore le don — c'est cela qu'il faut écrire.
+      if (reclamees.has(c.id)) return `<li>${num}${nom}<span>demandée, don pas encore ouvert</span></li>`;
       return `<li>${num}${nom}<span>en attente</span></li>`;
     };
 
     const restantes = lot ? lot.filter((c) => !c.donnee).length : 0;
     paint(ui.gwish, lot && lot.length
       ? `<div class="h">Lot en cours · ${restantes}/${lot.length} à placer
-           <button class="rf" data-gnext title="Relit ta collection et refait le lot — à faire après avoir étiqueté des cartes, ou pour changer de sélection">↻</button></div>
+           <button class="rf" data-gnext title="Relit votre collection et refait le lot — à faire après avoir étiqueté des cartes, ou pour changer de sélection">↻</button></div>
          <ol class="glot">${lot.map(etatCarte).join('')}</ol>
-         <div class="gmeta">${messageGuildeLot(lot).length}/${CHAT_MAX} caractères ·
-           <b>${lot.reduce((s, c) => s + (c.donnee ? 0 : karmaDe(c.rarete)), 0).toLocaleString('fr-FR')}</b>
-           karma restant · ${lot.ecartees} écartées (étiquetées ou favorites)</div>
+         <div class="gmeta"><b>${lot.reduce((s, c) => s + (c.donnee ? 0 : karmaDe(c.rarete)), 0).toLocaleString('fr-FR')}</b>
+           karma restant à prendre${lot.ecartees
+             ? ` · <span title="Une carte étiquetée ou mise en favori sur le site ne part jamais dans un lot : c'est ainsi qu'on garde une carte.">${lot.ecartees} carte${lot.ecartees > 1 ? 's' : ''} gardée${lot.ecartees > 1 ? 's' : ''}</span>`
+             : ''}${
+           /*
+            * Le compteur de caractères s'affichait en permanence — « 212/1000 »
+            * — pour une limite qu'un lot de cinq titres n'approche jamais. Il ne
+            * gardait d'ailleurs rien : la constante n'était lue que là. Il ne
+            * paraît plus que le jour où il aurait quelque chose à empêcher.
+            */
+           messageGuildeLot(lot).length > CHAT_MAX
+             ? ` · <span class="hot">message trop long pour le tchat (${messageGuildeLot(lot).length} signes sur ${CHAT_MAX})</span>`
+             : ''}</div>
          <button data-gcopy>Copier le lot</button>
          <button data-gtuto title="La marche à suivre ne change pas d'un lot à l'autre : une fois suffit, ou quand de nouveaux membres arrivent">Copier le mode d'emploi</button>`
       : `<div class="h">Aucun lot en cours</div>
-         Cinq de tes Super Rares et Ultra Rares, à publier dans le tchat. Le lot suivant se
+         Cinq de vos Super Rares et Ultra Rares, à publier dans le tchat. Le lot suivant se
          prépare seul une fois celles-ci données.
          <button data-gcopy>Préparer le premier lot</button>
          <button data-gtuto>Copier le mode d'emploi</button>`);
@@ -5911,7 +6095,20 @@
       return;
     }
     const du = claimable();
-    const reste = (a.list || []).filter((x) => !x.done);
+    /*
+     * Le succès le mieux payé qui reste — mais pas un de ceux que le bloc des
+     * paliers, juste au-dessus, énumère déjà.
+     *
+     * Les deux blocs tiraient de la même liste par deux chemins : `GOALS`,
+     * écrit en dur, et le relevé de la page Succès. On lisait donc, à trois
+     * lignes d'intervalle, « +3 000 Va donc jouer dehors — N cartes »
+     * puis « Mieux payé encore verrouillé : +3 000 Va donc jouer dehors ». Le
+     * bloc des paliers gagne : il a l'échéance, que le relevé n'a pas. Celui-ci
+     * ne garde que ce que l'autre ne montre pas — un succès de bataille, par
+     * exemple, qui n'a rien à voir avec la collection.
+     */
+    const dejaDits = new Set(pendingGoals().map((r) => r.g.name));
+    const reste = (a.list || []).filter((x) => !x.done && !dejaDits.has(x.name));
     const gros = reste.slice().sort((x, y) => y.reward - x.reward)[0];
 
     paint(ui.achv, `
@@ -5921,10 +6118,10 @@
         <span class="age">${fmtAge(a.at)}</span>
       </div>
       ${du.n ? `<a class="claim" href="/achievements" data-goto="/achievements"
-          title="${esc(du.list.map((x) => `${x.name} +${x.reward}`).join(' · '))}">
-          ${du.n} récompense${du.n > 1 ? 's' : ''} à réclamer <b>+${du.total.toLocaleString('fr-FR')}</b></a>` : ''}
+          title="${esc(du.list.map((x) => `${x.name} +${fmtWb(x.reward)}`).join(' · '))}">
+          ${du.n} récompense${du.n > 1 ? 's' : ''} à réclamer <b>+${fmtWb(du.total)}</b></a>` : ''}
       ${gros ? `<div class="none">Mieux payé encore verrouillé :
-          <b>+${gros.reward}</b> ${esc(gros.name)} — ${esc(gros.desc)}</div>` : ''}`);
+          <b>+${fmtWb(gros.reward)}</b> ${esc(gros.name)} — ${esc(chiffresFr(gros.desc))}</div>` : ''}`);
   }
 
   /*
@@ -5955,6 +6152,15 @@
     ms == null ? '—' : ms <= 0 ? '0:00' : ms > 3600000 ? fmtSpan(ms) : fmtClock(ms);
 
   const fmtWb = (n) => (n == null ? '—' : Number(n).toLocaleString('fr-FR'));
+
+  /*
+   * Les textes qui viennent du site n'ont pas nos séparateurs : il écrit
+   * « Posséder 100000 cartes ». Posé trois lignes sous « N / 30 000 »,
+   * c'est la même quantité écrite de deux façons dans le même bloc — et c'est
+   * ce qu'on voyait dans l'onglet Paquets.
+   */
+  const chiffresFr = (s) =>
+    String(s == null ? '' : s).replace(/\d{4,}/g, (n) => Number(n).toLocaleString('fr-FR'));
 
   /*
    * La fraîcheur d'un relevé, en trois caractères : l'en-tête n'a pas la place
@@ -6183,19 +6389,31 @@
 
     if (!lignes.length) {
       ui.troc.innerHTML = '<div class="h">Échanges</div>'
-        + '<div>Aucun de tes souhaits n’est détenu par un ami pour l’instant. '
-        + 'La liste est relue avec tes souhaits, toutes les quinze minutes.</div>';
+        + '<div>Aucun de vos souhaits n’est détenu par un ami pour l’instant. '
+        + 'La liste est relue avec vos souhaits, toutes les quinze minutes.</div>';
       return;
     }
 
+    /*
+     * Un nom, puis le compte des autres — jamais trois noms tronqués.
+     *
+     * La colonne rendait « CielGreg, guacamolec, J… » sur sept lignes de huit :
+     * le début, identique partout, tenait toute la place, et ce que la
+     * troncature emportait était justement le nom qui distinguait une ligne de
+     * la suivante. Un seul nom suivi de « +2 » tient dans moins de signes et
+     * dit ce que la ligne apporte ; la liste entière reste en infobulle, où
+     * elle a la place de s'écrire.
+     */
     const rangs = lignes.slice(0, TROC_LIGNES).map((l) => {
       const qui = l.qui.join(', ');
+      const autres = l.qui.length - 1;
+      const court = autres > 0 ? `${l.qui[0]} +${autres}` : l.qui[0];
       return `<button class="l" data-troc-qui="${esc(l.qui[0])}"`
         + ` title="${esc(l.t)} — détenue par ${esc(qui)}. Ouvre les échanges,`
         + ` le composeur cherchera ${esc(l.qui[0])}.">`
         + `<span class="t">${esc(l.t)}</span>`
         + `<span class="r">${esc(l.r)}</span>`
-        + `<span class="q">${esc(qui)}</span>`
+        + `<span class="q">${esc(court)}</span>`
         + '</button>';
     }).join('');
 
@@ -6527,8 +6745,8 @@
           prefs.db ? 'base illisible' : 'option décochée',
           prefs.db
             ? 'Ta liste de souhaits n’a pas pu être lue, et sans elle le bouton écrirait en '
-              + 'double. Réessaie ; si ça dure, décoche puis recoche « Accès direct à la base ».'
-            : 'Coche « Accès direct à la base » dans les réglages du panneau.',
+              + 'double. Réessayez ; si ça dure, décochez puis recochez « Accès direct à la base ».'
+            : 'Cochez « Accès direct à la base » dans les réglages du panneau.',
         );
         return;
       }
@@ -6576,7 +6794,7 @@
             place <= 0 ? 'liste pleine'
               : deborde ? 'recherche trop large'
                 : `${neuves.length - place} de trop`,
-            `Le volet Souhaits ne surveille que ${WISH_SUIVI_MAX} cartes : au-delà, tu remplirais `
+            `Le volet Souhaits ne surveille que ${WISH_SUIVI_MAX} cartes : au-delà, vous rempliriez `
               + 'une liste dont la fin ne serait plus regardée, ce qui est pire que de ne rien '
               + `ajouter. Tu en souhaites déjà ${deja.size}, il reste donc ${reste} places, et `
               + (deborde
@@ -6595,8 +6813,8 @@
         wishDire(
           barre.surSouhaits ? 'rien à retirer' : 'rien de neuf',
           barre.surSouhaits
-            ? 'Aucune carte de cette vue n’est dans ta liste de souhaits.'
-            : 'Tout ce que cette recherche renvoie est déjà souhaité, ou déjà dans ta collection.',
+            ? 'Aucune carte de cette vue n’est dans votre liste de souhaits.'
+            : 'Tout ce que cette recherche renvoie est déjà souhaité, ou déjà dans votre collection.',
         );
         wishAllLot = null;
         return;
@@ -6620,8 +6838,8 @@
     if (!uid) {
       wishDire(
         'session illisible',
-        'Ta session n’a pas pu être lue dans cet onglet. Recharge la page ; si ça persiste, '
-          + 'reconnecte-toi au site.',
+        'Votre session n’a pas pu être lue dans cet onglet. Rechargez la page ; si ça persiste, '
+          + 'reconnectez-vous au site.',
       );
       paintWishAll();
       return;
@@ -6659,15 +6877,21 @@
        */
       state.wish.at = 0;
       refreshWishlist(true).catch(() => {});
+      // Le code de retour du serveur ne dit rien à qui joue : il va en console,
+      // avec de quoi retrouver l'écriture qui a échoué.
+      if (echec) {
+        console.warn('[WikiMasters Tools] écriture des souhaits interrompue',
+          { faits, total: lot.ids.length, statut: echec.status || null, raison: echec.raison || null });
+      }
       wishDire(
         echec
-          ? `${faits} sur ${lot.ids.length} — ${echec.status ? `statut ${echec.status}` : echec.raison}`
+          ? `${faits} sur ${lot.ids.length} — interrompu`
           : `${faits} ${lot.sens === 'ajouter' ? 'ajoutées' : 'retirées'}`,
         echec
           ? `L’écriture s’est arrêtée en chemin : ${faits} cartes sont bien passées, le reste non. `
             + 'Recliquer reprend là où ça s’est arrêté — ce qui est déjà écrit est écarté du '
             + 'compte suivant.'
-          : 'Le site ne redessine pas ses cœurs tout seul — actualise la page pour les voir. '
+          : 'Le site ne redessine pas ses cœurs tout seul — actualisez la page pour les voir. '
             + 'Le volet Souhaits, lui, est déjà à jour.',
       );
       paintWishAll();
@@ -6727,15 +6951,15 @@
       texte = wishAllLot.sens === 'retirer' ? `Retirer ${n} ?` : `Souhaiter ${n} ?`;
       titre = wishAllLot.tronque
         ? `Recherche trop large : lecture arrêtée à ${WISH_Q_PAGES} pages, ces ${n} cartes n’en `
-          + 'sont qu’une partie. Reclique pour confirmer.'
-        : 'Reclique pour confirmer. Le bouton se désarme tout seul en six secondes.';
+          + 'sont qu’une partie. Recliquez pour confirmer.'
+        : 'Recliquez pour confirmer. Le bouton se désarme tout seul en six secondes.';
     } else if (wishAllNote && Date.now() - wishAllNoteAt < WISH_NOTE_MS) {
       texte = wishAllNote;
       titre = wishAllNoteTitre;
     } else if (!prefs.db) {
       texte = retire ? 'Tout retirer' : 'Tout souhaiter';
       titre = 'Le site ne publie aucune route d’API pour la liste de souhaits : son propre client '
-        + 'écrit dans la base. Coche « Accès direct à la base » dans les réglages du panneau '
+        + 'écrit dans la base. Cochez « Accès direct à la base » dans les réglages du panneau '
         + 'pour que ce bouton puisse en faire autant.';
       actif = false;
     } else if (barre.tape !== barre.q) {
@@ -6747,13 +6971,13 @@
        */
       texte = 'Valide la recherche';
       titre = `Le champ dit « ${barre.tape || '(vide)'} », l’écran montre `
-        + `${barre.q ? `« ${barre.q} »` : 'le catalogue'}. Clique « Rechercher » — le bouton `
+        + `${barre.q ? `« ${barre.q} »` : 'le catalogue'}. Cliquez « Rechercher » — le bouton `
         + 'agit sur ce qui est affiché, jamais sur ce qui est seulement tapé.';
       actif = false;
     } else if (retire) {
       texte = 'Tout retirer';
       titre = barre.q
-        ? `Retirer de tes souhaits les cartes de la recherche « ${barre.q} »`
+        ? `Retirer de vos souhaits les cartes de la recherche « ${barre.q} »`
           + (barre.raretes.size ? `, raretés ${[...barre.raretes].join(' ')}` : '')
         : 'Vider la liste de souhaits entière. Le compte s’affiche avant, et il faut recliquer.';
     } else if (!barre.q) {
@@ -6765,7 +6989,7 @@
       texte = 'Tout souhaiter';
       titre = `Mettre en souhait les cartes de « ${barre.q} »`
         + (barre.raretes.size ? `, raretés ${[...barre.raretes].join(' ')}` : '')
-        + '. Les cartes que tu possèdes ou souhaites déjà sont écartées, et le compte exact '
+        + '. Les cartes que vous possédez ou souhaitez déjà sont écartées, et le compte exact '
         + 's’affiche avant toute écriture.';
     }
 
@@ -6809,6 +7033,9 @@
         vus.add(x.id);
         trouvees.push({
           auction: x.id,
+          // L'identifiant de la carte, pour retrouver sa cote : sans lui, le
+          // volet affichait un prix sans jamais dire s'il était bon.
+          id: x.card_id,
           title: c.t,
           rarity: x.snapshot_rarity || c.r,
           bid: Number(x.current_bid || x.effective_bid || x.base_amount) || 0,
@@ -6857,6 +7084,31 @@
    * l'enchère. La pastille *offre* dit qu'une mise est déjà posée — sur une
    * carte qu'on veut, savoir qu'on n'est pas seul change ce qu'on propose.
    */
+  /*
+   * Le verdict sur un prix demandé, quand la cote le permet.
+   *
+   * Le volet listait des prix allant de 12 à 22 000 wb sans jamais dire s'ils
+   * étaient bons — alors que la Revente tient la cote de plusieurs milliers de
+   * cartes dans le même navigateur. C'est pourtant la seule question qu'on se
+   * pose devant une carte qu'on veut : est-ce que je mise ?
+   *
+   * On ne tranche que sur une cote solide, au même seuil que le reste : sous
+   * cinq ventes, il n'y a rien à comparer et la ligne reste neutre.
+   */
+  function coteSouhait(x) {
+    const r = (sell.rows || []).find((l) => (x.id && l.id === x.id) || l.t === x.title);
+    if (!r || r.seule || r.n < THIN_SALES) return null;
+    const cls = x.bid <= r.med ? 'bon' : x.bid >= (r.q3 || r.med) ? 'cher' : '';
+    const verdict = cls === 'bon' ? 'sous la médiane'
+      : cls === 'cher' ? 'au-dessus du prix visé' : 'dans la fourchette';
+    return {
+      cls,
+      fleche: cls === 'bon' ? '↓' : cls === 'cher' ? '↑' : '·',
+      titre: `Cote sur ${r.n} ventes — médiane ${fmtWb(r.med)} wb, prix visé `
+        + `${fmtWb(r.q3 || r.med)} wb. La demande actuelle est ${verdict}.`,
+    };
+  }
+
   function wishRows(list) {
     return list
       .map((x) => ({ x, ms: leftNow(x) }))
@@ -6864,13 +7116,14 @@
       .map(({ x, ms }) => {
         const fini = ms != null && ms <= 0;
         const cls = [fini ? 'done' : ms != null && ms <= MKT_SOON_MS ? 'soon' : ''].filter(Boolean).join(' ');
+        const c = coteSouhait(x);
         return `<li class="${cls}" data-auction="${esc(x.auction)}" ${LIGNE_ACTIVE}
-            title="${esc(x.title)} — ouvrir la page de l'enchère"
+            title="${esc(x.title)} — ouvrir la page de l'enchère${c ? `\n${esc(c.titre)}` : ''}"
             style="--c:${RARITY_COLOR[x.rarity] || '#8C8275'}">
           <span class="dot"></span>
           <span class="t">${esc(x.title)}</span>
           ${x.bids ? '<span class="tag">offre</span>' : ''}
-          <span class="v">${fmtWb(x.bid)} wb</span>
+          <span class="v${c ? ` ${c.cls}` : ''}">${c ? `${c.fleche} ` : ''}${fmtWb(x.bid)} wb</span>
           <span class="e">${fmtLeft(ms)}</span>
         </li>`;
       })
@@ -6936,9 +7189,10 @@
       rel: { n: suivies, hot: pausees > 0,
              title: pausees ? `${pausees} carte(s) en pause` : 'Cartes remises en vente automatiquement' },
       souh: { n: souhaits.length, hot: souhaits.length > 0,
-              title: souhaits.length
-                ? `${souhaits.length} carte(s) de ta liste de souhaits en vente`
-                : 'Cartes de ta liste de souhaits actuellement aux enchères' },
+              title: (souhaits.length
+                ? `${souhaits.length} carte(s) de votre liste de souhaits en vente`
+                : 'Cartes de votre liste de souhaits actuellement aux enchères')
+                + '\n↓ le prix demandé est sous la médiane de sa cote · ↑ il dépasse son prix visé' },
     });
 
     /*
@@ -6955,9 +7209,9 @@
     if (!prefs.watchBids && sub !== 'rel' && sub !== 'souh') {
       ui.relist.hidden = true;
       paint(ui.market,
-        `<div class="mkoff"><b>Surveillance désactivée.</b> Coche ` +
-        `« Surveillance » en bas de cet onglet pour suivre ici tes mises, ` +
-        `tes ventes en cours et leurs échéances.</div>`);
+        `<div class="mkoff"><b>Surveillance désactivée.</b> Cochez ` +
+        `« Surveillance » en bas de cet onglet pour suivre ici vos mises, ` +
+        `vos ventes en cours et leurs échéances.</div>`);
       paint(ui.mkfoot, '');
       return;
     }
@@ -6983,7 +7237,7 @@
       ? `<ul>${mktRows(bids, 'bids')}</ul>`
       : `<div class="none">Aucune enchère relevée. Elles ne se lisent que depuis ` +
         `la page Marché, onglet « Mes enchères » — <em>rafraîchir</em> l'ouvre ` +
-        `pour toi si tu y es.</div>`);
+        `pour vous si vous y êtes.</div>`);
 
     /*
      * Le compte du serveur et la liste balayée peuvent diverger le temps d'un
@@ -6997,7 +7251,7 @@
         ? `<div class="none">${occupes} vente${occupes > 1 ? 's' : ''} en cours d'après le ` +
           `serveur : le détail arrive au prochain relevé.</div>`
         : `<div class="none">Aucune vente en cours. Le bouton ci-dessous donne la ` +
-          `cote de tes cartes et pré-remplit le prix de vente.</div>`);
+          `cote de vos cartes et pré-remplit le prix de vente.</div>`);
 
     /*
      * Ce que les ventes closes ont rapporté : chiffre déjà tenu, jamais montré
@@ -7020,8 +7274,8 @@
      */
     const nbSouh = Object.keys(state.wish.cards || {}).length;
     const corpsSouh = !prefs.watchWish
-      ? `<div class="mkoff"><b>Souhaits non surveillés.</b> Coche « Souhaits » en ` +
-        `bas de cet onglet : le panneau signalera les cartes de ta liste de ` +
+      ? `<div class="mkoff"><b>Souhaits non surveillés.</b> Cochez « Souhaits » en ` +
+        `bas de cet onglet : le panneau signalera les cartes de votre liste de ` +
         `souhaits mises aux enchères.</div>`
       : mktHead(souhaits.length
           ? `<span class="n">${souhaits.length}</span> en vente sur ${nbSouh} souhaitée${nbSouh > 1 ? 's' : ''}`
@@ -7029,7 +7283,7 @@
           state.wishHits.at) +
         (souhaits.length
           ? `<ul>${wishRows(souhaits)}</ul>`
-          : `<div class="none">Rien de ta liste de souhaits aux enchères en ce ` +
+          : `<div class="none">Rien de votre liste de souhaits aux enchères en ce ` +
             `moment. Le marché récent est relu toutes les 100 s ; ajoute des ` +
             `cartes depuis <em>Toutes les cartes</em> sur le site.</div>`);
 
@@ -7154,6 +7408,7 @@
        */
       const info = vente ? fmtLeft(leftNow(vente)) : '';
       const infobulle = `${w.title} — annonce de ${w.minutes || 10} min à ${w.price} wb` +
+        (w.invendus ? ` · invendue ${w.invendus} fois` : '') +
         (w.paused ? ` · en pause après ${w.fails} tentatives` : '');
       return `<li class="${cls}" title="${esc(infobulle)}">
         <span class="dot"></span>
@@ -7177,7 +7432,7 @@
      * était arrivé à la carte, et le motif d'un refus restait dans l'infobulle,
      * là où personne ne va le chercher. Les deux sont maintenant écrits.
      */
-    const VERBES = { ok: 'remise en vente', refus: 'refusée', stop: 'retirée' };
+    const VERBES = { ok: 'remise en vente', refus: 'refusée', stop: 'retirée', baisse: 'prix baissé' };
     const journal = log.slice(0, 6).map((e) => {
       const age = Date.now() - e.at;
       const verbe = e.issue === 'ok' && e.motif === 'vendue' ? 'vendue'
@@ -7189,7 +7444,8 @@
         <span class="act">${verbe}</span>
         ${e.prix != null ? `<span class="p">${e.prix} wb</span>` : ''}
         <span class="w">${age < 60000 ? "à l'instant" : fmtSpan(age)}</span>
-        ${e.issue === 'refus' && e.motif ? `<span class="why">${esc(e.motif)}</span>` : ''}
+        ${(e.issue === 'refus' || e.issue === 'baisse') && e.motif
+          ? `<span class="why">${esc(e.motif)}</span>` : ''}
       </li>`;
     });
 
@@ -7223,7 +7479,7 @@
         ? `<ul class="suivi">${lignes.join('')}</ul>`
         : `<div class="empty">Aucune carte suivie. ${prefs.relistUnsold
             ? `Une vente qui se termine sans acheteur s'inscrit toute seule.`
-            : `Coche « Relances auto » en bas pour que les ventes sans acheteur s'inscrivent seules.`}</div>`) +
+            : `Cochez « Relances auto » en bas pour que les ventes sans acheteur s'inscrivent seules.`}</div>`) +
       (journal.length ? `<div class="rh sub">Journal</div><ul class="jour">${journal.join('')}</ul>` : ''));
   }
 
@@ -7544,7 +7800,43 @@
     saveStore({ nextRelistAt: state.nextRelistAt });
   }
 
-  function enrolWatch(card, title, price, minutes) {
+  /*
+   * Combien de tours invendus avant de baisser, et jusqu'où.
+   *
+   * Une annonce qui ne trouve pas preneur deux fois de suite au même prix a
+   * répondu à la question : le prix est trop haut. La relance rejouait pourtant
+   * `base_amount: w.price` à l'identique, indéfiniment — le journal d'un compte
+   * réel montrait la même carte échouer deux fois au même montant, quatre
+   * cartes sur les douze dernières lignes, pour 14 ventes conclues sur 100.
+   *
+   * On ne descend jamais sous la médiane d'une cote solide : c'est le prix
+   * auquel la carte se vend vraiment, pas un prix bradé. Sans cote fiable, on
+   * retire un quart par tour, avec un plancher absolu pour ne pas offrir une
+   * carte à zéro au bout de quelques échecs.
+   */
+  const RELIST_TOURS_AVANT_BAISSE = 2;
+  const RELIST_BAISSE = 0.75;
+  const RELIST_PLANCHER = 5;
+
+  /**
+   * Le prix de la prochaine annonce, après un invendu.
+   * @param {string} card     identifiant de la carte
+   * @param {string} titre    son titre, pour retrouver la cote d'un cache ancien
+   * @param {number} prix     le prix qui vient d'échouer
+   * @param {number} tours    nombre d'invendus consécutifs, celui-ci compris
+   */
+  function prixApresInvendu(card, titre, prix, tours) {
+    if (tours < RELIST_TOURS_AVANT_BAISSE) return prix;
+    const ligne = (sell.rows || []).find((r) => r.id === card || r.t === titre);
+    const plancher = ligne && !ligne.seule && ligne.n >= THIN_SALES
+      ? Math.max(RELIST_PLANCHER, ligne.med)
+      : RELIST_PLANCHER;
+    // Déjà au plancher : insister à la baisse ne vendrait pas davantage.
+    if (prix <= plancher) return prix;
+    return Math.max(plancher, Math.round(prix * RELIST_BAISSE));
+  }
+
+  function enrolWatch(card, title, price, minutes, invendus) {
     if (!card || !price) return false;
     /*
      * Une carte étiquetée ne s'inscrit pas. C'est la première des deux barrières
@@ -7564,6 +7856,9 @@
       since: dejaLa ? dejaLa.since : Date.now(),
       fails: 0,
       paused: false,
+      // Les tours perdus survivent à la réinscription : c'est eux qui font
+      // baisser le prix, et les remettre à zéro à chaque cycle les annulerait.
+      invendus: invendus != null ? invendus : (dejaLa && dejaLa.invendus) || 0,
       /*
        * On garde la trace de la dernière annonce publiée. La réinscription
        * l'effaçait, et avec elle la garantie « une annonce à la fois » : une
@@ -7800,7 +8095,14 @@
       } else if (prefs.relistUnsold) {
         // Invendue : on l'inscrit, la réconciliation se charge du reste.
         const t = await listingTerms(id, n.data?.auction_id || null);
-        if (t) enrolWatch(id, titre, t.price, t.minutes);
+        if (t) {
+          const tours = ((state.watch[id] && state.watch[id].invendus) || 0) + 1;
+          const prix = prixApresInvendu(id, titre, t.price, tours);
+          if (prix < t.price) {
+            logRelist(titre, 'baisse', prix, `invendue ${tours} fois à ${t.price} wb`);
+          }
+          enrolWatch(id, titre, prix, t.minutes, tours);
+        }
       }
     }
     if (!ajout) return;
@@ -7876,7 +8178,28 @@
         sell.at = d.at || 0;
         sell.tags = d.tags || [];
         sell.themes = d.themes || {};
-        for (const r of sell.rows) if (r.id) sell.checked.add(r.id);
+        /*
+         * Le cache porte des cotes calculées par l'ancienne règle, où le
+         * « 3e quartile » d'un échantillon mince valait le maximum. On les
+         * répare ici plutôt que d'attendre un rescan de la collection entière
+         * — qui dure plusieurs minutes et que personne ne relance pour un
+         * correctif qu'il ignore. La réparation est exacte : sous le seuil,
+         * la valeur juste est la médiane, et elle est déjà dans la ligne.
+         */
+        for (const r of sell.rows) {
+          if (r.id) sell.checked.add(r.id);
+          if (r.seule || r.n >= THIN_SALES) continue;
+          /*
+           * Deux ventes : la médiane rangée est celle du haut, donc le maximum
+           * — s'y replier ne corrigerait rien. Les deux valeurs centrales sont
+           * ici le minimum et le maximum, tous deux dans la ligne : la vraie
+           * médiane se recalcule exactement, sans relire quoi que ce soit.
+           */
+          if (r.n === 2 && Number.isFinite(r.min) && Number.isFinite(r.max)) {
+            r.med = Math.round((r.min + r.max) / 2);
+          }
+          r.q3 = r.med;
+        }
       }
     } catch (_) {
       /* cache illisible : on rescannera */
@@ -8064,7 +8387,8 @@
       });
     } catch (err) {
       cards = [];
-      sell.note = `La lecture de ta collection s’est interrompue : ${(err && err.message) || 'erreur inconnue'}.`;
+      console.warn('[WikiMasters Tools] lecture de la collection interrompue :', err);
+      sell.note = 'La lecture de votre collection s’est interrompue — réessayez.';
     }
 
     /*
@@ -8076,10 +8400,11 @@
     if (!cards.length) {
       sell.scanning = false;
       if (!sell.note) {
+        if (sell.refus) console.warn('[WikiMasters Tools] collection refusée', sell.refus);
         sell.note = sell.refus
-          ? `Le serveur a refusé la lecture de ta collection (statut ${sell.refus}). `
-            + 'Recharge la page ; si ça persiste, reconnecte-toi au site.'
-          : 'Ta collection est revenue vide : rien à coter.';
+          ? 'Le serveur a refusé de lire votre collection. '
+            + 'Rechargez la page ; si ça persiste, reconnectez-vous au site.'
+          : 'Votre collection est revenue vide : rien à coter.';
       }
       renderSell();
       return;
@@ -8125,11 +8450,11 @@
       sell.scanning = false;
       sell.refusVentes = sonde.status;
       sell.refusVentesN = 1;
+      console.warn('[WikiMasters Tools] marché des cartes refusé', sonde.status || 'réseau');
       sell.note = sonde.status === 403
-        ? 'le marché des cartes est réservé aux comptes PRO (403) — coche « Accès direct à '
-          + 'la base » dans les réglages : la cote passe alors par la table des enchères, '
-          + 'sans l’abonnement'
-        : `le serveur a refusé le marché des cartes (statut ${sonde.status || 'réseau'})`;
+        ? 'les prix sont réservés aux comptes PRO — cochez « Accès direct à '
+          + 'la base » dans les réglages : ils redeviennent lisibles sans l’abonnement'
+        : 'le serveur a refusé de donner les prix du marché';
       renderSell();
       return;
     }
@@ -8240,8 +8565,9 @@
       const parId = new Map(sell.rows.map((r) => [r.id, r]));
       for (const r of rows) parId.set(r.id, r);
       sell.rows = [...parId.values()];
-      sell.note = `relevé partiel : lecture interrompue à ${cards.length} cartes`
-        + `${sell.refus ? ` (statut ${sell.refus})` : ''}, les cotes déjà connues sont gardées`;
+      if (sell.refus) console.warn('[WikiMasters Tools] lecture interrompue', sell.refus);
+      sell.note = `relevé partiel : lecture interrompue à ${cards.length.toLocaleString('fr-FR')} `
+        + 'cartes, les cotes déjà connues sont gardées';
     } else if (!rows.length) {
       /*
        * Zéro ligne, trois causes possibles et un seul écran vide : le serveur
@@ -8255,14 +8581,16 @@
        * la session du joueur. C'est donc vers ce réglage qu'il faut envoyer,
        * pas vers une page d'abonnement.
        */
+      if (sell.refusVentes) {
+        console.warn('[WikiMasters Tools] historique des ventes refusé', sell.refusVentes);
+      }
       sell.note = sell.refusVentes === 403
-        ? 'le marché des cartes est réservé aux comptes PRO (403) — coche « Accès direct à '
-          + 'la base » dans les réglages : la cote passe alors par la table des enchères, '
-          + 'sans l’abonnement'
+        ? 'les prix sont réservés aux comptes PRO — cochez « Accès direct à '
+          + 'la base » dans les réglages : ils redeviennent lisibles sans l’abonnement'
         : sell.refusVentesN
-          ? `le serveur a refusé l’historique des ventes (statut ${sell.refusVentes}) — `
-            + `relevé arrêté après ${sell.refusVentesN} cartes sur ${cards.length}`
-          : `aucune de tes ${cards.length} cartes n’a d’historique de vente`;
+          ? 'le serveur a refusé l’historique des ventes — relevé arrêté après '
+            + `${sell.refusVentesN.toLocaleString('fr-FR')} cartes sur ${cards.length.toLocaleString('fr-FR')}`
+          : `aucune de vos ${cards.length.toLocaleString('fr-FR')} cartes n’a d’historique de vente`;
       if (!sell.rows.length) sell.rows = rows;
     } else {
       sell.rows = rows;
@@ -8285,7 +8613,28 @@
    * étiquettes réellement rencontrées dans la collection, et le choix est
    * mémorisé. Un compte qui n'en utilise pas ne voit pas le sélecteur.
    */
-  const sellPrefs = { minSales: 2, hideTags: [], hideTagged: false, rarity: '', onlyFree: true };
+  /*
+   * `minSales` par défaut au seuil du ⚠, et pas en dessous. À 2, le tableau
+   * laissait passer — et classait en tête — exactement les lignes qu'il
+   * signalait lui-même comme non fiables : sur les sept premières d'un compte
+   * réel, les trois solides étaient toutes étiquetées donc invendables, et les
+   * quatre seules à porter un bouton « Vendre » étaient les quatre marquées ⚠.
+   * Deux seuils qui se contredisent ne valent pas mieux qu'aucun seuil.
+   */
+  const sellPrefs = { minSales: THIN_SALES, hideTags: [], hideTagged: false, rarity: '', onlyFree: true };
+
+  /** Une cote assise sur assez de ventes pour qu'on la classe devant. */
+  const fiable = (x) => (!x.seule && x.n >= THIN_SALES ? 1 : 0);
+
+  /*
+   * Le relevé de la concurrence a-t-il eu lieu ? `sell.comp` vide se lisait
+   * comme « personne ne vend rien », et le filtre « sans concurrence » laissait
+   * alors passer TOUT le catalogue en le présentant comme exclusif. Mesuré au
+   * chronomètre sur un compte réel : N cartes annoncées sans concurrence
+   * pendant le relevé, N une fois celui-ci terminé — N cartes présentées
+   * comme uniques ne l'étaient pas. L'absence de donnée n'est pas une donnée.
+   */
+  const concurrenceConnue = () => !!sell.compAt;
 
   function sellRows() {
     return sell.rows
@@ -8298,8 +8647,14 @@
       .filter((x) => sellPrefs.hideTagged || !x.tags.some((t) => sellPrefs.hideTags.includes(t)))
       .filter((x) => !sellPrefs.rarity || x.r === sellPrefs.rarity)
       // Sans concurrence d'abord, puis par prix visé.
-      .filter((x) => !sellPrefs.onlyFree || !sell.comp.get(x.id))
-      .sort((a, b) => (b.q3 || b.med) - (a.q3 || a.med));
+      .filter((x) => !sellPrefs.onlyFree || !concurrenceConnue() || !sell.comp.get(x.id))
+      /*
+       * Les cotes minces passent derrière, quel que soit leur prix. Trier sur
+       * le seul prix revenait à classer par incertitude : moins une carte a de
+       * ventes, plus son estimation est haute, plus elle remontait. Le haut du
+       * tableau — celui qu'on lit — était donc systématiquement le moins sûr.
+       */
+      .sort((a, b) => fiable(b) - fiable(a) || (b.q3 || b.med) - (a.q3 || a.med));
   }
 
   /** Ouvre la fiche de la carte au formulaire d'enchère, prix pré-rempli. */
@@ -8356,17 +8711,58 @@
    */
   function coteRow(c, px) {
     const sorted = px.slice().sort((a, b) => a - b);
+    const med = medianeDe(sorted);
     return {
       id: c.id, t: c.t || c.title, r: c.r || c.rarity, tags: c.tags || [], n: px.length,
       theme: themeOf(c.cat || ''), vues: c.vues || 0,
       moy: Math.round(px.reduce((a, b) => a + b, 0) / px.length),
-      // La médiane résiste aux ventes aberrantes, fréquentes ici.
-      med: sorted[Math.floor(sorted.length / 2)],
-      // 3e quartile : on vend à la patience, pas au prix courant.
-      q3: sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * 0.75))],
+      med,
+      q3: q3De(sorted, med),
       min: sorted[0], max: sorted[sorted.length - 1],
     };
   }
+
+  /*
+   * La médiane résiste aux ventes aberrantes, fréquentes ici — encore
+   * faut-il que ce soit une médiane.
+   *
+   * `sorted[floor(n / 2)]` rend l'élément du HAUT sur un échantillon pair. Sur
+   * deux ventes, une à 2 wikibidous et une à 10 000, il rendait donc 10 000 :
+   * la « valeur du milieu » était le maximum, et le repli du prix visé sur la
+   * médiane ne repliait sur rien. C'est le contrôle du vérificateur qui l'a
+   * montré, en réclamant que le prix visé diffère du maximum.
+   *
+   * Sur un nombre pair, la médiane est la moyenne des deux valeurs centrales.
+   */
+  const medianeDe = (trie) => {
+    const m = trie.length >> 1;
+    return trie.length % 2 ? trie[m] : Math.round((trie[m - 1] + trie[m]) / 2);
+  };
+
+  /*
+   * 3e quartile : on vend à la patience, pas au prix courant.
+   *
+   * Sauf qu'en dessous de cinq ventes, `floor(n × 0,75)` tombe sur le DERNIER
+   * indice — 1 sur 2, 2 sur 3, 3 sur 4. Ce n'était donc pas une approximation
+   * du quartile, c'était le MAXIMUM jamais atteint, et c'est lui qui partait
+   * dans le formulaire de vente.
+   *
+   * Relevé à l'écran, sur un compte réel : une Rare cotée 1 565 sur trois
+   * ventes dont la médiane est 28 — cinquante-six fois la médiane. Une Commune
+   * à 10 000 sur deux ventes, l'une à 2 et l'autre à 10 000. Ces lignes-là
+   * arrivaient en TÊTE du tableau, le tri se faisant sur ce prix.
+   *
+   * Le compteur de ventes conclues disait le reste : 14 sur 100.
+   *
+   * Le seuil est celui du ⚠ que le tableau affiche déjà — au-dessus,
+   * `floor(n × 0,75)` désigne un vrai quartile haut ; en dessous, on s'en
+   * tient à la médiane, qui ne peut pas être une valeur aberrante à elle
+   * seule.
+   */
+  const q3De = (trie, med) =>
+    trie.length < THIN_SALES
+      ? med
+      : trie[Math.min(trie.length - 1, Math.floor(trie.length * 0.75))];
 
   /**
    * La cote quand le site ne rend qu'une moyenne — ce que voit un compte sans
@@ -8697,7 +9093,7 @@
           <div class="bar">
             <label>Ventes mini <input type="number" data-min min="1" max="50"></label>
             <label>Rareté <select data-rar></select></label>
-            <label title="N'afficher que les cartes que personne d'autre ne propose en ce moment">
+            <label data-freelabel title="N'afficher que les cartes que personne d'autre ne propose en ce moment">
               <input type="checkbox" data-free> Sans concurrence</label>
             <span class="tags" data-taglabel hidden>Masquer <button class="tagchip" data-all>toutes les étiquetées</button><span data-tag></span></span>
             <button data-rescan>Rafraîchir la cote</button>
@@ -8705,10 +9101,11 @@
           <div class="scroll" data-scroll></div>
           <div class="journal" data-journal></div>
           <div class="note">
-            ⚠ signale une cote établie sur moins de 5 ventes : le prix peut être
-            une coïncidence. Rien n'est mis en vente depuis cette page. « Vendre » ouvre la fiche de la carte
-            sur le formulaire du site, avec le 3e quartile des ventes pré-rempli — tu choisis la durée
-            et tu lances l'enchère toi-même.
+            ⚠ signale une cote établie sur moins de 5 ventes : le prix visé y
+            retombe sur la médiane, et ces cartes passent en fin de tableau.
+            Rien n'est mis en vente depuis cette page. « Vendre » ouvre la fiche
+            de la carte sur le formulaire du site, prix pré-rempli — vous
+            choisissez la durée et vous lancez l'enchère vous-même.
           </div>
         </div>
       </div>`;
@@ -8717,7 +9114,7 @@
     const q = (s) => root.querySelector(s);
     sellUI = { host, root, sum: q('[data-sum]'), scroll: q('[data-scroll]'),
       journal: q('[data-journal]'), min: q('[data-min]'), rar: q('[data-rar]'), free: q('[data-free]'), tag: q('[data-tag]'),
-      taglabel: q('[data-taglabel]'), all: q('[data-all]') };
+      taglabel: q('[data-taglabel]'), all: q('[data-all]'), freeLabel: q('[data-freelabel]') };
 
     q('[data-close]').addEventListener('click', closeSell);
     q('[data-wrap]').addEventListener('click', (e) => { if (e.target === q('[data-wrap]')) closeSell(); });
@@ -8827,9 +9224,9 @@
       // collection, on cote ensuite. Un compteur figé sur « 0 » n'a jamais dit
       // lequel des deux était en cours.
       if (!sell.total) {
-        sellUI.sum.textContent = `lecture de ta collection · ${sell.read} cartes`;
+        sellUI.sum.textContent = `lecture de votre collection · ${sell.read} cartes`;
         paint(sellUI.scroll,
-          '<div class="empty">Lecture de ta collection, 50 cartes par page…</div>');
+          '<div class="empty">Lecture de votre collection, 50 cartes par page…</div>');
         return;
       }
       sellUI.sum.textContent = `cotation ${sell.done} / ${sell.total}`;
@@ -8851,8 +9248,22 @@
         (sell.compTronque ? ' (dernier relevé interrompu — le serveur a freiné)' : '')
       : sell.compTronque
         ? ' · relevé de la concurrence interrompu — « sans concurrence » n’est pas fiable'
-        : ' · relevé de la concurrence en cours…';
-    sellUI.sum.textContent = `${rows.length} cartes · ~${valeur.toLocaleString('fr-FR')} wb${age}${conc}`
+        : ' · relevé de la concurrence en cours — « sans concurrence » ne filtre pas encore';
+
+    /*
+     * La case ne doit pas avoir l'air d'agir tant qu'elle n'agit pas : cochée
+     * pendant le relevé, elle affirmait N cartes exclusives dont 159 ne
+     * l'étaient pas. On la neutralise le temps que la concurrence soit connue.
+     */
+    sellUI.free.disabled = !concurrenceConnue();
+    sellUI.freeLabel.style.opacity = concurrenceConnue() ? '' : '.4';
+    sellUI.freeLabel.title = concurrenceConnue()
+      ? 'N’afficher que les cartes que personne d’autre ne propose en ce moment'
+      : 'En attente du relevé de la concurrence : le filtre ne peut pas encore savoir qui vend quoi.';
+
+    // Les deux nombres de la même ligne s'écrivaient dans deux formats : « 1234
+    // cartes · ~56 789 wb ».
+    sellUI.sum.textContent = `${rows.length.toLocaleString('fr-FR')} cartes · ~${valeur.toLocaleString('fr-FR')} wb${age}${conc}`
       + (sell.note ? ` · ${sell.note}` : '');
 
     if (!rows.length) {
@@ -8898,7 +9309,7 @@
               x.seule
                 ? ' title="Le site n’a donné que la moyenne, sans le détail des ventes : impossible de savoir sur combien de transactions elle repose."'
                 : x.n < THIN_SALES
-                  ? ' title="Cote établie sur moins de 5 ventes : le prix visé peut être une coïncidence plutôt qu’un prix de marché."'
+                  ? ' title="Moins de 5 ventes : trop peu pour un quartile haut, le prix visé retombe donc sur la médiane. La carte passe aussi en fin de tableau."'
                   : ''
             }>${x.seule ? '⌀' : `${x.n}${x.n < THIN_SALES ? ' ⚠' : ''}`}</td>
             <td class="num ${sell.comp.get(x.id) ? 'busy' : 'free'}">${sell.comp.get(x.id) || '—'}</td>
@@ -8955,6 +9366,18 @@
   setInterval(() => {
     if (location.pathname.startsWith('/achievements')) readAchievements();
   }, 3000);
+
+  /*
+   * La vérification du numéro en ligne. Elle se garde elle-même à une fois par
+   * heure — le tour n'est là que pour couvrir un onglet resté ouvert toute la
+   * journée, cas exactement le plus concerné : c'est celui-là qui rate la
+   * fenêtre de Tampermonkey.
+   *
+   * Le premier passage attend que la page se pose : rien de ceci n'est urgent,
+   * et une requête sortante pendant le montage retarderait ce qui l'est.
+   */
+  setTimeout(chercherMaj, MAJ_PREMIER_DELAI);
+  setInterval(chercherMaj, MAJ_TOUTES_LES_MS);
 
   /*
    * Et le même relevé en base, depuis n'importe quelle page. Le DOM ne parle
