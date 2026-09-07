@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WikiMasters Tools
 // @namespace    https://www.wiki-masters.com/
-// @version      2.7.1
+// @version      2.8.0
 // @description  Boîte à outils WikiMasters : ouverture automatique des paquets, suivi des tirages, cote des cartes et revente.
 // @match        https://www.wiki-masters.com/*
 // @match        https://wiki-masters.com/*
@@ -41,7 +41,7 @@
    *
    * Il est lu par le garde juste en dessous, d'où sa place en tête.
    */
-  const VERSION = '2.7.1';
+  const VERSION = '2.8.0';
 
   /*
    * Une seule instance par page — et savoir laquelle
@@ -295,6 +295,12 @@
     wish: { at: 0, cards: {} },      // liste de souhaits : card_id -> { t, r }
     wishHits: { at: 0, list: [] },   // souhaits actuellement en vente
     wishSeen: {},                    // annonces déjà signalées, pour ne pas re-notifier
+    /*
+     * Les souhaits qu'un ami détient. Dérivé de la MÊME lecture que `wish` :
+     * chaque réponse de la liste de souhaits porte déjà `friendOwners`, et
+     * l'ignorer revenait à jeter la moitié de ce qu'on venait de payer.
+     */
+    troc: { at: 0, lignes: [], amis: 0, enAttente: 0 },
     message: 'Prêt.',
     warn: false,
   };
@@ -480,6 +486,7 @@
     if (s.wish && s.wish.cards) state.wish = s.wish;
     if (s.wishHits && Array.isArray(s.wishHits.list)) state.wishHits = s.wishHits;
     if (s.wishSeen && typeof s.wishSeen === 'object') state.wishSeen = s.wishSeen;
+    if (s.troc && Array.isArray(s.troc.lignes)) state.troc = s.troc;
 
     const st = s.stats;
     if (st && typeof st === 'object') {
@@ -4573,6 +4580,30 @@
      * geste — copier une liste et la coller dans le canal de la guilde. Il est
      * donc en tête, et c'est le seul endroit de l'onglet avec un bouton.
      */
+    /*
+     * Le volet Échanges emprunte la boîte des souhaits de guilde : c'est la
+     * même famille — ce que les autres joueurs peuvent pour toi — et deux
+     * cadres différents dans un même onglet se seraient disputés l'attention.
+     */
+    .troc { padding: 9px 10px; margin-bottom: 8px; border: 1px solid var(--line);
+            border-radius: 10px; font-size: 10px; line-height: 1.55; color: var(--dim); }
+    .troc .h { font-size: 11px; color: var(--text); font-weight: 600; margin-bottom: 5px; }
+    .troc b { color: var(--muted); font-weight: 600; font-variant-numeric: tabular-nums; }
+    .troc .l {
+      display: flex; align-items: baseline; gap: 6px; width: calc(100% + 12px);
+      margin: 0 -6px; padding: 4px 6px; border: 0; border-radius: 7px;
+      background: none; color: var(--dim); font: inherit; text-align: left; cursor: pointer;
+      transition: background .14s;
+    }
+    .troc .l:hover { background: var(--raise); }
+    /* Le titre cède la place le premier : le nom de l'ami est ce qui fait agir. */
+    .troc .l .t { flex: 1; min-width: 0; color: var(--text); font-weight: 600;
+                  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .troc .l .r { flex: none; color: var(--muted); font-weight: 700; }
+    .troc .l .q { flex: none; max-width: 45%; color: var(--muted);
+                  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .troc .plus { margin-top: 6px; color: var(--muted); }
+
     .gwish { padding: 9px 10px; margin-bottom: 8px; border: 1px solid var(--line);
              border-radius: 10px; font-size: 10px; line-height: 1.55; color: var(--dim); }
     .gwish .h { display: flex; align-items: baseline; gap: 6px;
@@ -4912,6 +4943,7 @@
               <input type="checkbox" data-opt-gwatch> Alerter sur mes SR / UR demandées</label>
             <div class="gwish" data-gwish></div>
             <div data-gdons></div>
+            <div class="troc" data-troc></div>
           </section>
 
           <section class="tab" data-tab="reglages">
@@ -4965,6 +4997,7 @@
       bonusnote: q('[data-bonusnote]'),
       dbnote: q('[data-dbnote]'),
       gwish: q('[data-gwish]'),
+      troc: q('[data-troc]'),
       optGwatch: q('[data-opt-gwatch]'),
       gdons: q('[data-gdons]'),
       optDb: q('[data-opt-db]'),
@@ -5199,6 +5232,11 @@
      * en ouvrant l'onglet. Le texte copié se colle tel quel dans le canal de la
      * guilde — c'est le livrable, le panneau n'écrit nulle part à ta place.
      */
+    ui.troc.addEventListener('click', (e) => {
+      const b = e.target.closest('[data-troc-qui]');
+      if (b) goTroc(b.dataset.trocQui);
+    });
+
     ui.gwish.addEventListener('click', async (e) => {
       const tuto = e.target.closest('[data-gtuto]');
       const refaire = e.target.closest('[data-gnext]');
@@ -5680,6 +5718,14 @@
    * chiffre l'arbitrage, et te mène à la page.
    */
   function renderGuild() {
+    /*
+     * Avant le retour anticipé qui suit : les échanges ne dépendent pas du
+     * relevé de la guilde, ils viennent de la liste de souhaits. Les laisser
+     * derrière ce garde les aurait rendus invisibles tant que la guilde se
+     * tait — c'est-à-dire au tout premier affichage, celui qui compte.
+     */
+    renderTroc();
+
     const g = state.guild;
     if (!g || !g.at) {
       paint(ui.gdons, `<div class="gskip">Relevé de la guilde en cours…</div>`);
@@ -6031,6 +6077,14 @@
   async function refreshWishlist(force) {
     if (!force && Date.now() - state.wish.at < WISH_TTL_MS) return state.wish;
     const cartes = {};
+    /*
+     * Chaque page porte aussi `friendOwners` — quel ami détient quelle carte —
+     * et `friendPendingOfferKeys`, les couples joueur:carte déjà engagés dans
+     * une offre. Les récolter ici ne coûte rien : ce sont les mêmes réponses.
+     */
+    const chezAmis = {};
+    const amis = new Set();
+    const engages = new Set();
     try {
       for (let page = 0; page < WISH_MAX_PAGES; page++) {
         const d = await api(`/api/cards?page=${page}&wishlist=1`);
@@ -6038,6 +6092,14 @@
         if (!lot.length) break;
         for (const c of lot) {
           cartes[c.id] = { t: c.wikipedia_title || c.title || c.id, r: c.rarity || '?' };
+        }
+        for (const k of (d.data && d.data.friendPendingOfferKeys) || []) engages.add(k);
+        const proprios = (d.data && d.data.friendOwners) || {};
+        for (const [id, liste] of Object.entries(proprios)) {
+          for (const a of liste || []) {
+            if (!a || !a.username) continue;
+            (chezAmis[id] = chezAmis[id] || []).push(a);
+          }
         }
         if (d.data && Number.isFinite(d.data.total)
             && Object.keys(cartes).length >= d.data.total) break;
@@ -6051,8 +6113,148 @@
      */
     if (!Object.keys(cartes).length) return state.wish;
     state.wish = { at: Date.now(), cards: cartes };
-    saveStore({ wish: state.wish });
+
+    /*
+     * Le filtrage des offres en cours se fait ICI, une fois tout lu : les
+     * couples engagés arrivent page par page, et une clé de la page 2 peut
+     * porter sur une carte de la page 1. Filtrer au fil de l'eau aurait laissé
+     * passer celles qui arrivent après leur carte.
+     *
+     * Ordre des lignes : par rareté décroissante, puis par nombre d'amis. Une
+     * Légendaire détenue par un ami est la ligne qui vaut le déplacement ; une
+     * Commune que quatre amis possèdent ne vaut presque rien, et se retrouve
+     * en bas d'elle-même.
+     */
+    const lignes = [];
+    for (const [id, proprios] of Object.entries(chezAmis)) {
+      const carte = cartes[id];
+      if (!carte) continue;
+      const qui = proprios
+        .filter((a) => !engages.has(`${a.id}:${id}`))
+        .map((a) => a.username);
+      if (!qui.length) continue;
+      lignes.push({ id, t: carte.t, r: carte.r, qui: [...new Set(qui)] });
+      for (const u of qui) amis.add(u);
+    }
+    const rang = (r) => {
+      const i = RARETES.indexOf(r);
+      return i === -1 ? RARETES.length : i;
+    };
+    lignes.sort((a, b) => rang(a.r) - rang(b.r) || b.qui.length - a.qui.length
+      || a.t.localeCompare(b.t));
+
+    state.troc = {
+      at: Date.now(),
+      lignes,
+      amis: amis.size,
+      enAttente: engages.size,
+    };
+    saveStore({ wish: state.wish, troc: state.troc });
+    renderTroc();
     return state.wish;
+  }
+
+  /*
+   * Le volet Échanges
+   * -----------------
+   * `friendOwners` répond à la question que le marché ne sait pas traiter :
+   * non pas « qui vend cette carte », mais « qui l'a ». Sur la liste de
+   * souhaits, mesuré au moment de l'écriture : 37 souhaits sur 71 détenus par
+   * au moins un ami, 26 amis distincts. Plus de la moitié de ce qu'on cherche
+   * est à portée de conversation, et rien ne le disait.
+   *
+   * Il vit dans l'onglet Guilde, pas dans un cinquième onglet : la barre en
+   * porte quatre à 11,5 px, et un cinquième déborderait à 260 px de large — la
+   * borne basse de la poignée de redimensionnement. Guilde est d'ailleurs déjà
+   * l'onglet des autres joueurs : ce qu'ils demandent, ce qu'on peut leur
+   * donner, et maintenant ce qu'ils détiennent.
+   *
+   * Ce que le volet NE fait pas : proposer. Une proposition engage une de tes
+   * cartes et un autre joueur ; c'est de la même famille que vendre ou donner,
+   * et le panneau ne le fait pas à ta place. Il montre, il ouvre le composeur
+   * au bon nom, et il s'arrête là.
+   */
+  const TROC_LIGNES = 8;   // au-delà, le volet cesse d'être lisible d'un coup d'œil
+
+  function renderTroc() {
+    if (!ui || !ui.troc) return;
+    const t = state.troc || { lignes: [], amis: 0, enAttente: 0 };
+    const lignes = t.lignes || [];
+
+    if (!lignes.length) {
+      ui.troc.innerHTML = '<div class="h">Échanges</div>'
+        + '<div>Aucun de tes souhaits n’est détenu par un ami pour l’instant. '
+        + 'La liste est relue avec tes souhaits, toutes les quinze minutes.</div>';
+      return;
+    }
+
+    const rangs = lignes.slice(0, TROC_LIGNES).map((l) => {
+      const qui = l.qui.join(', ');
+      return `<button class="l" data-troc-qui="${esc(l.qui[0])}"`
+        + ` title="${esc(l.t)} — détenue par ${esc(qui)}. Ouvre les échanges,`
+        + ` le composeur cherchera ${esc(l.qui[0])}.">`
+        + `<span class="t">${esc(l.t)}</span>`
+        + `<span class="r">${esc(l.r)}</span>`
+        + `<span class="q">${esc(qui)}</span>`
+        + '</button>';
+    }).join('');
+
+    const reste = lignes.length - TROC_LIGNES;
+    const pied = [];
+    if (reste > 0) pied.push(`${reste} autre${reste > 1 ? 's' : ''} plus bas dans la liste`);
+    if (t.enAttente) {
+      pied.push(`${t.enAttente} offre${t.enAttente > 1 ? 's' : ''} déjà en cours, écartée${t.enAttente > 1 ? 's' : ''}`);
+    }
+
+    ui.troc.innerHTML =
+      `<div class="h">Échanges · <b>${lignes.length}</b> souhait${lignes.length > 1 ? 's' : ''}`
+      + ` chez <b>${t.amis}</b> ami${t.amis > 1 ? 's' : ''}</div>`
+      + rangs
+      + (pied.length ? `<div class="plus">${esc(pied.join(' · '))}</div>` : '');
+  }
+
+  /*
+   * Le site n'a pas de lien profond vers le composeur : « Proposer un
+   * échange » ouvre une fenêtre sans toucher à l'URL. On refait donc le geste
+   * — aller sur la page, ouvrir le composeur, y écrire le nom — exactement le
+   * détour déjà fait pour atteindre une carte en collection.
+   *
+   * Chaque étape abandonne en silence si elle ne trouve pas sa cible : on est
+   * alors sur la page des échanges, ce qui reste le bon endroit. Une erreur
+   * affichée pour un raccourci raté vaudrait moins que le raccourci.
+   */
+  function goTroc(qui) {
+    if (!location.pathname.startsWith('/trades')) goPath('/trades');
+    attendre(
+      () => [...document.querySelectorAll('button')]
+        .find((b) => /proposer un échange/i.test(b.textContent)),
+      (bouton) => {
+        bouton.click();
+        attendre(
+          () => document.querySelector('input[placeholder*="Recherch"]'),
+          (champ) => setReactInput(champ, qui),
+        );
+      },
+    );
+  }
+
+  /** Attendre qu'un nœud paraisse, puis agir. Abandon au bout de dix secondes. */
+  function attendre(trouver, agir) {
+    let essais = 0;
+    const id = setInterval(() => {
+      let cible = null;
+      try {
+        cible = trouver();
+      } catch (_) {
+        /* la page se redessine : on retentera au tour suivant */
+      }
+      if (cible) {
+        clearInterval(id);
+        agir(cible);
+      } else if (++essais > 40) {
+        clearInterval(id);
+      }
+    }, 250);
   }
 
   /*
