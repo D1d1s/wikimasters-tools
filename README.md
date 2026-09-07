@@ -41,7 +41,12 @@ bas à droite → **Start**.
 > Un onglet déjà ouvert avant l'installation ne charge pas le script.
 > L'actualisation n'est pas optionnelle.
 
-Les mises à jour se font ensuite toutes seules. Vous n'aurez plus à réinstaller.
+Les mises à jour se font ensuite toutes seules — Tampermonkey s'en charge, sur
+son propre calendrier, en général dans les 24 h.
+
+Le panneau n'attend pas jusque-là pour vous le dire : dès qu'une version plus
+récente est publiée, une **pastille verte** paraît à côté du titre. Un clic
+dessus la propose tout de suite, et vous actualisez la page.
 
 ---
 
@@ -61,21 +66,24 @@ C'est le seul endroit où poser une question. L'invitation n'expire pas, elle pe
 **📦 Paquets** — ouvre vos paquets en boucle, au rythme que le serveur autorise,
 et dort jusqu'à l'heure exacte de régénération plutôt que de le harceler. Compte
 à rebours, journal des tirages, paliers de collection avec le temps qu'ils
-demandent, et les succès dont la récompense **attend d'être réclamée**.
+demandent, et les succès dont la récompense **attend d'être réclamée**. Cliquer
+une pastille de rareté ouvre votre collection sur ces seuls tirages.
 
 **🪙 Marché** — vos enchères, vos ventes et leurs emplacements, les cartes de
-votre liste de souhaits mises aux enchères, et la remise en vente automatique des
-invendus.
+votre liste de souhaits mises aux enchères — avec le prix demandé **comparé à
+leur cote** — et la remise en vente automatique des invendus, dont le prix
+baisse tout seul si personne n'en veut.
 
-**🏰 Guilde** — les dons possibles, classés, avec le calcul qui dit si donner
-rapporte plus que vendre. Et **quels de vos souhaits sont déjà chez vos amis**,
-Légendaires en tête, avec la page d'échange ouverte au bon nom en un clic.
+**🏰 Guilde** — les cartes que vous pouvez donner tout de suite, avec le karma
+que chacune rapporte, et un lot de cinq à publier dans le tchat. Et **quels de
+vos souhaits sont déjà chez vos amis**, Légendaires en tête, avec la page
+d'échange ouverte au bon nom en un clic.
 
-**Et dans les pages du jeu** — un filtre *Nouveaux* dans votre collection, un tri
-**par valeur réelle** de toute la collection, un bouton **Tout souhaiter** qui met
-une recherche entière en liste de souhaits — « BMW », c'est 345 cartes en un
-clic au lieu de mille gestes — et une page de revente qui vous dit à quel prix
-vendre et sur quelles cartes vous seriez le seul vendeur.
+**Et dans les pages du jeu** — un tri **par prix** de toute la collection, un
+bouton **Tout souhaiter** qui met une recherche entière en liste de souhaits —
+des centaines de cartes en un clic au lieu d'autant de gestes — et une page de
+revente qui vous dit à quel prix vendre et sur quelles cartes vous seriez le
+seul vendeur.
 
 ---
 
