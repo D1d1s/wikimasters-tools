@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WikiMasters Tools
 // @namespace    https://www.wiki-masters.com/
-// @version      2.9.0
+// @version      2.9.1
 // @description  Boîte à outils WikiMasters : ouverture automatique des paquets, suivi des tirages, cote des cartes et revente.
 // @match        https://www.wiki-masters.com/*
 // @match        https://wiki-masters.com/*
@@ -41,7 +41,7 @@
    *
    * Il est lu par le garde juste en dessous, d'où sa place en tête.
    */
-  const VERSION = '2.9.0';
+  const VERSION = '2.9.1';
 
   /*
    * Une seule instance par page — et savoir laquelle
@@ -4868,6 +4868,19 @@
     .relist .why { flex-basis: 100%; margin: -2px 0 1px 13px; font-size: 10px; line-height: 1.4; color: var(--warn); }
     /* Le motif d'une baisse explique, il n'alerte pas. */
     .relist li.baisse .why { color: var(--dim); }
+    /*
+     * La suggestion de prix : une ligne à elle, sous la carte concernée. Elle
+     * propose, elle n'agit pas — d'où un bouton bien visible plutôt qu'un
+     * message qu'on prendrait pour un compte rendu de ce qui a déjà eu lieu.
+     */
+    .relist .baisse { flex-basis: 100%; display: flex; align-items: center; gap: 7px;
+                      margin: 1px 0 2px 13px; font-size: 10px; color: var(--dim); }
+    .relist .baisse button {
+      padding: 2px 8px; border: 1px solid rgba(240,169,75,.4); border-radius: 999px;
+      background: none; color: var(--warn); cursor: pointer;
+      font: 600 10px var(--sans); font-variant-numeric: tabular-nums;
+    }
+    .relist .baisse button:hover { background: rgba(240,169,75,.16); }
     .relist .empty { font-size: 11px; color: var(--dim); line-height: 1.45; }
     .relist li.wait .dot { background: var(--dim); }
     .relist li.pause .dot { background: var(--warn); opacity: .5; }
@@ -5080,7 +5093,7 @@
             <div class="mopt">
               <label class="opt" title="Relève enchères et ventes. Ne touche à rien tant que vous regardez : il ne change d’onglet et ne recharge qu’en arrière-plan, après une minute d’absence.">
                 <input type="checkbox" data-opt-bids> Surveillance</label>
-              <label class="opt" title="Une vente terminée sans acheteur est relancée pour la même durée. Au deuxième invendu d'affilée, le prix baisse d'un quart — sans jamais descendre sous la médiane des ventes réelles de la carte.">
+              <label class="opt" title="Une vente terminée sans acheteur est relancée au même prix et pour la même durée — le prix que vous avez choisi, jamais un autre. Après deux invendus d'affilée, le volet Relances propose un prix plus bas ; il ne s'applique que si vous cliquez.">
                 <input type="checkbox" data-opt-relist> Relances auto</label>
               <label class="opt" title="Signale les cartes de votre liste de souhaits mises aux enchères. Lit le marché récent, sans rien y publier.">
                 <input type="checkbox" data-opt-wish> Souhaits</label>
@@ -5217,6 +5230,23 @@
         if (w) {
           w.paused = false;
           w.fails = 0;
+          saveStore({ watch: state.watch });
+        }
+        return render();
+      }
+      /*
+       * Le seul endroit où un prix de relance change — et il faut un clic pour
+       * y arriver. Les annonces déjà en ligne ne bougent pas : une enchère
+       * lancée ne se modifie pas, c'est la suivante qui partira au nouveau prix.
+       */
+      const bas = e.target.closest('[data-baisser]');
+      if (bas) {
+        const w = state.watch[bas.dataset.baisser];
+        const prix = Number(bas.dataset.prix);
+        if (w && prix > 0 && prix < w.price) {
+          logRelist(w.title, 'baisse', prix, `à votre demande, après ${w.invendus} invendus à ${w.price} wb`);
+          w.price = prix;
+          w.invendus = 0;   // le compte repart : le nouveau prix n'a pas encore échoué
           saveStore({ watch: state.watch });
         }
         return render();
@@ -7392,6 +7422,24 @@
     const enVente = new Map(ventes.map((v) => [v.card, v]));
     const aInscrire = ventes.filter((v) => !state.watch[v.card]).length;
 
+    /*
+     * La ligne qui propose un prix plus bas — et ne l'applique pas.
+     *
+     * Elle dit ce qu'on constate (n invendus au même prix), ce sur quoi repose
+     * le conseil (la médiane, et sur combien de ventes), et le prix proposé.
+     * Le bouton est le seul chemin : sans clic, la carte repart à SON prix.
+     */
+    const suggestion = (card, w) => {
+      const propose = prixSuggere(card, w.title, w.price, w.invendus || 0);
+      if (propose == null || propose >= w.price) return '';
+      const cote = (sell.rows || []).find((r) => r.id === card || r.t === w.title);
+      return `<span class="baisse">
+        invendue ${w.invendus} fois à ${w.price} wb
+        <button data-baisser="${esc(card)}" data-prix="${propose}"
+          title="Les prochaines annonces partiront à ${propose} wb au lieu de ${w.price} wb. Calculé sur ${cote.n} ventes réelles, dont la médiane est ${cote.med} wb — la suggestion ne descend jamais en dessous. Rien ne change tant que vous ne cliquez pas.">passer à ${propose} wb</button>
+      </span>`;
+    };
+
     const lignes = suivies.map(([card, w]) => {
       const vente = enVente.get(card);
       // Une carte bloquée par la garde « une annonce à la fois » est bien en
@@ -7420,6 +7468,7 @@
           ? `<button class="x" data-retry="${esc(card)}" title="Reprendre le suivi : remet le compteur d'échecs à zéro">↻</button>`
           : ''}
         <button class="x" data-unwatch="${esc(card)}" title="Ne plus suivre cette carte">✕</button>
+        ${suggestion(card, w)}
       </li>`;
     });
 
@@ -7801,38 +7850,55 @@
   }
 
   /*
-   * Combien de tours invendus avant de baisser, et jusqu'où.
-   *
    * Une annonce qui ne trouve pas preneur deux fois de suite au même prix a
-   * répondu à la question : le prix est trop haut. La relance rejouait pourtant
-   * `base_amount: w.price` à l'identique, indéfiniment — le journal d'un compte
-   * réel montrait la même carte échouer deux fois au même montant, quatre
-   * cartes sur les douze dernières lignes, pour 14 ventes conclues sur 100.
+   * répondu à la question : le prix est trop haut. Le journal d'un compte réel
+   * montrait la même carte échouer deux fois au même montant — quatre cartes
+   * sur douze lignes, pour 14 ventes conclues sur 100.
    *
-   * On ne descend jamais sous la médiane d'une cote solide : c'est le prix
-   * auquel la carte se vend vraiment, pas un prix bradé. Sans cote fiable, on
-   * retire un quart par tour, avec un plancher absolu pour ne pas offrir une
-   * carte à zéro au bout de quelques échecs.
+   * Le panneau le DIT. Il ne baisse pas.
+   *
+   * La 2.9.0 baissait le prix toute seule, d'un quart par tour invendu. C'était
+   * une faute, sur deux plans.
+   *
+   * D'abord le principe : mettre en vente est irréversible dès la première
+   * mise, et c'est pour ça que le panneau ne vend ni ne donne à la place de qui
+   * l'utilise. Cocher « Relances auto », c'est consentir à REPUBLIER SON prix —
+   * celui qu'on a choisi, qu'on connaît. Ce n'est pas consentir à ce qu'un
+   * autre prix soit choisi pour soi.
+   *
+   * Ensuite l'arithmétique, et c'est pire. Le plancher n'existait que pour une
+   * carte à cote solide. Sous cinq ventes — le cas le plus fréquent sur les
+   * cartes chères, justement — il tombait au plancher absolu : 100, 75, 56, 42,
+   * et ainsi de suite jusqu'à 5 wikibidous. Une Légendaire mal cotée finissait
+   * bradée pendant qu'on regardait ailleurs.
+   *
+   * Ce qui reste : le calcul, offert comme SUGGESTION dans le volet Relances,
+   * avec un bouton. Rien ne bouge sans un clic.
    */
-  const RELIST_TOURS_AVANT_BAISSE = 2;
+  const RELIST_TOURS_AVANT_SUGGESTION = 2;
   const RELIST_BAISSE = 0.75;
   const RELIST_PLANCHER = 5;
 
   /**
-   * Le prix de la prochaine annonce, après un invendu.
+   * Le prix qu'on PROPOSERAIT après des invendus — jamais celui qu'on applique.
    * @param {string} card     identifiant de la carte
    * @param {string} titre    son titre, pour retrouver la cote d'un cache ancien
    * @param {number} prix     le prix qui vient d'échouer
    * @param {number} tours    nombre d'invendus consécutifs, celui-ci compris
+   * @returns {number|null}   le prix suggéré, ou `null` s'il n'y a rien à dire
    */
-  function prixApresInvendu(card, titre, prix, tours) {
-    if (tours < RELIST_TOURS_AVANT_BAISSE) return prix;
+  function prixSuggere(card, titre, prix, tours) {
+    if (tours < RELIST_TOURS_AVANT_SUGGESTION) return null;
     const ligne = (sell.rows || []).find((r) => r.id === card || r.t === titre);
-    const plancher = ligne && !ligne.seule && ligne.n >= THIN_SALES
-      ? Math.max(RELIST_PLANCHER, ligne.med)
-      : RELIST_PLANCHER;
-    // Déjà au plancher : insister à la baisse ne vendrait pas davantage.
-    if (prix <= plancher) return prix;
+    /*
+     * Sans cote solide, on ne suggère RIEN. Un quart de moins sur un prix dont
+     * on ignore s'il est juste n'est pas un conseil, c'est une devinette — et
+     * répétée, elle mène à zéro. La médiane d'une cote établie, elle, est un
+     * prix auquel la carte s'est réellement vendue.
+     */
+    if (!ligne || ligne.seule || ligne.n < THIN_SALES) return null;
+    const plancher = Math.max(RELIST_PLANCHER, ligne.med);
+    if (prix <= plancher) return null;
     return Math.max(plancher, Math.round(prix * RELIST_BAISSE));
   }
 
@@ -8096,12 +8162,13 @@
         // Invendue : on l'inscrit, la réconciliation se charge du reste.
         const t = await listingTerms(id, n.data?.auction_id || null);
         if (t) {
+          /*
+           * On réinscrit au prix que l'utilisateur a choisi, inchangé. Le
+           * compte des invendus le suit, et la suggestion se calcule à
+           * l'affichage — elle n'entre nulle part dans ce qui est publié.
+           */
           const tours = ((state.watch[id] && state.watch[id].invendus) || 0) + 1;
-          const prix = prixApresInvendu(id, titre, t.price, tours);
-          if (prix < t.price) {
-            logRelist(titre, 'baisse', prix, `invendue ${tours} fois à ${t.price} wb`);
-          }
-          enrolWatch(id, titre, prix, t.minutes, tours);
+          enrolWatch(id, titre, t.price, t.minutes, tours);
         }
       }
     }
