@@ -71,8 +71,9 @@ une pastille de rareté ouvre votre collection sur ces seuls tirages.
 
 **🪙 Marché** — vos enchères, vos ventes et leurs emplacements, les cartes de
 votre liste de souhaits mises aux enchères — avec le prix demandé **comparé à
-leur cote** — et la remise en vente automatique des invendus, dont le prix
-baisse tout seul si personne n'en veut.
+leur cote** — et la remise en vente automatique des invendus, **toujours au prix
+que vous avez fixé**. Après deux échecs, le panneau en propose un plus bas ; il
+attend votre clic.
 
 **🏰 Guilde** — les cartes que vous pouvez donner tout de suite, avec le karma
 que chacune rapporte, et un lot de cinq à publier dans le tchat. Et **quels de
