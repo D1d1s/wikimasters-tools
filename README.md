@@ -26,8 +26,6 @@ Rien envoyé nulle part.
 - Ouvre vos paquets en boucle, au rythme que le serveur autorise.
 - Dort jusqu'à l'heure exacte de régénération, avec le compte à rebours.
 - Journal des tirages. Un clic sur une rareté ouvre votre collection dessus.
-- Paliers de collection et le temps qu'ils demandent.
-- Les succès dont la récompense attend d'être réclamée.
 
 ### 🪙 Marché
 
@@ -35,6 +33,14 @@ Rien envoyé nulle part.
 - Vos souhaits mis aux enchères, prix demandé comparé à leur cote.
 - Remise en vente des invendus, toujours au prix que vous avez fixé.
 - Après deux échecs, un prix plus bas est proposé. Il attend votre clic.
+
+### 🏆 Succès
+
+- Le palier de collection le plus proche, ce qu'il paie, et le temps qu'il
+  demande au rythme mesuré sur votre session.
+- Où vous en êtes sur les 51 succès.
+- Ceux dont la récompense **attend d'être réclamée** — elle ne se crédite pas
+  toute seule, et rien ne le signale ailleurs.
 
 ### 🏰 Guilde
 
