@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WikiMasters Tools
 // @namespace    https://www.wiki-masters.com/
-// @version      2.10.0
+// @version      2.11.0
 // @description  Boîte à outils WikiMasters : ouverture automatique des paquets, suivi des tirages, cote des cartes et revente.
 // @match        https://www.wiki-masters.com/*
 // @match        https://wiki-masters.com/*
@@ -41,7 +41,7 @@
    *
    * Il est lu par le garde juste en dessous, d'où sa place en tête.
    */
-  const VERSION = '2.10.0';
+  const VERSION = '2.11.0';
 
   /*
    * Une seule instance par page — et savoir laquelle
@@ -4995,6 +4995,13 @@
     /* Trois relevés qui se lisent ensemble : espacés du gap de l'onglet plus
        leur propre marge, ils se dispersaient en pavé gris. */
     .tune + .tune { margin-top: -7px; }
+    .diag {
+      margin-top: 4px; padding: 5px 10px; border: 1px solid var(--line);
+      border-radius: 7px; background: none; color: var(--muted);
+      font: 11px var(--sans); cursor: pointer; transition: .14s;
+    }
+    .diag:hover { color: var(--text); border-color: var(--dim); background: var(--raise); }
+    .diag.ok { color: var(--live); border-color: var(--live); }
     /* Ce que le panneau ne fera jamais seul, dit là où on cherche ce qu'il fait. */
     .note-vente { margin-top: -2px; color: var(--dim); font-size: 10px; line-height: 1.5; }
     .note-vente b { color: var(--muted); font-weight: 600; }
@@ -5167,6 +5174,21 @@
             <div class="sect suite">Ce qu'il a constaté</div>
             <div class="tune" data-bonusnote></div>
             <div class="tune" data-dbnote></div>
+            <!--
+              Le salon d'aide demandait d'ouvrir la console avec F12 et d'y
+              taper une commande. C'est l'étape qui fait renoncer : on demande à
+              un joueur d'utiliser un outil de développeur pour signaler que
+              rien ne s'affiche. Ce bouton met le même relevé dans le
+              presse-papiers, et la personne colle.
+
+              Ce qu'il ne met PAS : la taille de la collection, ni le nombre de
+              Légendaires, ni les succès. Ce sont eux qui identifient un compte
+              sur un jeu à classement public — c'est la raison pour laquelle la
+              capture du README est fabriquée sur un compte inventé. Un
+              diagnostic collé dans un salon public n'a pas le droit d'en dire
+              plus qu'une image.
+            -->
+            <button class="diag" data-diag>Copier le diagnostic</button>
             <div class="apropos">WikiMasters Tools <b>${VERSION}</b> — mise à jour
               automatique. Dès qu'une version plus récente est en ligne, une
               pastille verte paraît à côté du titre : un clic dessus la propose.
@@ -5200,6 +5222,7 @@
       reset: q('[data-reset]'),
       bonusnote: q('[data-bonusnote]'),
       dbnote: q('[data-dbnote]'),
+      diag: q('[data-diag]'),
       gwish: q('[data-gwish]'),
       troc: q('[data-troc]'),
       optGwatch: q('[data-opt-gwatch]'),
@@ -5358,6 +5381,28 @@
      * quatre secondes, exécute. Passé ce délai il se désarme tout seul — un
      * bouton laissé armé finirait par être cliqué sans qu'on sache pourquoi.
      */
+    ui.diag.addEventListener('click', async () => {
+      const texte = construireDiagnostic();
+      let pose = false;
+      try {
+        await navigator.clipboard.writeText(texte);
+        pose = true;
+      } catch (_) {
+        /*
+         * Le presse-papiers demande un contexte sûr et parfois une permission.
+         * Refusé, on ne laisse pas l'utilisateur sans rien : le relevé part en
+         * console, où il reste sélectionnable.
+         */
+        console.info('[WikiMasters Tools] diagnostic\n' + texte);
+      }
+      ui.diag.classList.toggle('ok', pose);
+      ui.diag.textContent = pose ? 'Copié — collez-le dans #aide' : 'Voir dans la console (F12)';
+      setTimeout(() => {
+        ui.diag.classList.remove('ok');
+        ui.diag.textContent = 'Copier le diagnostic';
+      }, 4000);
+    });
+
     let resetArme = 0;
     ui.reset.addEventListener('click', () => {
       if (Date.now() < resetArme) {
@@ -9647,6 +9692,58 @@
 
     console.info('[WikiMasters Tools] diagnostic cote', rapport);
     return rapport;
+  }
+
+  /**
+   * Le relevé que le bouton des Réglages met dans le presse-papiers.
+   *
+   * Ce qu'il ne dit PAS, et c'est délibéré : la taille de la collection, le
+   * nombre de Légendaires, l'avancement des succès. Ce sont eux qui
+   * identifient un compte sur un jeu à classement public — la même raison qui
+   * fait fabriquer la capture du README sur un compte inventé. Un diagnostic
+   * collé dans un salon public n'a pas le droit d'en dire plus qu'une image.
+   *
+   * Les compteurs de SESSION, eux, sont admis : ils repartent de zéro à chaque
+   * remise à zéro et ne désignent personne. Ils disent en revanche tout de
+   * suite si la boucle a ouvert quelque chose ou rien du tout.
+   */
+  function construireDiagnostic() {
+    const oui = (v) => (v ? '✓' : '✗');
+    const opts = [
+      ['démarrage auto', prefs.autostart],
+      ['paquets bonus', prefs.bonus],
+      ['succès auto', prefs.autoclaim],
+      ['base directe', prefs.db],
+      ['veille guilde', prefs.watchGuild],
+      ['reprise auto', prefs.autoResume],
+      ['marché', prefs.watchBids],
+      ['notifications', prefs.notify],
+      ['souhaits', prefs.watchWish],
+      ['relances auto', prefs.relistUnsold],
+    ]
+      .map(([n, v]) => `${n} ${oui(v)}`)
+      .join(' · ');
+
+    /* Le nom du navigateur suffit : on cherche « Firefox ou Chrome », pas une empreinte. */
+    const nav =
+      (navigator.userAgent.match(/(Firefox|Edg|OPR|Chrome|Safari)\/(\d+)/) || [])
+        .slice(1)
+        .join(' ') || 'inconnu';
+
+    return [
+      `WikiMasters Tools ${VERSION}`
+        + (state.majDispo ? ` — ${state.majDispo} est en ligne, pas encore installée` : ''),
+      `Navigateur : ${nav}`,
+      `Page : ${location.pathname}`,
+      `Boucle : ${state.running ? 'en marche' : 'arrêtée'}`
+        + (state.message ? ` — ${state.message}` : ''),
+      `Session : ${state.packs} paquet(s), ${state.cards} carte(s)`,
+      `Réglages : ${opts}`,
+      state.dbNote ? `Base : ${state.dbNote}` : null,
+      state.bonusNote ? `Bonus : ${state.bonusNote}` : null,
+    ]
+      .filter(Boolean)
+      .join('\n');
   }
 
   // Poignée de diagnostic : `__wmAuto.version`, `__wmAuto.state`, `__wmAuto.prefs`.
