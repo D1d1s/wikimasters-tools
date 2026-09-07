@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WikiMasters Tools
 // @namespace    https://www.wiki-masters.com/
-// @version      2.9.2
+// @version      2.10.0
 // @description  Boîte à outils WikiMasters : ouverture automatique des paquets, suivi des tirages, cote des cartes et revente.
 // @match        https://www.wiki-masters.com/*
 // @match        https://wiki-masters.com/*
@@ -41,7 +41,7 @@
    *
    * Il est lu par le garde juste en dessous, d'où sa place en tête.
    */
-  const VERSION = '2.9.2';
+  const VERSION = '2.10.0';
 
   /*
    * Une seule instance par page — et savoir laquelle
@@ -406,7 +406,7 @@
     relistUnsold: false,  // remettre en vente les invendus, au même prix et durée
     logRarity: null,      // rareté isolée dans le journal, null = tout
     folded: false,
-    tab: 'paquets',       // onglet actif : paquets | marche | reglages
+    tab: 'paquets',       // onglet actif : paquets | succes | marche | guilde | reglages
     mktSub: 'ench',       // volet du Marché : ench | vent | rel
   };
 
@@ -5083,6 +5083,7 @@
           <button data-tab-btn="paquets">Paquets</button>
           <button data-tab-btn="marche">Marché<i class="badge" data-badge hidden></i></button>
           <button data-tab-btn="guilde">Guilde</button>
+          <button data-tab-btn="succes">Succès</button>
           <button data-tab-btn="reglages">Réglages</button>
         </nav>
 
@@ -5102,8 +5103,30 @@
           <div class="chips" data-rar></div>
           <button class="openrar" data-open-rar hidden></button>
           <div class="log" data-log></div>
-          <div class="goal" data-goal></div>
-          <div class="achv" data-achv></div>
+          </section>
+
+          <!--
+            Les paliers et les succès ont leur onglet.
+
+            Ils vivaient sous le journal des tirages, où ils pesaient 223 px
+            sur 576 : 39 % de l'onglet Paquets ne parlait pas de paquets. Et ce
+            sont les mêmes succès du jeu vus par deux sources : pendingGoals
+            les lit dans GOALS, readAchievements sur la page du site, au point
+            que renderAchievements doit écarter les noms que l'autre affiche
+            déjà. Les séparer était l'anomalie ; les réunir ici les remet
+            ensemble et rend l'onglet Paquets à ce qu'il annonce.
+
+            Mesuré avant de le faire : à 260 px — la borne basse de la poignée —
+            cinq onglets tiennent avec 12,1 px de marge. « Échanges » débordait
+            de 1,7 px, d'où son refus quand le volet a été ajouté ; « Succès »
+            est plus court de deux lettres, et c'est tout ce qui les sépare.
+
+            (Pas d'accent grave ici : ce balisage vit dans un littéral de
+            gabarit, et le premier fermerait la chaîne.)
+          -->
+          <section class="tab" data-tab="succes">
+            <div class="goal" data-goal></div>
+            <div class="achv" data-achv></div>
           </section>
 
           <section class="tab" data-tab="marche">
@@ -5702,7 +5725,7 @@
     for (const sec of ui.body.querySelectorAll('[data-tab]')) {
       sec.classList.toggle('on', sec.dataset.tab === nom);
     }
-    for (const n of ['paquets', 'marche', 'guilde', 'reglages']) {
+    for (const n of ['paquets', 'succes', 'marche', 'guilde', 'reglages']) {
       ui.panel.classList.toggle(`tab-${n}`, n === nom);
     }
     ui.body.scrollTop = 0;
