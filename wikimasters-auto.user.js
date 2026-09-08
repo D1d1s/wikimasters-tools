@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WikiMasters Tools
 // @namespace    https://www.wiki-masters.com/
-// @version      2.13.1
+// @version      2.14.2
 // @description  Boîte à outils WikiMasters : ouverture automatique des paquets, suivi des tirages, cote des cartes et revente.
 // @match        https://www.wiki-masters.com/*
 // @match        https://wiki-masters.com/*
@@ -41,7 +41,7 @@
    *
    * Il est lu par le garde juste en dessous, d'où sa place en tête.
    */
-  const VERSION = '2.13.1';
+  const VERSION = '2.14.2';
 
   /*
    * Une seule instance par page — et savoir laquelle
@@ -230,7 +230,7 @@
     decayMs: 250,          // grignoté à chaque succès
     growth: 1.6,           // multiplié à chaque 429
     jitter: 0.2,           // ±20 % pour ne pas taper à intervalle fixe
-    // Le plancher appris se détend de 10 % après cette série de succès sans
+    // Le plancher appris se détend d'un cran après cette série de succès sans
     // refus : sans quoi un 429 isolé — pic de charge, onglet concurrent — le
     // figerait haut pour toute la session, et un nouvel assouplissement du jeu
     // passerait inaperçu.
@@ -913,6 +913,27 @@
        */
       if (!cartes.length || sell.tronque) return false;
 
+      /*
+       * Le compte, maintenant qu'il veut dire quelque chose.
+       *
+       * Les doublons masquaient ce contrôle : la liste était plus LONGUE que la
+       * collection, quoi qu'il arrive. Dédoublonnée, elle peut être plus courte
+       * — c'est le cas symétrique, une carte vendue ou donnée pendant les vingt
+       * secondes de lecture, qui décale vers l'arrière et fait sauter une
+       * entrée. Rare, mais plus masqué.
+       *
+       * Le total est relevé AVANT la lecture, et la collection ne fait que
+       * grossir pendant : en régime normal on en a donc plus, jamais moins. Un
+       * manque d'une page entière signale autre chose, et là on n'allume pas —
+       * même règle que pour une lecture tronquée, pour la même raison : une
+       * page vide dans la collection du site est pire qu'un tri absent.
+       */
+      if (valueTotal && cartes.length < valueTotal - COLLECTION_PAGE) {
+        console.info('[WikiMasters Tools] tri par valeur : lecture incomplète —',
+          `${cartes.length} lignes pour ${valueTotal} annoncées, ${sell.doublons} doublon(s) écarté(s).`);
+        return false;
+      }
+
       const moy = new Map(sell.rows.map((r) => [r.id, r.moy]));
       const cotees = [];
       const muettes = [];
@@ -1173,15 +1194,55 @@
    * Des cartes réordonnées sans leur prix, c'est un ordre qu'il faut croire sur
    * parole. La pastille le montre, sous le badge de rareté, et seulement quand
    * le tri est allumé : le reste du temps, la collection reste celle du site.
+   *
+   * Sur la page des échanges, elle s'affiche TOUJOURS.
+   * -------------------------------------------------
+   * Il n'y a pas de tri à y allumer, et surtout la question ne se pose pas de
+   * la même façon : sur la collection on cherche « lesquelles valent quelque
+   * chose », ici on répond à « est-ce que j'accepte ». Un échange est
+   * irréversible et engage une carte contre une autre ; le prix de chacune est
+   * exactement ce qu'on veut savoir avant de cliquer, et aller le chercher
+   * ailleurs pendant qu'une offre attend, personne ne le fait.
+   *
+   * La règle « le reste du temps, la collection reste celle du site » tient
+   * toujours : elle porte sur la collection, où le site propose son propre
+   * ordre et où nos pastilles seraient une surcouche non demandée. La page des
+   * échanges n'affiche rien de tel.
+   *
+   * Ce que la pastille NE fait pas : totaliser les deux côtés de la table.
+   * Demandé explicitement — « le prix moyen de chaque carte, pas le prix moyen
+   * total des cartes échangées ». Un total sous-entendrait d'ailleurs qu'un
+   * échange se juge à la somme, alors qu'on troque le plus souvent pour une
+   * carte précise qui manque.
+   *
+   * Limite connue, et elle est réelle : le prix vient des cotes déjà relevées,
+   * qui portent sur TA collection. Une carte qu'on te propose et que tu n'as
+   * jamais eue n'a donc pas de pastille. Les tiennes en ont une, ce qui répond
+   * déjà à la moitié de la question — ce que tu donnes.
    */
+  const onTrades = () => location.pathname.startsWith('/trades');
+
   function paintValueBadges() {
-    const prix = byValue && sell.rows.length ? new Map(sell.rows.map((r) => [r.t, r.moy])) : null;
+    const montrer = (byValue || onTrades()) && sell.rows.length;
+    const prix = montrer ? new Map(sell.rows.map((r) => [r.t, r.moy])) : null;
     // Tri éteint et aucune pastille à retirer : rien à parcourir. La collection
     // porte quelques milliers de nœuds, et ce tour passe à chaque rendu.
     if (!prix && !document.querySelector('[data-wm-value]')) return;
 
     for (const h of document.querySelectorAll('h3')) {
-      const item = h.closest(CARD_ITEM);
+      /*
+       * Le composeur d'échange n'habille pas ses cartes comme la collection :
+       * relevé sur la vraie page, `CARD_ITEM` n'y trouve RIEN. Sa tuile est le
+       * `<button>` qui entoure le titre — `position: relative` et
+       * `overflow: hidden`, donc exactement ce qu'il faut pour une pastille
+       * posée en absolu, et 50 titres sur 50 s'y rattachent.
+       *
+       * On ne cherche ce second habillage que sur la page des échanges. Un
+       * `closest('button')` général attraperait n'importe quel `h3` niché dans
+       * un bouton ailleurs sur le site, et poserait des prix là où personne
+       * n'en a demandé.
+       */
+      const item = h.closest(CARD_ITEM) || (onTrades() ? h.closest('button') : null);
       if (!item) continue;
       const hote = item.firstElementChild || item;
       const pastille = hote.querySelector('[data-wm-value]');
@@ -1205,6 +1266,158 @@
         + `background:rgba(0,0,0,.6);color:${VALUE_COLOR};pointer-events:none;`
         + 'font:700 10px ui-sans-serif,system-ui,sans-serif;font-variant-numeric:tabular-nums';
       hote.appendChild(neuve);
+    }
+  }
+
+  /*
+   * Le prix dans le DÉTAIL d'un échange — reçu, envoyé, ou dans l'historique.
+   * ----------------------------------------------------------------------
+   * Le composeur affiche des cartes entières, avec leur titre dans un `h3` :
+   * la pastille du dessus suffit. La LISTE des offres, elle, ne montre qu'une
+   * étiquette de texte par carte, « R · Mobile Legends: Ba… ».
+   *
+   * Et ce titre-là est tronqué DANS LE DOM, pas par CSS : `textContent` rend
+   * bien « Mobile Legends: Ba… ». Une correspondance par titre exact échoue
+   * donc toujours, et par préfixe elle est dangereuse — relevé sur un vrai
+   * compte, « Paris Saint-Germai… » a huit correspondances dans la cote, à des
+   * prix différents. Afficher l'une d'elles au hasard serait pire que rien :
+   * un échange se décide là-dessus.
+   *
+   * `/api/trades` porte les titres ENTIERS et les `card_id` de chaque offre.
+   * On lit donc cette liste — une requête, gardée une minute — et on ne
+   * retient un prix que si le préfixe ET la rareté ne désignent qu'une seule
+   * valeur. Deux cartes homonymes au même prix restent affichables ; deux
+   * cartes homonymes à des prix différents n'affichent rien.
+   */
+  /*
+   * Et surtout : coter les cartes qu'on ne possède PAS.
+   * --------------------------------------------------
+   * La cote porte sur ta collection — c'est ce qu'elle sert à vendre. Or dans
+   * un échange, les cartes qui comptent le plus sont justement celles que tu
+   * n'as pas : celles qu'on te propose. Mesuré sur un vrai compte, l'onglet
+   * « Envoyées » n'affichait AUCUN prix, ses trois cartes étant toutes
+   * demandées, donc absentes de la cote.
+   *
+   * Les `card_id` viennent de `/api/trades`, et la table des ventes closes se
+   * lit en masse — c'est déjà ce que fait le relevé complet. Une poignée de
+   * requêtes couvre tout l'historique des échanges, une fois, et le résultat
+   * vit à part : ces cartes ne t'appartiennent pas, elles n'ont rien à faire
+   * dans la liste de revente.
+   */
+  const TRADES_TTL = 60000;
+  let tradeCards = { at: 0, lignes: [] };
+  let tradeEnCours = false;
+  const tradePrix = new Map();   // card_id → moyenne, pour les cartes non possédées
+  let tradeCoteEnCours = false;
+
+  async function coterCartesEchangees() {
+    if (tradeCoteEnCours || !prefs.db) return;
+    const parId = new Set(sell.rows.map((r) => r.id));
+    const manquants = tradeCards.lignes
+      .map((l) => l.id)
+      .filter((id) => !parId.has(id) && !tradePrix.has(id));
+    if (!manquants.length) return;
+    tradeCoteEnCours = true;
+    try {
+      const parCarte = await dbSalesBulk(manquants);
+      if (!parCarte) return;   // base illisible : on garde ce qu'on a
+      for (const id of manquants) {
+        const px = parCarte.get(id) || [];
+        // Une carte sans vente est notée `null` : sans ça on la redemanderait
+        // à chaque rendu, indéfiniment.
+        tradePrix.set(id, px.length ? Math.round(px.reduce((a, b) => a + b, 0) / px.length) : null);
+      }
+      paintTradeListPrices();
+    } catch (_) {
+      /* base injoignable : la pastille se contentera des cartes possédées */
+    } finally {
+      tradeCoteEnCours = false;
+    }
+  }
+
+  async function refreshTradeCards() {
+    if (tradeEnCours || Date.now() - tradeCards.at < TRADES_TTL) return;
+    tradeEnCours = true;
+    try {
+      const { status, data } = await api('/api/trades');
+      const lots = (data && (data.trades || data.data)) || [];
+      if (status !== 200 || !Array.isArray(lots)) return;
+      const vues = new Map();
+      for (const t of lots) {
+        for (const it of (t && t.items) || []) {
+          const titre = it.card && (it.card.wikipedia_title || it.card.title);
+          if (!titre || !it.card_id) continue;
+          vues.set(it.card_id, { t: titre, r: it.snapshot_rarity || (it.card && it.card.rarity) || '' });
+        }
+      }
+      tradeCards = { at: Date.now(), lignes: [...vues.entries()].map(([id, v]) => ({ id, ...v })) };
+      /*
+       * Repeindre TOUT DE SUITE, sans quoi rien ne s'affiche jamais.
+       *
+       * Le peintre tourne sur les rendus de la page. Au premier passage l'index
+       * est vide, il lance cette lecture et s'arrête ; la lecture aboutit deux
+       * cents millisecondes plus tard, alors que la page ne bouge plus — donc
+       * plus aucun rendu, donc plus aucun passage. Vu à l'écran : zéro prix sur
+       * une liste dont toutes les cartes étaient cotées.
+       *
+       * C'est le même détour que la cote d'une enchère, et pour la même raison.
+       * Ce second passage peint seulement : l'index est en mémoire, il ne relit
+       * rien.
+       */
+      paintTradeListPrices();
+      coterCartesEchangees();
+    } catch (_) {
+      /* réseau : on garde l'index précédent plutôt que de tout effacer */
+    } finally {
+      tradeEnCours = false;
+    }
+  }
+
+  /** « R · Mobile Legends: Ba… » — rareté, séparateur, titre éventuellement coupé. */
+  const TRADE_LABEL = /^\s*([A-Z]{1,2})\s*·\s*(.+?)\s*$/;
+
+  function paintTradeListPrices() {
+    if (!onTrades()) return;
+    if (!sell.rows.length) return;
+    refreshTradeCards();
+    if (!tradeCards.lignes.length) return;
+
+    const parId = new Map(sell.rows.map((r) => [r.id, r.moy]));
+
+    for (const span of document.querySelectorAll('span.inline-flex')) {
+      if (span.children.length || span.dataset.wmTradePrice) continue;
+      const m = TRADE_LABEL.exec(span.textContent || '');
+      if (!m) continue;
+      const rarete = m[1];
+      const prefixe = m[2].replace(/[…]|\.\.\.$/g, '').trim();
+      if (!prefixe) continue;
+
+      // Toutes les cartes d'échange dont le titre commence par ce préfixe, à
+      // rareté égale. La rareté est portée par l'étiquette elle-même : elle
+      // écarte déjà l'essentiel des homonymes.
+      const prix = new Set();
+      for (const l of tradeCards.lignes) {
+        if (l.r && rarete && l.r !== rarete) continue;
+        if (!l.t.startsWith(prefixe)) continue;
+        // Ta cote d'abord — c'est la même mesure ; sinon celle relevée pour
+        // les cartes d'échange que tu ne possèdes pas.
+        const moy = parId.get(l.id) ?? tradePrix.get(l.id);
+        if (moy != null) prix.add(moy);
+      }
+      // Zéro prix connu, ou plusieurs prix qui ne s'accordent pas : on se tait.
+      if (prix.size !== 1) continue;
+
+      const moy = [...prix][0];
+      const etiquette = document.createElement('span');
+      etiquette.dataset.wmTradePrice = '1';
+      etiquette.textContent = `⌀ ${fmtWb(moy)}`;
+      etiquette.title = 'Moyenne des ventes réelles de cette carte';
+      etiquette.style.cssText =
+        `margin-left:4px;color:${VALUE_COLOR};font-weight:700;font-variant-numeric:tabular-nums`;
+      span.insertAdjacentElement('afterend', etiquette);
+      // Le marqueur va sur l'étiquette de la CARTE, pas sur la nôtre : c'est
+      // lui qui empêche de repeindre deux fois au rendu suivant.
+      span.dataset.wmTradePrice = 'fait';
     }
   }
 
@@ -1487,6 +1700,7 @@
     applyNewFilter();
     injectValueSort();
     paintValueBadges();
+    paintTradeListPrices();
     injectWishAll();
     injectAuctionCote();
   }
@@ -4496,14 +4710,11 @@
          * fait redescendre le délai d'un cran. Si c'était trop tôt, le 429
          * suivant le remonte — au pire un aller-retour tous les quarante paquets.
          *
-         * On mord une PART DE L'ÉCART au plancher de sécurité, pas un
-         * pourcentage de la valeur. Les deux se valent près du but ; loin, non :
-         * à 10 % de la valeur, revenir de 40 s demandait 1 520 paquets sans le
-         * moindre refus, soit trois jours de fonctionnement continu — un
-         * plancher appris par accident s'installait donc à demeure. En part
-         * d'écart, plus il est absurde, plus vite il retombe, et près du
-         * plancher de sécurité il ne bouge presque plus : c'est là qu'il faut
-         * être prudent, pas à 40 s.
+         * Le pas est ADDITIF, et de la même famille que la marge qui pose le
+         * plancher — un peu plus petit qu'elle. Deux règles proportionnelles se
+         * sont succédé ici, et toutes deux ont fini par dériver : la détente
+         * traversait ce que la marge défendait, et le plancher montait par
+         * cliquet. Voir `probeMarginMs` pour le détail et les mesures.
          */
         state.delayMs = Math.max(floorMs(), state.delayMs - CFG.decayMs);
         if (state.probeFloorMs && ++state.cleanHits >= CFG.probeAfterHits) {
@@ -4556,9 +4767,13 @@
        * Le serveur throttle les appels rapprochés. On ralentit durablement au
        * lieu d'insister — et surtout on RETIENT le délai qui vient d'être
        * refusé : c'est la seule mesure fiable du débit autorisé, et le jeu
-       * l'a déjà changé une fois. Le plancher se pose 10 % au-dessus de ce
+       * l'a déjà changé une fois. Le plancher se pose une marge au-dessus de ce
        * délai, le délai courant recule plus largement puis redescend jusqu'à
        * ce plancher au fil des succès.
+       *
+       * La marge est ADDITIVE, et les deux gardes qui suivent tiennent à ça :
+       * seul le premier refus d'une série compte, et seulement s'il a testé le
+       * plancher. Voir `probeMarginMs` pour ce qu'a coûté chacune.
        */
       if (status === 429) {
         state.throttles += 1;
@@ -8780,7 +8995,8 @@
                  checked: new Set(), themes: {}, comp: new Map(), compAt: 0, compTronque: false,
                  prunedAt: 0,   // dernière vérification de ce qui est encore possédé
                  // Pourquoi le tableau est vide — ou incomplet — quand il l'est.
-                 note: '', refus: 0, tronque: false, freinages: 0,
+                 // Lignes relues à cause du glissement de pagination, écartées.
+                 note: '', refus: 0, tronque: false, freinages: 0, doublons: 0,
                  // Refus rencontrés sur l'historique des ventes, carte par carte.
                  refusVentes: 0, refusVentesN: 0 };
 
@@ -8913,10 +9129,33 @@
     return null;
   }
 
+  /*
+   * La pagination glisse pendant la lecture, et c'est la boucle qui la fait
+   * glisser.
+   *
+   * N pages, une vingtaine de secondes, et pendant ce temps des paquets
+   * s'ouvrent : cinq cartes de plus à chaque fois, insérées dans un ordre trié
+   * par rareté, donc n'importe où. Une insertion pousse tout ce qui suit d'un
+   * cran — une carte qui était en fin de page passe en tête de la suivante, et
+   * on la lit DEUX FOIS.
+   *
+   * Rien n'est sauté pour autant : sauter demanderait un déplacement vers
+   * l'arrière, donc une suppression. Le défaut est unilatéral, et dédoublonner
+   * ne peut donc pas amputer la liste — c'est ce qui avait fait hésiter, à
+   * tort. La suppression existe (une carte vendue, une carte donnée), elle est
+   * simplement rare devant le flux des ouvertures ; `buildValueOrder` compare
+   * de son côté le compte obtenu à celui du serveur avant d'allumer le tri.
+   *
+   * `id` est l'identifiant de la LIGNE de collection, pas de la carte : deux
+   * exemplaires d'une même carte sont deux lignes, et tous deux doivent rester.
+   * Sans `id`, on garde l'entrée plutôt que de la perdre.
+   */
   async function fetchCollectionRaw(onProgress) {
     const out = [];
+    const vues = new Set();
     sell.refus = 0;
     sell.tronque = false;
+    sell.doublons = 0;
     sell.freinages = 0;
     for (let base = 0; base < SELL_MAX_PAGES; base += SELL_POOL) {
       const avant = sell.freinages;
@@ -8937,7 +9176,13 @@
           fini = true;
           continue;
         }
-        out.push(...d.collection);
+        for (const e of d.collection) {
+          if (e && e.id != null) {
+            if (vues.has(e.id)) { sell.doublons += 1; continue; }
+            vues.add(e.id);
+          }
+          out.push(e);
+        }
         if (d.collection.length < COLLECTION_PAGE) fini = true;
       }
       if (onProgress) onProgress(out.length);
@@ -10120,6 +10365,59 @@
    * Utile surtout à distance : sur un autre compte, c'est la seule façon de
    * savoir laquelle des trois on regarde.
    */
+  /*
+   * Ce que la lecture de la collection a réellement ramené — surtout combien de
+   * lignes ont été relues à cause du glissement de pagination.
+   *
+   * Ce chiffre-là n'était visible nulle part : la liste était simplement plus
+   * longue que la collection, et personne ne comptait. Il s'affiche maintenant
+   * à la demande, et il dira tout seul si le glissement s'aggrave — par exemple
+   * si la lecture ralentit ou si le rythme d'ouverture monte.
+   */
+  async function diagTri() {
+    /*
+     * Une lecture complète, c'est quatre cents requêtes. Deux en même temps,
+     * c'est douze appels simultanés au lieu de six — de quoi provoquer le
+     * freinage qu'on venait mesurer, et fausser les deux relevés d'un coup,
+     * `fetchCollectionRaw` écrivant ses compteurs sur le `sell` partagé.
+     */
+    if (valueBusy || sell.scanning) {
+      console.info('[WikiMasters Tools] diagnostic tri : une lecture est déjà en cours,'
+        + ' réessayez quand elle sera finie.');
+      return null;
+    }
+
+    /*
+     * Et on rend les compteurs comme on les a trouvés. Ils ne servent pas qu'à
+     * ce diagnostic : la Revente s'en sert pour dire POURQUOI son tableau est
+     * vide, et l'infobulle du bouton « Prix ↓ » distingue un serveur qui a
+     * ralenti d'un serveur qui a refusé. Les écraser, c'est effacer la trace de
+     * la panne qu'on cherche — l'inverse de ce qu'un diagnostic doit faire.
+     */
+    const avant = { refus: sell.refus, tronque: sell.tronque,
+                    freinages: sell.freinages, doublons: sell.doublons };
+    const t0 = Date.now();
+    try {
+      const { data } = await api('/api/my-collection/stats');
+      const annonce = (data && data.total) || 0;
+      const cartes = await fetchCollectionRaw();
+      const rapport = {
+        version: VERSION,
+        annoncé_par_le_serveur: annonce,
+        lignes_gardées: cartes.length,
+        doublons_écartés: sell.doublons,
+        écart: annonce ? cartes.length - annonce : null,
+        lecture_tronquée: sell.tronque,
+        freinages_429: sell.freinages,
+        secondes: Math.round((Date.now() - t0) / 100) / 10,
+      };
+      console.info('[WikiMasters Tools] diagnostic tri', rapport);
+      return rapport;
+    } finally {
+      Object.assign(sell, avant);
+    }
+  }
+
   async function diagCote() {
     const rapport = {
       version: VERSION,
@@ -10220,7 +10518,7 @@
   window.__wmAuto = {
     version: VERSION,
     start, stop, resetStats, exportCsv, exportJson, claimBonusPacks,
-    state, prefs, CFG, sell, openSell, diagCote,
+    state, prefs, CFG, sell, openSell, diagCote, diagTri,
     // De quoi vérifier la protection par étiquette sans lire le code :
     // `__wmAuto.ownedIndex(true)` reconstruit l'index, `__wmAuto.owned.tagged`
     // liste les cartes hors de portée, `__wmAuto.isTagged(id)` tranche.
