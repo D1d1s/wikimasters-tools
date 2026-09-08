@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WikiMasters Tools
 // @namespace    https://www.wiki-masters.com/
-// @version      2.11.0
+// @version      2.12.0
 // @description  Boîte à outils WikiMasters : ouverture automatique des paquets, suivi des tirages, cote des cartes et revente.
 // @match        https://www.wiki-masters.com/*
 // @match        https://wiki-masters.com/*
@@ -41,7 +41,7 @@
    *
    * Il est lu par le garde juste en dessous, d'où sa place en tête.
    */
-  const VERSION = '2.11.0';
+  const VERSION = '2.12.0';
 
   /*
    * Une seule instance par page — et savoir laquelle
@@ -1083,6 +1083,279 @@
     }
   }
 
+  // -------------------------------- prix moyen sous le formulaire de mise
+
+  /*
+   * Le prix moyen d'une carte existe déjà côté site, à deux endroits. Le
+   * dialogue « Mettre aux enchères » l'affiche pour la rareté qu'on vend —
+   * VENTES, DERNIÈRE, MOYENNE, sous un titre « Marché · Légendaire ». Et la
+   * page d'une annonce a sa « Vue du marché », avec le graphique.
+   *
+   * Sauf que sur la page d'annonce, cette vue est rangée derrière une icône,
+   * en haut à droite, à l'opposé du formulaire de mise. Décider d'un prix
+   * demande donc d'ouvrir la modale, de lire, de la refermer, et de revenir au
+   * champ avec le nombre en tête. Sur une enchère qui se termine dans dix
+   * secondes, ça ne se fait pas.
+   *
+   * Le chiffre se pose donc sous le formulaire, là où la question se pose.
+   *
+   * La source est `?scope=summary`, celle du dialogue de vente, et non
+   * l'historique complet : c'est l'historique détaillé que le site réserve aux
+   * comptes PRO, pas la moyenne. Un compte sans abonnement voit donc ce
+   * chiffre-là, exactement comme il le voit déjà en mettant une carte en vente.
+   *
+   * Le résumé rend `{average, count, latest}` PAR RARETÉ, et c'est ce qui
+   * compte : un même titre se vend à des prix sans rapport selon la rareté de
+   * l'exemplaire, et l'annonce dit la sienne (`snapshot_rarity`). La « Vue du
+   * marché », elle, s'ouvre sur « Toutes » : quand le titre s'est vendu en
+   * plusieurs raretés, sa moyenne les mêle. Relevé sur une carte partie une
+   * fois en Rare à 15 et une fois en Super Rare à 5, elle annonce 10 — un prix
+   * auquel aucun des deux exemplaires n'est jamais parti.
+   */
+  const RARITY_NAME = {
+    L: 'Légendaire', UR: 'Ultra Rare', SR: 'Super Rare',
+    R: 'Rare', PC: 'Peu Commune', C: 'Commune',
+  };
+
+  const AUCTION_PATH = /^\/marketplace\/([0-9a-f-]{36})\/?$/i;
+
+  /*
+   * Le wikibidou du site, recopié tel quel. Tous les prix de la page en
+   * portent un — mise de départ, mise minimum, champ de saisie. Un nombre nu
+   * posé au milieu d'eux se lirait comme une autre unité.
+   *
+   * C'est le seul dessin de ce script : partout ailleurs, un caractère suffit.
+   *
+   * Les attributs de pose sont passés par l'appelant — la moyenne s'écrit en
+   * grand dans une boîte flex, la dernière vente au fil d'une phrase, et les
+   * deux ne se calent pas de la même façon. `currentColor` fait le reste :
+   * l'icône prend la couleur du texte qui la porte.
+   */
+  const wbIcon = (pose) =>
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none"'
+    + ' stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"'
+    + ` aria-hidden="true" ${pose}><circle cx="12" cy="12" r="9"></circle>`
+    + '<path d="M7.5 8.5 9.5 15.5 12 10 14.5 15.5 16.5 8.5"></path></svg>';
+
+  /*
+   * L'icône au fil du texte, et non dans une boîte à elle.
+   *
+   * Elle avait d'abord une boîte `inline-flex`, comme celle du site pour la
+   * mise de départ. Sauf qu'une boîte flex se fabrique sa PROPRE ligne de
+   * base : le « 364 » flottait trois pixels au-dessus de la phrase qui le
+   * porte. Mesuré à l'écran, et visible à l'œil nu.
+   *
+   * Le chiffre reste donc du texte ordinaire, sur la ligne de base de la
+   * phrase, et l'icône seule est calée. `display:inline-block` est
+   * indispensable : le preflight de Tailwind pose `svg { display: block }`,
+   * qui renverrait l'icône à la ligne. La taille est en `em` pour suivre le
+   * corps du texte, et −0,2 em centre le rond sur la hauteur d'x — relevé
+   * à un quart de pixel près.
+   */
+  const WB_AU_FIL = 'style="display:inline-block;width:1.15em;height:1.15em;'
+    + 'vertical-align:-0.2em"';
+
+  /*
+   * Le guetteur repasse à chaque rendu de React — donc sans arrêt sur une page
+   * dont le compte à rebours bouge toutes les secondes. Sans ce cache, ouvrir
+   * une annonce lancerait deux requêtes par tour de guetteur. La cote d'une
+   * carte ne bouge pas en cinq minutes ; une lecture ratée se retente plus
+   * tôt, sans pour autant marteler un serveur qui vient de refuser.
+   */
+  const COTE_ENCHERE_TTL = 300000;
+  const COTE_ENCHERE_RETRY = 30000;
+  const COTE_ENCHERE_MAX = 200;  // annonces gardées en mémoire
+
+  const coteVue = new Map();  // id d'annonce → { at, cote }
+  let coteEnCours = null;     // une lecture à la fois
+
+  /**
+   * La cote d'une annonce : la moyenne des ventes de sa carte, DANS SA RARETÉ.
+   *
+   * @returns {Promise<?{moy: ?number, n: number, dernier: ?number, rarete: string}>}
+   *   `n: 0` pour une carte jamais vendue dans cette rareté — ce n'est pas un
+   *   échec, et ça se dit. `null` quand la lecture n'a pas abouti.
+   */
+  async function fetchAuctionCote(id) {
+    // L'annonce d'abord : ni la carte ni sa rareté ne sont dans l'URL.
+    let carte = null;
+    let rarete = null;
+
+    const a = await api(`/api/marketplace/${id}`);
+    if (a.status === 200 && a.data && a.data.auction) {
+      carte = a.data.auction.card_id;
+      rarete = a.data.auction.snapshot_rarity;
+    } else {
+      // Repli par la base, comme partout ailleurs quand le site refuse.
+      const lignes = await sbGet(`auctions?id=eq.${id}&select=card_id,snapshot_rarity`);
+      if (!Array.isArray(lignes) || !lignes.length) return null;
+      carte = lignes[0].card_id;
+      rarete = lignes[0].snapshot_rarity;
+    }
+    if (!carte || !rarete) return null;
+
+    const vide = { moy: null, n: 0, dernier: null, rarete };
+
+    const s = await api(`/api/marketplace/cards/${carte}/sales?scope=summary`);
+    if (s.status === 200 && s.data && s.data.summary) {
+      const e = s.data.summary[rarete];
+      if (!e || !Number.isFinite(e.average)) return vide;
+      return {
+        moy: Math.round(e.average),
+        n: Number.isFinite(e.count) ? e.count : 0,
+        dernier: Number.isFinite(e.latest) ? e.latest : null,
+        rarete,
+      };
+    }
+
+    /*
+     * Le résumé refusé, il reste la base. Même critère de « vendue » que le
+     * relevé de la Revente : un `final_price` non nul, et rien d'autre.
+     */
+    const lignes = await sbGet(
+      `auctions?card_id=eq.${carte}&snapshot_rarity=eq.${rarete}&final_price=not.is.null`
+      + `&select=final_price&order=settled_at.desc&limit=${DB_LIMIT}`,
+    );
+    if (!Array.isArray(lignes)) return null;
+    const px = lignes.map((r) => r.final_price).filter(Number.isFinite);
+    if (!px.length) return vide;
+    return {
+      moy: Math.round(px.reduce((x, y) => x + y, 0) / px.length),
+      n: px.length,
+      dernier: px[0],  // `order=settled_at.desc` : la plus récente est en tête
+      rarete,
+    };
+  }
+
+  /**
+   * La boîte sous laquelle le prix moyen se pose : celle du formulaire de mise.
+   *
+   * Une enchère terminée n'a plus de bouton « Miser », mais la colonne garde
+   * ses boîtes — la dernière annonce alors le statut. Le prix moyen s'y
+   * accroche, au même endroit à l'œil, et reste utile : c'est là qu'on regarde
+   * à combien la carte est partie.
+   */
+  function boiteDeMise() {
+    const miser = [...document.querySelectorAll('main button')]
+      .find((b) => b.textContent.trim() === 'Miser');
+    const sienne = miser && miser.closest('.card-frame');
+    if (sienne) return sienne;
+
+    // La nôtre est une `.card-frame` elle aussi : elle ne doit pas s'ancrer
+    // sous elle-même, sans quoi elle descendrait d'un cran à chaque tour.
+    const boites = document.querySelectorAll('main .card-frame:not([data-wm-cote])');
+    return boites.length ? boites[boites.length - 1] : null;
+  }
+
+  function injectAuctionCote() {
+    const m = AUCTION_PATH.exec(location.pathname);
+    if (!m) {
+      document.querySelector('[data-wm-cote]')?.remove();
+      return;
+    }
+    const id = m[1];
+    const ancre = boiteDeMise();
+    if (!ancre) return;
+
+    const vu = coteVue.get(id);
+    const ttl = vu && vu.cote ? COTE_ENCHERE_TTL : COTE_ENCHERE_RETRY;
+    if ((!vu || Date.now() - vu.at > ttl) && !coteEnCours) {
+      coteEnCours = id;
+      fetchAuctionCote(id)
+        .catch(() => null)
+        .then((cote) => {
+          if (coteVue.size >= COTE_ENCHERE_MAX) oublierVieillesCotes();
+          coteVue.set(id, { at: Date.now(), cote });
+          coteEnCours = null;
+          /*
+           * Le formulaire a pu être remplacé pendant la lecture, et l'onglet
+           * changer d'annonce. On repart de la page telle qu'elle est, pas de
+           * l'ancre relevée avant l'appel. La cote est en cache : ce second
+           * passage peint, il ne relit pas.
+           */
+          injectAuctionCote();
+        });
+    }
+    paintAuctionCote(ancre, id);
+  }
+
+  /** Le cache ne doit pas grossir indéfiniment au fil des annonces ouvertes. */
+  function oublierVieillesCotes() {
+    const limite = Date.now() - COTE_ENCHERE_TTL;
+    for (const [id, v] of coteVue) if (v.at < limite) coteVue.delete(id);
+    // Que des entrées fraîches : on repart de zéro plutôt que de garder la main
+    // sur des centaines d'annonces qu'on ne rouvrira pas.
+    if (coteVue.size >= COTE_ENCHERE_MAX) coteVue.clear();
+  }
+
+  function paintAuctionCote(ancre, id) {
+    const vu = coteVue.get(id);
+    let boite = document.querySelector('[data-wm-cote]');
+
+    /*
+     * Rien tant que la lecture n'a pas abouti. Une boîte vide qui apparaît puis
+     * se remplit décalerait le formulaire de mise sous le curseur — le bouton
+     * « Miser » n'a pas le droit de bouger sous le doigt.
+     */
+    if (!vu || !vu.cote) {
+      if (boite) boite.remove();
+      return;
+    }
+    const { moy, n, dernier, rarete } = vu.cote;
+    const nom = RARITY_NAME[rarete] || rarete;
+    const maigre = n > 0 && n < THIN_SALES;
+
+    // Annonce suivante : la boîte de la précédente ne doit pas se recycler avec
+    // ses chiffres le temps d'un rendu.
+    if (!boite || boite.dataset.wmCote !== id) {
+      if (boite) boite.remove();
+      boite = document.createElement('div');
+      boite.dataset.wmCote = id;
+      // Classes du site : la boîte a la géométrie de celles qu'elle suit.
+      boite.className = 'card-frame p-4 space-y-1';
+    }
+    if (boite.previousElementSibling !== ancre) ancre.after(boite);
+
+    /*
+     * Le nombre de ventes n'a pas d'unité à porter, le mot « ventes » la dit.
+     * La dernière, elle, est un PRIX : elle prend le wikibidou, comme tous les
+     * prix de la page au-dessus d'elle.
+     */
+    const detail = n
+      ? `${esc(fmtWb(n))} vente${n > 1 ? 's' : ''} en ${esc(nom)}`
+        + (dernier == null
+          ? ''
+          // `nowrap` : l'unité ne doit jamais se retrouver seule en fin de ligne.
+          : ' · la dernière à <span style="white-space:nowrap">'
+            + `${wbIcon(WB_AU_FIL)} ${esc(fmtWb(dernier))}</span>`)
+      : `Jamais vendue en ${esc(nom)}`;
+
+    boite.title = n
+      ? `Moyenne des ventes conclues de cette carte en ${nom} — le chiffre que le site donne `
+        + 'en mettant une carte en vente, et dans sa Vue du marché.'
+        + (dernier == null
+          ? ''
+          : ` La dernière est partie à ${fmtWb(dernier)} : son écart avec la moyenne dit dans `
+            + 'quel sens le prix bouge.')
+        + (maigre
+          ? ` Établie sur ${n} vente${n > 1 ? 's' : ''} seulement : une enchère emballée `
+            + 'suffit à la tirer loin du prix courant.'
+          : '')
+      : `Aucune vente conclue pour cette carte en ${nom} : il n’y a pas de prix courant, `
+        + 'et la mise de départ ne se compare à rien.';
+
+    boite.innerHTML = `
+      <div class="flex items-center justify-between">
+        <span class="text-xs uppercase tracking-wide text-[var(--color-foreground)]/50"
+          >Prix moyen${maigre ? ' ⚠' : ''}</span>
+        <span class="inline-flex items-center gap-1.5 text-2xl font-bold tabular-nums"
+          style="color:${VALUE_COLOR}"
+          >${moy == null ? '' : wbIcon('class="size-6"')}${moy == null ? '—' : esc(fmtWb(moy))}</span>
+      </div>
+      <div class="text-sm text-[var(--color-foreground)]/50"
+        ><span style="color:${RARITY_COLOR[rarete] || VALUE_COLOR}">◆</span> ${detail}</div>`;
+  }
+
   function refreshCollection() {
     syncNavigation();
     injectNewFilter();
@@ -1090,6 +1363,7 @@
     injectValueSort();
     paintValueBadges();
     injectWishAll();
+    injectAuctionCote();
   }
 
   /** Répartition par rareté, dérivée de l'historique — jamais comptée à part. */
