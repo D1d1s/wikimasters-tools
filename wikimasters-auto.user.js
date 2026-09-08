@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WikiMasters Tools
 // @namespace    https://www.wiki-masters.com/
-// @version      2.14.5
+// @version      2.15.0
 // @description  Boîte à outils WikiMasters : ouverture automatique des paquets, suivi des tirages, cote des cartes et revente.
 // @match        https://www.wiki-masters.com/*
 // @match        https://wiki-masters.com/*
@@ -41,7 +41,7 @@
    *
    * Il est lu par le garde juste en dessous, d'où sa place en tête.
    */
-  const VERSION = '2.14.5';
+  const VERSION = '2.15.0';
 
   /*
    * Une seule instance par page — et savoir laquelle
@@ -1351,6 +1351,60 @@
   const tradePrix = new Map();   // card_id → moyenne, pour les cartes non possédées
   let tradeCoteEnCours = false;
 
+  /*
+   * Les cartes des AUTRES, cotées elles aussi.
+   * -----------------------------------------
+   * `/api/trades` ne donne que les cartes déjà engagées dans une offre. Le
+   * composeur, lui, montre la collection entière de l'ami — 484 cartes sur le
+   * compte où ç'a été relevé — et c'est là qu'on choisit ce qu'on va demander.
+   * Sans prix, on choisit à l'aveugle.
+   *
+   * Ces cartes arrivent dans une réponse de la même forme que la nôtre :
+   * `collection[]`, chaque entrée portant son `card_id`. Et l'historique des
+   * ventes se lit par `card_id`, sans se soucier de qui détient la carte — le
+   * marché est public.
+   *
+   * On observe donc la FORME plutôt que la route. Le chemin de la collection
+   * d'autrui porte un identifiant et n'est documenté nulle part ; l'écrire en
+   * dur, c'est reprendre le pari qui a déjà coûté deux corrections aujourd'hui.
+   * Toute réponse qui ressemble à une collection nourrit l'index, d'où qu'elle
+   * vienne — la nôtre, celle d'un ami, celle d'un profil visité.
+   *
+   * On ne modifie rien de la réponse : on la lit au passage sur un clone, et
+   * la moindre anomalie est avalée. Observer ne doit jamais coûter la requête
+   * observée.
+   */
+  const VUES_MAX = 4000;   // borne mémoire : au-delà on cesse d'indexer
+  let cardsProxyOn = false;
+
+  function installCardsProxy() {
+    if (cardsProxyOn) return;
+    cardsProxyOn = true;
+    const passe = window.fetch;
+    window.fetch = async function (input) {
+      const res = await passe.apply(this, arguments);
+      try {
+        if (!onTrades() || tradeCards.lignes.length >= VUES_MAX) return res;
+        const url = typeof input === 'string' ? input : (input && input.url) || '';
+        if (!/\/api\//.test(url) || !/collection/i.test(url)) return res;
+        const data = await res.clone().json();
+        const lot = data && data.collection;
+        if (!Array.isArray(lot) || !lot.length) return res;
+        const connus = new Set(tradeCards.lignes.map((l) => l.id));
+        for (const e of lot) {
+          const titre = e && e.card && (e.card.wikipedia_title || e.card.title);
+          if (!e || !e.card_id || !titre || connus.has(e.card_id)) continue;
+          connus.add(e.card_id);
+          tradeCards.lignes.push({ id: e.card_id, t: titre, r: (e.card && e.card.rarity) || '' });
+        }
+        coterCartesEchangees();
+      } catch (_) {
+        /* réponse illisible ou non-JSON : rien à indexer, et rien à casser */
+      }
+      return res;
+    };
+  }
+
   async function coterCartesEchangees() {
     if (tradeCoteEnCours || !prefs.db) return;
     const parId = new Set(sell.rows.map((r) => r.id));
@@ -1420,6 +1474,7 @@
 
   function paintTradeListPrices() {
     if (!onTrades()) return;
+    installCardsProxy();
     if (!sell.rows.length) return;
     refreshTradeCards();
     if (!tradeCards.lignes.length) return;
