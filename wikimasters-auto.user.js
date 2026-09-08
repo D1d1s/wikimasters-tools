@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WikiMasters Tools
 // @namespace    https://www.wiki-masters.com/
-// @version      2.14.2
+// @version      2.14.5
 // @description  Boîte à outils WikiMasters : ouverture automatique des paquets, suivi des tirages, cote des cartes et revente.
 // @match        https://www.wiki-masters.com/*
 // @match        https://wiki-masters.com/*
@@ -41,7 +41,7 @@
    *
    * Il est lu par le garde juste en dessous, d'où sa place en tête.
    */
-  const VERSION = '2.14.2';
+  const VERSION = '2.14.5';
 
   /*
    * Une seule instance par page — et savoir laquelle
@@ -1225,26 +1225,67 @@
   function paintValueBadges() {
     const montrer = (byValue || onTrades()) && sell.rows.length;
     const prix = montrer ? new Map(sell.rows.map((r) => [r.t, r.moy])) : null;
+    /*
+     * Sur les échanges, la carte affichée n'est pas forcément à toi — c'est
+     * même le cas le plus intéressant. La cote par titre ne couvre que ta
+     * collection ; les prix relevés pour les cartes d'échange, eux, sont
+     * indexés par `card_id`. `tradeCards` porte la correspondance des deux, on
+     * s'en sert pour les rendre atteignables par titre.
+     *
+     * Vu à l'écran sans ça : le détail d'une offre montrait une carte sans
+     * prix alors que la liste juste derrière l'affichait.
+     */
+    if (prix && onTrades()) {
+      for (const l of tradeCards.lignes) {
+        if (prix.has(l.t)) continue;
+        const moy = tradePrix.get(l.id);
+        if (moy != null) prix.set(l.t, moy);
+      }
+    }
     // Tri éteint et aucune pastille à retirer : rien à parcourir. La collection
     // porte quelques milliers de nœuds, et ce tour passe à chaque rendu.
     if (!prix && !document.querySelector('[data-wm-value]')) return;
 
     for (const h of document.querySelectorAll('h3')) {
       /*
-       * Le composeur d'échange n'habille pas ses cartes comme la collection :
-       * relevé sur la vraie page, `CARD_ITEM` n'y trouve RIEN. Sa tuile est le
-       * `<button>` qui entoure le titre — `position: relative` et
-       * `overflow: hidden`, donc exactement ce qu'il faut pour une pastille
-       * posée en absolu, et 50 titres sur 50 s'y rattachent.
+       * Les échanges n'habillent pas leurs cartes comme la collection :
+       * relevé sur la vraie page, `CARD_ITEM` n'y trouve RIEN.
        *
-       * On ne cherche ce second habillage que sur la page des échanges. Un
-       * `closest('button')` général attraperait n'importe quel `h3` niché dans
-       * un bouton ailleurs sur le site, et poserait des prix là où personne
-       * n'en a demandé.
+       * Et ils ne les habillent pas d'une seule façon. Le composeur enveloppe
+       * sa tuile dans un `<button>` — on choisit une carte en cliquant dessus.
+       * La modale de détail montre la MÊME tuile, sans bouton : il n'y a rien à
+       * y choisir. Chercher un `<button>` marchait donc dans le composeur et
+       * nulle part ailleurs, ce qui s'est vu tout de suite : le détail d'une
+       * offre n'affichait aucun prix.
+       *
+       * On vise donc la propriété qui compte réellement — un ancêtre
+       * `position: relative`, seul endroit où une pastille posée en absolu
+       * atterrit dans la carte plutôt qu'au coin de la page. Les deux
+       * habillages le portent, sur la même boîte à `w-[clamp(…)]`, et un
+       * changement de classes du site n'y peut rien.
+       *
+       * Quatre niveaux suffisent — mesuré, la boîte est à deux — et bornent la
+       * remontée : sans borne on finirait par accrocher un conteneur de page,
+       * et la pastille irait se poser à des centaines de pixels de sa carte.
        */
-      const item = h.closest(CARD_ITEM) || (onTrades() ? h.closest('button') : null);
+      let item = h.closest(CARD_ITEM);
+      let tuileEchange = false;
+      if (!item && onTrades()) {
+        let n = h.parentElement;
+        for (let i = 0; i < 4 && n && !item; i++, n = n.parentElement) {
+          if (getComputedStyle(n).position === 'relative') { item = n; tuileEchange = true; }
+        }
+      }
       if (!item) continue;
-      const hote = item.firstElementChild || item;
+      /*
+       * L'hôte est la tuile ELLE-MÊME sur les échanges, et non son premier
+       * enfant. Ce détour vient de la collection, où le premier enfant est le
+       * cadre positionné ; sur les échanges c'est l'IMAGE de la carte — et une
+       * `<img>` ne contient rien. La pastille était bien créée, mesurée à
+       * 0 × 0 pixel, invisible : le pire des cas, un correctif qui a l'air posé
+       * et qui n'affiche rien.
+       */
+      const hote = tuileEchange ? item : (item.firstElementChild || item);
       const pastille = hote.querySelector('[data-wm-value]');
       const moy = prix ? prix.get(h.textContent.trim()) : null;
 
@@ -1328,6 +1369,7 @@
         tradePrix.set(id, px.length ? Math.round(px.reduce((a, b) => a + b, 0) / px.length) : null);
       }
       paintTradeListPrices();
+      paintValueBadges();   // le détail d'une offre montre la carte en grand
     } catch (_) {
       /* base injoignable : la pastille se contentera des cartes possédées */
     } finally {
