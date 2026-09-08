@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WikiMasters Tools
 // @namespace    https://www.wiki-masters.com/
-// @version      2.12.1
+// @version      2.13.0
 // @description  Boîte à outils WikiMasters : ouverture automatique des paquets, suivi des tirages, cote des cartes et revente.
 // @match        https://www.wiki-masters.com/*
 // @match        https://wiki-masters.com/*
@@ -41,7 +41,7 @@
    *
    * Il est lu par le garde juste en dessous, d'où sa place en tête.
    */
-  const VERSION = '2.12.1';
+  const VERSION = '2.13.0';
 
   /*
    * Une seule instance par page — et savoir laquelle
@@ -236,13 +236,40 @@
     // passerait inaperçu.
     probeAfterHits: 40,
     /*
-     * Part de l'ÉCART au plancher de sécurité reprise à chaque détente — pas un
-     * pourcentage de la valeur. Mesuré : à 0,35, revenir d'un plancher de 40 s
-     * demande 520 paquets contre 1 480 avec l'ancienne règle, et un plancher
-     * réellement mesuré à 2 s met toujours 200 paquets à s'effacer. Plus il est
-     * absurde, plus vite il retombe ; près du but, il ne bouge presque plus.
+     * Marge au-dessus d'un délai refusé, et pas de détente — les deux ADDITIFS,
+     * et c'est le point.
+     *
+     * Ils valaient « +10 % » et « 35 % de l'écart au plancher de sécurité ».
+     * Deux pas de tailles sans rapport, et le grand traversait ce que le petit
+     * défendait : depuis un plancher de 3 136 ms, la détente faisait un bond de
+     * 818 ms et atterrissait à 2 318 — sous un seuil serveur de 2 500. Elle ne
+     * sondait pas le mur, elle entrait dedans, à tous les coups.
+     *
+     * Mesuré sur le banc, une heure de boucle réelle contre un serveur refusant
+     * en dessous de 2 500 ms : 39 refus, un tous les 24 paquets, 11 % du temps
+     * passé à reculer pour rien — et un plancher stabilisé 25 % au-dessus de ce
+     * que le serveur tolérait. Le plus lent des deux mondes.
+     *
+     * Pire, le multiplicatif dérivait vers le haut : chaque contact ajoutait
+     * 10 % (~300 ms à cette hauteur) qu'il fallait 48 paquets propres pour
+     * regagner. C'est cet engrenage qui a porté un compte réel jusqu'au plafond
+     * de 60 s ; les doubles boucles ne faisaient que fournir les contacts.
+     *
+     * En additif, l'écart au seuil réel ne peut plus dépasser la marge : le
+     * plancher oscille juste au-dessus au lieu de s'en éloigner. La détente est
+     * volontairement plus PETITE que la marge — sans quoi le système repart en
+     * dents de scie, chaque détente annulant plus que ce qu'un contact corrige.
+     *
+     * 300 plutôt que 200 : les deux ont été mesurés en répétition, parce qu'un
+     * seul essai ne départage pas deux réglages séparés par cinq refus. À 200,
+     * trois essais donnent 19, 19 et 20 refus par heure ; à 300, 14, 15 et 14 —
+     * soit 19,3 contre 14,3 de moyenne, pour un débit qui ne baisse pas (1 041
+     * contre 1 051 paquets). La marge plus large fait toucher le mur un quart
+     * de fois en moins sans rien coûter, le plancher ne s'établissant que
+     * 100 ms plus haut.
      */
-    probeRelax: 0.35,
+    probeMarginMs: 300,
+    probeRelaxMs: 150,
 
     // Une seule remise en vente à la fois, espacée au hasard dans cet
     // intervalle : dix annonces publiées dans la même seconde se remarquent, et
@@ -463,15 +490,54 @@
      * migration complète n'aurait jamais pu s'exécuter. Un marqueur à demi
      * consommé ne se rattrape pas — il se remplace.
      */
-    if (!s.debitRecalibre) {
-      saveStore({ debitRecalibre: true, probeFloorMs: 0, delayMs: CFG.startDelayMs });
+    /*
+     * Deuxième remise à zéro, et pour une raison neuve : tant que le verrou ne
+     * tenait pas, une partie des 429 était FABRIQUÉE par deux boucles ouvrant
+     * ensemble depuis deux onglets. Le plancher qu'ils ont appris ne mesure
+     * donc pas le débit du serveur, il mesure un défaut de l'outil — et il se
+     * transmettait de session en session, `delayMs` étant persisté et ne
+     * reculant que de 250 ms par succès.
+     *
+     * Relevé sur un compte réel avant le correctif : `delayMs` et
+     * `probeFloorMs` tous deux à 60 000 ms, le plafond, sur un compte qui
+     * ouvrait ses paquets à une minute d'intervalle. Aucun serveur n'a jamais
+     * refusé ce rythme-là. On repart du départ, et le prochain refus — un vrai,
+     * cette fois — le réapprendra proprement.
+     *
+     * Marqueur neuf plutôt que réutilisation de `debitRecalibre` : là où
+     * l'ancien est déjà posé, une condition qui le relit ne s'exécuterait
+     * jamais. C'est la leçon de la migration précédente, écrite juste au-dessus.
+     */
+    if (!s.debitVerrou) {
+      saveStore({ debitVerrou: true, probeFloorMs: 0, delayMs: CFG.startDelayMs });
     } else {
       if (Number.isFinite(s.probeFloorMs)) {
         state.probeFloorMs = Math.min(CFG.ceilDelayMs, Math.max(0, s.probeFloorMs));
       }
-      if (Number.isFinite(s.delayMs) && Number.isFinite(s.probeFloorMs)) {
-        state.delayMs = Math.min(CFG.ceilDelayMs, Math.max(floorMs(), s.delayMs));
-      }
+      /*
+       * Le PLANCHER se relit, le DÉLAI non — et c'est une distinction de nature,
+       * pas un raccourci.
+       *
+       * Le plancher est une mesure : le serveur a refusé, on a retenu où. Le
+       * délai courant, lui, n'est qu'un recul temporaire — la valeur qu'il a au
+       * moment où l'onglet se ferme est celle d'un incident en cours, gonflée
+       * de 60 % par refus, pas un rythme constaté.
+       *
+       * Le relire était le dernier engrenage vers le haut. Une série de refus
+       * portait le délai à 20 s, la page se rechargeait, et la session suivante
+       * repartait à 20 s pour ne regagner que 250 ms par succès : huit heures
+       * pour effacer un incident de trente secondes. Le plancher, lui, ne peut
+       * plus s'emballer depuis que la marge est additive ; il n'y avait plus de
+       * raison de laisser le délai le faire.
+       *
+       * On repart donc du départ, borné par le plancher appris : c'est lui qui
+       * porte ce qu'on sait du serveur, et il suffit.
+       *
+       * Il continue d'être ÉCRIT dans le stockage, et ce n'est pas un oubli :
+       * c'est en l'y lisant sur un compte réel qu'on a vu l'emballement. Écrit
+       * pour le diagnostic, jamais relu pour agir.
+       */
+      state.delayMs = Math.max(floorMs(), CFG.startDelayMs);
     }
     if (Number.isFinite(s.cadenceMs)) state.cadenceMs = s.cadenceMs;
     // Le maximum du compteur de pitié s'accumule d'une session à l'autre : c'est
@@ -4320,6 +4386,39 @@
 
     while (mine()) {
       /*
+       * Le verrou, repris à CHAQUE tour — pas seulement au démarrage.
+       * ---------------------------------------------------------------
+       * `start()` vérifiait le verrou une fois et plus jamais ; le battement le
+       * rafraîchissait sans jamais lire sa réponse (voir plus bas). Une boucle
+       * qui perdait la main continuait donc d'ouvrir, en aveugle, à côté de
+       * celle qui l'avait prise.
+       *
+       * Ce n'est pas une hypothèse. Chrome gèle les minuteries d'un onglet en
+       * arrière-plan à environ un tour par minute : le rafraîchissement, qui
+       * n'a lieu qu'un tour sur huit, demande alors huit minutes là où le
+       * verrou expire en douze secondes. Relevé sur un vrai navigateur : un
+       * onglet tenait le verrou avec un battement vieux de 159 secondes. Il
+       * suffit qu'un second onglet lise ce verrou — libre, puisque périmé —
+       * pour que deux boucles ouvrent ensemble.
+       *
+       * Deux appels collés, c'est exactement ce que le serveur refuse. Le 429
+       * qui suit n'apprend donc RIEN sur le débit autorisé : il est fabriqué
+       * par l'outil. Et il coûte cher, parce qu'il est retenu — `delayMs` est
+       * multiplié puis persisté, le plancher appris se recalcule dessus. Vu sur
+       * un compte réel : les deux collés au plafond de 60 s, pour des paquets
+       * ouverts à une minute d'intervalle que le serveur n'a jamais refusés à
+       * ce rythme-là.
+       *
+       * `takeLock()` REPREND le verrou s'il est libre ou déjà nôtre, et ne rend
+       * faux que si un autre onglet le tient vraiment. Un onglet réveillé après
+       * un gel se réapproprie donc sa place tant que personne ne l'a prise ;
+       * s'il l'a perdue, il s'arrête ici, avant d'ouvrir quoi que ce soit.
+       */
+      if (!takeLock()) {
+        return stop('Un autre onglet a pris la main — boucle arrêtée ici.', true);
+      }
+
+      /*
        * Vérification à CHAQUE tour, pas seulement au démarrage : le pack
        * quotidien se libère au changement de jour côté serveur — en UTC, donc
        * pas au minuit de ton fuseau. Une boucle lancée la veille ne l'aurait
@@ -4399,8 +4498,7 @@
         state.delayMs = Math.max(floorMs(), state.delayMs - CFG.decayMs);
         if (state.probeFloorMs && ++state.cleanHits >= CFG.probeAfterHits) {
           state.cleanHits = 0;
-          const ecart = state.probeFloorMs - CFG.floorDelayMs;
-          const relaxed = state.probeFloorMs - Math.max(CFG.decayMs, Math.round(ecart * CFG.probeRelax));
+          const relaxed = state.probeFloorMs - CFG.probeRelaxMs;
           state.probeFloorMs = relaxed <= CFG.floorDelayMs ? 0 : relaxed;
         }
         saveStore({ delayMs: state.delayMs, probeFloorMs: state.probeFloorMs });
@@ -4467,7 +4565,7 @@
          * doit bien répondre à chaque refus.
          */
         if (state.throttles === 1) {
-          state.probeFloorMs = Math.min(CFG.ceilDelayMs, Math.round(state.delayMs * 1.1));
+          state.probeFloorMs = Math.min(CFG.ceilDelayMs, state.delayMs + CFG.probeMarginMs);
         }
         state.delayMs = Math.min(CFG.ceilDelayMs, Math.round(state.delayMs * CFG.growth));
         saveStore({ delayMs: state.delayMs, probeFloorMs: state.probeFloorMs });
@@ -9887,7 +9985,20 @@
   setInterval(() => {
     if (!state.running) return;
     if (state.waitUntil) renderStatus();
-    if (++beat % 8 === 0) takeLock(); // ~4 s, bien sous le TTL de 12 s
+    /*
+     * La réponse de `takeLock()` était jetée. C'est le silence qui coûtait :
+     * un onglet dépossédé continuait sa boucle sans que rien ne le dise, et
+     * les deux ouvraient de concert. On le lit, et on s'arrête.
+     *
+     * Le tour de boucle refait la même vérification avant chaque ouverture —
+     * c'est elle qui garantit qu'aucun paquet ne part sans le verrou. Ici, on
+     * gagne seulement de le dire tout de suite plutôt qu'à la fin d'une longue
+     * attente : sans ça le panneau annoncerait « Prochain paquet dans 2:54 »
+     * pendant trois minutes alors que la main est déjà passée à côté.
+     */
+    if (++beat % 8 === 0 && !takeLock()) { // ~4 s, bien sous le TTL de 12 s
+      stop('Un autre onglet a pris la main — boucle arrêtée ici.', true);
+    }
   }, CFG.tickMs);
 
   /*
