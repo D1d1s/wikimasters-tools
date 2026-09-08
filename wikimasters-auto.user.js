@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WikiMasters Tools
 // @namespace    https://www.wiki-masters.com/
-// @version      2.12.0
+// @version      2.12.1
 // @description  Boîte à outils WikiMasters : ouverture automatique des paquets, suivi des tirages, cote des cartes et revente.
 // @match        https://www.wiki-masters.com/*
 // @match        https://wiki-masters.com/*
@@ -41,7 +41,7 @@
    *
    * Il est lu par le garde juste en dessous, d'où sa place en tête.
    */
-  const VERSION = '2.12.0';
+  const VERSION = '2.12.1';
 
   /*
    * Une seule instance par page — et savoir laquelle
@@ -778,8 +778,10 @@
    * On trie donc la collection ENTIÈRE et on laisse le site l'afficher : la
    * réponse de `/api/my-collection` est interceptée, et son tableau `collection`
    * remplacé par la tranche correspondante de notre classement. Le site rend ses
-   * propres cartes, sa pagination, son filtre de rareté et sa recherche
-   * continuent de fonctionner — seul l'ordre change. Le reste de la réponse est
+   * propres cartes ; sa pagination, ses filtres de rareté et d'étiquette et sa
+   * recherche continuent de fonctionner — seul l'ordre change. Ces filtres-là,
+   * le classement doit les reproduire lui-même : voir `filterValueRows`, et ce
+   * qu'il en coûte de n'en oublier un. Le reste de la réponse est
    * laissé intact, et la moindre anomalie renvoie la réponse d'origine : le tri
    * ne peut pas empêcher la collection de s'afficher.
    *
@@ -861,6 +863,53 @@
    */
   let valueProxyOn = false;
 
+  /*
+   * Les filtres du site, reproduits sur le classement.
+   *
+   * LE PIÈGE : le proxy rend une tranche de SA liste, pas de celle du serveur.
+   * Un filtre qu'il ne reproduit pas est donc purement et simplement perdu —
+   * « Sans étiquette » sélectionnée, la collection continuait d'afficher les
+   * cartes étiquetées, et le tri avait l'air d'ignorer le filtre. Il l'ignorait.
+   *
+   * Relevé sur les requêtes du site :
+   *   `rarity=SR&rarity=R`  la rareté est RÉPÉTÉE, une occurrence par rareté
+   *                         cochée. `get()` n'en lisait que la première : à deux
+   *                         raretés, la seconde disparaissait de la page.
+   *   `tag_id=<uuid>`       une étiquette précise
+   *   `untagged=1`          « Sans étiquette »
+   *
+   * Les étiquettes voyagent avec chaque entrée de `/api/my-collection` — `tags`,
+   * un tableau d'objets `{id, name, …}` — donc le classement les porte déjà et
+   * les reproduire ne coûte aucune requête. Mesuré sur ce compte : N cartes
+   * en tout, N sans étiquette, soit exactement les N exemplaires
+   * étiquetés — le prédicat local et `untagged=1` désignent le même ensemble.
+   *
+   * Un paramètre inconnu rend la main au site plutôt que d'afficher les mauvaises
+   * cartes : un filtre ajouté demain éteindra le tri sur cette vue-là, il ne
+   * mentira pas dessus.
+   */
+  const COLLECTION_PARAMS = new Set(
+    ['sort', 'page', 'stats', 'limit', 'q', 'rarity', 'tag_id', 'untagged']
+  );
+
+  /** @returns {Array|null} le classement filtré, ou `null` si un filtre échappe. */
+  function filterValueRows(p) {
+    for (const [cle, val] of p) if (val && !COLLECTION_PARAMS.has(cle)) return null;
+
+    const raretes = p.getAll('rarity').filter(Boolean);
+    const untagged = p.get('untagged');
+    const tag = p.get('tag_id');
+
+    let out = valueRows;
+    if (raretes.length) {
+      const voulues = new Set(raretes);
+      out = out.filter((e) => e.card && voulues.has(e.card.rarity));
+    }
+    if (untagged && untagged !== '0') out = out.filter((e) => !e.tags || !e.tags.length);
+    else if (tag) out = out.filter((e) => e.tags && e.tags.some((t) => t && t.id === tag));
+    return out;
+  }
+
   function installValueProxy() {
     if (valueProxyOn) return;
     valueProxyOn = true;
@@ -880,8 +929,8 @@
         const data = await res.clone().json();
         if (!data || !Array.isArray(data.collection)) return res;
 
-        const rarete = p.get('rarity');
-        const liste = rarete ? valueRows.filter((e) => e.card && e.card.rarity === rarete) : valueRows;
+        const liste = filterValueRows(p);
+        if (!liste) return res;  // un filtre qu'on ne sait pas reproduire
         const page = Math.max(0, parseInt(p.get('page'), 10) || 0);
         data.collection = liste.slice(page * COLLECTION_PAGE, (page + 1) * COLLECTION_PAGE);
 
