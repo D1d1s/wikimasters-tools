@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WikiMasters Tools
 // @namespace    https://www.wiki-masters.com/
-// @version      2.13.0
+// @version      2.13.1
 // @description  Boîte à outils WikiMasters : ouverture automatique des paquets, suivi des tirages, cote des cartes et revente.
 // @match        https://www.wiki-masters.com/*
 // @match        https://wiki-masters.com/*
@@ -41,7 +41,7 @@
    *
    * Il est lu par le garde juste en dessous, d'où sa place en tête.
    */
-  const VERSION = '2.13.0';
+  const VERSION = '2.13.1';
 
   /*
    * Une seule instance par page — et savoir laquelle
@@ -508,8 +508,18 @@
      * l'ancien est déjà posé, une condition qui le relit ne s'exécuterait
      * jamais. C'est la leçon de la migration précédente, écrite juste au-dessus.
      */
-    if (!s.debitVerrou) {
-      saveStore({ debitVerrou: true, probeFloorMs: 0, delayMs: CFG.startDelayMs });
+    /*
+     * Troisième remise à zéro, et la deuxième en une journée — ce qui mérite
+     * d'être dit plutôt que masqué. Celle de la 2.13.0 a été effectuée, puis le
+     * plancher est remonté au plafond en moins d'une heure sur un compte réel :
+     * le correctif d'alors bornait le pas du plancher, pas la base sur laquelle
+     * il se calculait. Ces valeurs-là ne mesurent donc toujours rien.
+     *
+     * Marqueur neuf, encore : `debitVerrou` est déjà posé partout où la 2.13.0
+     * est passée, et une condition qui le relit ne s'exécuterait jamais.
+     */
+    if (!s.debitCliquet) {
+      saveStore({ debitCliquet: true, probeFloorMs: 0, delayMs: CFG.startDelayMs });
     } else {
       if (Number.isFinite(s.probeFloorMs)) {
         state.probeFloorMs = Math.min(CFG.ceilDelayMs, Math.max(0, s.probeFloorMs));
@@ -4564,8 +4574,34 @@
          * Le délai courant, lui, continue de doubler : c'est le recul, et il
          * doit bien répondre à chaque refus.
          */
+        /*
+         * Et il ne renseigne que s'il a TESTÉ le plancher.
+         *
+         * Le délai courant peut être très au-dessus : il grandit de 60 % par
+         * refus et ne redescend que de 250 ms par succès. Un refus qui tombe
+         * pendant cette redescente ouvre bien une série neuve — les compteurs
+         * ont été remis à zéro par le succès qui précède — mais il ne dit rien
+         * de notre rythme : à ce délai-là, on ne testait plus rien.
+         *
+         * Le poser quand même sur ce délai gonflé était le dernier cliquet, et
+         * il suffisait à lui seul. Reproduit sur le banc : trois succès, une
+         * série de quatre refus, un succès, un refus — plancher de 1 550 à
+         * 8 242 ms d'un coup. Deux cycles de plus et c'est le plafond. C'est
+         * l'état trouvé sur un compte réel en 2.13.0, migration passée : les
+         * deux à 60 000 ms moins d'une heure après une remise à zéro.
+         *
+         * La marge additive bornait le PAS, pas la BASE. On exige donc que le
+         * délai refusé soit à portée du plancher — sinon le refus vient
+         * d'ailleurs (une rafale, un autre appel, un hoquet du serveur) et
+         * n'apprend rien sur l'espacement des ouvertures. Le premier refus,
+         * lui, compte toujours : sans plancher, c'est notre seule mesure.
+         */
         if (state.throttles === 1) {
-          state.probeFloorMs = Math.min(CFG.ceilDelayMs, state.delayMs + CFG.probeMarginMs);
+          const aTeste = !state.probeFloorMs
+            || state.delayMs <= floorMs() + CFG.probeMarginMs;
+          if (aTeste) {
+            state.probeFloorMs = Math.min(CFG.ceilDelayMs, state.delayMs + CFG.probeMarginMs);
+          }
         }
         state.delayMs = Math.min(CFG.ceilDelayMs, Math.round(state.delayMs * CFG.growth));
         saveStore({ delayMs: state.delayMs, probeFloorMs: state.probeFloorMs });
