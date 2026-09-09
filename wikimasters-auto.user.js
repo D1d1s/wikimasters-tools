@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WikiMasters Tools
 // @namespace    https://www.wiki-masters.com/
-// @version      2.16.0
+// @version      2.17.0
 // @description  Boîte à outils WikiMasters : ouverture automatique des paquets, suivi des tirages, cote des cartes et revente.
 // @match        https://www.wiki-masters.com/*
 // @match        https://wiki-masters.com/*
@@ -41,7 +41,7 @@
    *
    * Il est lu par le garde juste en dessous, d'où sa place en tête.
    */
-  const VERSION = '2.16.0';
+  const VERSION = '2.17.0';
 
   /*
    * Une seule instance par page — et savoir laquelle
@@ -9170,8 +9170,35 @@
          * correctif qu'il ignore. La réparation est exacte : sous le seuil,
          * la valeur juste est la médiane, et elle est déjà dans la ligne.
          */
+        /*
+         * Le cache porte aussi des LIGNES EN DOUBLE : le relevé posait une
+         * ligne par exemplaire possédé, et un exemplaire en double donnait deux
+         * lignes identiques, indiscernables, chacune avec son bouton « Vendre ».
+         * Relevé sur un compte réel : N lignes pour N cartes. Le compte
+         * de tête annonçait donc des lignes en disant « cartes ».
+         *
+         * Réparé ici plutôt qu'au prochain relevé complet, qui dure deux
+         * minutes et que personne ne relance pour un correctif qu'il ignore —
+         * même raison que la réparation du prix visé juste en dessous.
+         */
+        const vus = new Set();
+        sell.rows = sell.rows.filter((r) => {
+          if (!r.id) return true;
+          if (vus.has(r.id)) return false;
+          vus.add(r.id);
+          return true;
+        });
+
         for (const r of sell.rows) {
           if (r.id) sell.checked.add(r.id);
+          /*
+           * Le plafond s'applique aussi aux cotes déjà en cache : sans ça, un
+           * prix visé à vingt fois la médiane resterait affiché jusqu'au
+           * prochain relevé complet.
+           */
+          if (!r.seule && r.n >= THIN_SALES && Number.isFinite(r.med) && Number.isFinite(r.q3)) {
+            r.q3 = Math.min(r.q3, Math.round(r.med * Q3_PLAFOND));
+          }
           if (r.seule || r.n >= THIN_SALES) continue;
           /*
            * Deux ventes : la médiane rangée est celle du haut, donc le maximum
@@ -9424,7 +9451,34 @@
       return;
     }
 
-    sell.total = cards.length;
+    /*
+     * Un exemplaire par ligne, c'est la collection. Une carte par ligne, c'est
+     * la cote.
+     *
+     * `fetchCollection` rend un exemplaire possédé par entrée — c'est sa
+     * vérité, et le relevé de couverture s'en sert telle quelle. Mais la cote
+     * porte sur une CARTE : son historique de ventes ne dépend pas du nombre
+     * d'exemplaires qu'on en détient. Poser une ligne par exemplaire donnait
+     * deux lignes identiques pour une carte détenue en double, avec le même
+     * prix, la même amplitude et deux boutons « Vendre » qui ouvrent la même
+     * fiche. Relevé sur un compte réel : 21 lignes pour rien, et un compte de
+     * tête qui annonçait « N cartes » en comptant des lignes.
+     *
+     * Au passage, l'historique n'est plus demandé deux fois pour la même carte.
+     */
+    const distinctes = [];
+    {
+      const vus = new Set();
+      for (const c of cards) {
+        if (!c.id || vus.has(c.id)) continue;
+        vus.add(c.id);
+        distinctes.push(c);
+      }
+    }
+
+    // La cotation avance carte par carte, pas exemplaire par exemplaire : c'est
+    // ce que le compteur doit annoncer.
+    sell.total = distinctes.length;
 
     /*
      * La BASE d'abord. La table `auctions` porte les mêmes ventes closes que
@@ -9434,18 +9488,18 @@
      * quelques secondes.
      */
     if (prefs.db) {
-      const parCarte = await dbSalesBulk(cards.map((c) => c.id), (n) => {
+      const parCarte = await dbSalesBulk(distinctes.map((c) => c.id), (n) => {
         sell.done = n;
         renderSell();
       });
       if (parCarte) {
         const enBase = [];
-        for (const c of cards) {
+        for (const c of distinctes) {
           const px = parCarte.get(c.id) || [];
           if (px.length) enBase.push(coteRow(c, px));
         }
-        sell.done = cards.length;
-        finirScan(cards, enBase);
+        sell.done = distinctes.length;
+        finirScan(distinctes, enBase, cards.length);
         return;
       }
       // Base illisible (session, RLS, colonne renommée) : on retombe sur l'API.
@@ -9483,7 +9537,7 @@
       return;
     }
 
-    const queue = cards.slice();
+    const queue = distinctes.slice();
     const rows = [];
 
     const worker = async () => {
@@ -9536,15 +9590,23 @@
     };
 
     await Promise.all(Array.from({ length: SELL_POOL }, worker));
-    finirScan(cards, rows);
+    finirScan(distinctes, rows, cards.length);
   }
 
   /**
    * Clôture d'un relevé, quelle que soit la source — base ou API du site.
-   * @param {object[]} cards Toute la collection lue.
+   *
+   * @param {object[]} cards Les cartes DISTINCTES de la collection. La
+   *   liquidité par thème compte ainsi une carte une fois : détenue en double,
+   *   elle pesait deux fois au dénominateur et une seule fois au numérateur —
+   *   un thème paraissait donc moins liquide qu'il ne l'est.
    * @param {object[]} rows  Les cartes effectivement cotées.
+   * @param {number} exemplaires Le nombre d'EXEMPLAIRES lus. C'est l'unité de
+   *   `/api/my-collection/stats`, donc celle que la couverture doit comparer :
+   *   mélanger les deux ferait apparaître un manque permanent égal au nombre
+   *   de doublons.
    */
-  function finirScan(cards, rows) {
+  function finirScan(cards, rows, exemplaires) {
     /*
      * Liquidité par thème : la part des cartes d'un thème qui ont déjà trouvé
      * preneur. Le dénominateur doit compter TOUTES les cartes possédées, pas
@@ -9624,8 +9686,8 @@
      */
     if (!sell.tronque) {
       sell.scanAt = Date.now();
-      sell.scanTotal = cards.length;
-      sell.owned = { n: cards.length, at: Date.now() };
+      sell.scanTotal = exemplaires;
+      sell.owned = { n: exemplaires, at: Date.now() };
     }
     sell.scanning = false;
     saveCote();
@@ -9784,10 +9846,48 @@
    * tient à la médiane, qui ne peut pas être une valeur aberrante à elle
    * seule.
    */
+  /*
+   * Le prix visé ne peut pas s'éloigner indéfiniment de la médiane.
+   *
+   * Le 3e quartile est un prix réellement payé — un quart des ventes closes
+   * l'ont dépassé. Sur un échantillon mince, c'est pourtant une valeur aberrante
+   * déguisée en statistique : *Neptunium*, 8 ventes, médiane 233, prix visé
+   * **5 000**. Personne ne l'achète, et le taux de ventes conclues est passé de
+   * 16 à 11 sur 100 pendant que ces prix-là dormaient en tête de tableau.
+   *
+   * Mesuré sur N cartes cotées d'un compte réel, rapport q3/médiane par
+   * taille d'échantillon :
+   *
+   *   ventes   cartes   médian   p90    max
+   *    5–7      326      1,47    3,70   30,0
+   *    8–11     222      1,91    4,67   21,5
+   *    12–19    187      2,17    4,50   19,4
+   *    20–34    136      2,14    3,73    8,3
+   *    35+      133      1,54    2,33    5,5
+   *
+   * Le rapport MÉDIAN ne bouge pas — il reste entre 1,5 et 2,2 partout. C'est
+   * le maximum qui s'effondre quand l'échantillon grandit : 30× à six ventes,
+   * 5,5× à trente-cinq. Une carte bien échantillonnée ne justifie jamais un
+   * écart pareil ; les 20× et 30× ne vivent que là où trois ventes suffisent à
+   * faire un quartile. C'est du bruit, et on ne met pas un prix dessus.
+   *
+   * Le plafond est donc posé à 3× : au-dessus du rapport médian de TOUTES les
+   * tranches (2,17 au pire) et au-dessus du p90 de la seule tranche à laquelle
+   * on puisse se fier (2,33 à 35 ventes et plus). Ce qui dépasse est coupé.
+   *
+   * Ce que ça ne fait pas : baisser les prix en général. Le rapport médian
+   * étant de 1,8, l'immense majorité des lignes ne bouge pas — N cartes sur
+   * N dépassaient 3×.
+   */
+  const Q3_PLAFOND = 3;
+
   const q3De = (trie, med) =>
     trie.length < THIN_SALES
       ? med
-      : trie[Math.min(trie.length - 1, Math.floor(trie.length * 0.75))];
+      : Math.min(
+          trie[Math.min(trie.length - 1, Math.floor(trie.length * 0.75))],
+          Math.round(med * Q3_PLAFOND)
+        );
 
   /**
    * La cote quand le site ne rend qu'une moyenne — ce que voit un compte sans
