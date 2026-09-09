@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WikiMasters Tools
 // @namespace    https://www.wiki-masters.com/
-// @version      3.1.1
+// @version      3.2.0
 // @description  Boîte à outils WikiMasters : ouverture automatique des paquets, suivi des tirages, cote des cartes et revente.
 // @match        https://www.wiki-masters.com/*
 // @match        https://wiki-masters.com/*
@@ -41,7 +41,7 @@
    *
    * Il est lu par le garde juste en dessous, d'où sa place en tête.
    */
-  const VERSION = '3.1.1';
+  const VERSION = '3.2.0';
 
   /*
    * Une seule instance par page — et savoir laquelle
@@ -9209,6 +9209,18 @@
    * valeurs-là qu'un joueur peut choisir à la main, donc les seules qu'on
    * propose ici.
    */
+  /*
+   * La durée d'une carte mise en file : la plus courte que le site propose.
+   *
+   * C'est le choix qui engage le moins. Une carte qu'on vient de mettre en
+   * file part sans qu'on la revoie ; dix minutes, c'est dix minutes avant de
+   * pouvoir changer d'avis, contre vingt-quatre heures. Et « Tout repasser
+   * en » sait faire passer tout le lot à une autre durée en un geste — la
+   * corriger après coup coûte un clic, l'avoir devinée trop longue coûte une
+   * journée.
+   */
+  const FILE_MINUTES = 10;
+
   const DUREES = [
     { label: '10 min', minutes: 10 },
     { label: '30 min', minutes: 30 },
@@ -9541,16 +9553,44 @@
            * Le serveur rend la carte quelques secondes après avoir clos
            * l'enchère : absente ne veut pas dire perdue. On la garde inscrite
            * et on retentera — c'est tout l'intérêt de réconcilier.
+           *
+           * Mais un échec ne compte qu'UNE FOIS PAR CRÉNEAU.
+           *
+           * Ce tour repasse chaque seconde, et une carte introuvable ne
+           * reprogrammait rien : elle se voyait donc infliger vingt échecs en
+           * vingt secondes, puis la pause. Vingt tentatives étaient pensées
+           * comme un filet de sécurité au long cours ; elles se consommaient
+           * pendant l'absence de quelques secondes que ce commentaire décrit
+           * lui-même. Relevé sur un compte réel : trois cartes en pause après
+           * un seul invendu, revenues en collection depuis longtemps, la pause
+           * ayant survécu à sa cause.
+           *
+           * Espacé au rythme du marché, le budget devient trois minutes au
+           * lieu de vingt secondes — le temps qu'il faut à un serveur lent,
+           * sans rien perdre du filet.
            */
-          w.fails = (w.fails || 0) + 1;
-          if (w.fails >= WATCH_FAILS) {
-            w.paused = true;
-            w.pausedAt = Date.now();   // au-delà de WATCH_PAUSE_TTL, on oublie
-            logRelist(w.title, 'refus', w.price, 'introuvable en collection — suivi en pause');
+          if (Date.now() >= (w.failAt || 0) + CFG.relistGapMs[0]) {
+            w.fails = (w.fails || 0) + 1;
+            w.failAt = Date.now();
+            if (w.fails >= WATCH_FAILS) {
+              w.paused = true;
+              w.pausedAt = Date.now();   // au-delà de WATCH_PAUSE_TTL, on oublie
+              logRelist(w.title, 'refus', w.price, 'introuvable en collection — suivi en pause');
+            }
+            bouge = true;
           }
-          bouge = true;
           continue;
         }
+        /*
+         * Retrouvée : le compte d'échecs repart de zéro.
+         *
+         * Il ne se remettait à zéro qu'après une publication RÉUSSIE. Une
+         * carte revenue en collection mais qu'aucun emplacement n'attendait
+         * gardait donc ses échecs, et la prochaine absence les reprenait là où
+         * ils s'étaient arrêtés. Le compteur dit « combien de fois d'affilée
+         * on ne l'a pas trouvée » : la trouver le remet à zéro.
+         */
+        if (w.fails) { w.fails = 0; w.failAt = 0; bouge = true; }
         const res = await api('/api/marketplace', 'POST', {
           card_id: copie,
           base_amount: w.price,
@@ -11155,6 +11195,20 @@
         .encours { display: inline-block; padding: 4px 9px; border-radius: 8px;
                    background: rgba(53,214,143,.12); color: #35D68F;
                    font: 500 11px ui-sans-serif, system-ui, sans-serif; }
+        /*
+         * En file : la carte attend son tour, elle n'est pas encore au marché.
+         * Le lavande la distingue du vert de « en vente » — c'est une promesse,
+         * pas un fait. Même teinte que la rareté R du jeu, la seule de la
+         * palette qui ne soit prise ni par l'action ni par l'alerte.
+         */
+        .encours.file { background: rgba(198,167,242,.14); color: #C6A7F2; }
+        /* Le second geste de la ligne : il pèse moins que « Vendre », qui
+           passe par le formulaire du site et vous laisse valider. */
+        .go.file { color: #717C8D; }
+        tr:hover td .go.file { color: #C6A7F2; }
+        .go.file:hover, .go.file:focus-visible {
+          background: rgba(198,167,242,.15); border-color: #C6A7F2; color: #C6A7F2;
+        }
         .note { padding: 13px 20px; color: #717C8D; font-size: 11px; line-height: 1.55;
                 max-width: 90ch; border-top: 1px solid rgba(255,255,255,.07); }
         .empty { padding: 48px 40px; text-align: center; color: #717C8D; line-height: 1.6; }
@@ -11256,9 +11310,11 @@
           <div class="note">
             ⚠ signale une cote établie sur moins de 5 ventes : le prix visé y
             retombe sur la médiane, et ces cartes passent en fin de tableau.
-            Rien n'est mis en vente depuis cette page. « Vendre » ouvre la fiche
-            de la carte sur le formulaire du site, prix pré-rempli — vous
-            choisissez la durée et vous lancez l'enchère vous-même.
+            « Vendre » ouvre la fiche de la carte sur le formulaire du site,
+            prix pré-rempli — vous choisissez la durée et vous lancez l'enchère
+            vous-même. « Mettre en file » inscrit la carte au prix visé : elle
+            partira seule, sans vous, dès qu'un de vos dix emplacements se
+            libère. Rien ne part d'ici sans l'un de ces deux clics.
           </div>
         </div>
       </div>`;
@@ -11318,6 +11374,25 @@
         sellUI.rar.value = '';
         saveStore({ sellHideTagged: false, sellHideTags: [] });
         renderSell();
+        return;
+      }
+      /*
+       * Mettre en file. La carte rejoint `state.watch` au prix visé et à la
+       * durée minimale ; la boucle de relance la publiera dès qu'un des dix
+       * emplacements se libère.
+       *
+       * La Revente reste ouverte : on en met plusieurs d'affilée, c'est tout
+       * l'intérêt. Seule la ligne change d'air, sur place.
+       *
+       * `enrolWatch` refuse d'elle-même une carte étiquetée — c'est sa
+       * première barrière, et elle vaut aussi bien ici qu'ailleurs.
+       */
+      const f = e.target.closest('[data-file]');
+      if (f) {
+        enrolWatch(f.dataset.file, f.dataset.titre, Number(f.dataset.prix), FILE_MINUTES, 0);
+        saveStore({ watch: state.watch });
+        renderSell();
+        render();
         return;
       }
       const b = e.target.closest('[data-sell]');
@@ -11600,6 +11675,13 @@
         .map(
           (x) => {
             const dejaEnVente = mesVentes.has(x.id);
+            /*
+             * Déjà dans la file. C'est `state.watch`, la même que celle du
+             * volet Relances — une seule machine, qui sait déjà attendre un
+             * emplacement, retrouver l'exemplaire, écarter une carte
+             * étiquetée. Le bouton n'ouvre qu'une porte de plus vers elle.
+             */
+            const enFile = !!(state.watch && state.watch[x.id]);
             const listable = !dejaEnVente && !x.tags.length;
             const aLister = listable && restants > 0;
             if (aLister) restants -= 1;
@@ -11626,7 +11708,29 @@
               ? `<span class="protege" title="Carte étiquetée : hors de portée de la revente. Retire l’étiquette sur le site pour pouvoir la vendre.">protégée</span>`
               : dejaEnVente
                 ? `<span class="encours" title="Votre enchère court déjà sur cette carte. Elle occupe un de vos emplacements de vente ; son échéance est dans l’onglet Marché, volet Ventes.">en vente</span>`
-                : `<button class="go" data-sell="${esc(x.t)}" data-prix="${x.q3 || x.med}">Vendre</button>`}</td>
+                : enFile
+                  ? `<span class="encours file" title="Dans la file : elle partira dès qu’un de vos dix emplacements se libère, au prix visé. Retirez-la depuis Marché, volet Relances.">en file</span>`
+                  /*
+                   * Deux gestes, et ils ne font pas la même chose.
+                   *
+                   * « Vendre » ouvre le formulaire du site, prix pré-rempli :
+                   * vous voyez et vous validez. Il échoue quand les dix
+                   * emplacements sont pris, et c'est le seul chemin quand les
+                   * relances automatiques sont décochées.
+                   *
+                   * « Mettre en file » inscrit la carte et la laisse partir
+                   * seule dès qu'une place se libère — donc sans vous, au
+                   * moment venu. Il n'apparaît que si les relances sont
+                   * cochées : sans elles, rien ne publierait jamais et le
+                   * bouton promettrait une file qui n'avance pas.
+                   */
+                  : `<button class="go" data-sell="${esc(x.t)}" data-prix="${x.q3 || x.med}">Vendre</button>`
+                    + (prefs.relistUnsold
+                      ? ` <button class="go file" data-file="${esc(x.id)}" data-titre="${esc(x.t)}"`
+                        + ` data-prix="${x.q3 || x.med}"`
+                        + ' title="Elle partira toute seule dès qu’un emplacement se libère, au prix visé,'
+                        + ' pour la durée minimale. Rien ne part tant qu’une place ne s’ouvre pas.">Mettre en file</button>'
+                      : '')}</td>
           </tr>`;
           }
         )
