@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WikiMasters Tools
 // @namespace    https://www.wiki-masters.com/
-// @version      3.4.1
+// @version      3.4.3
 // @description  Boîte à outils WikiMasters : ouverture automatique des paquets, suivi des tirages, cote des cartes et revente.
 // @match        https://www.wiki-masters.com/*
 // @match        https://wiki-masters.com/*
@@ -41,7 +41,7 @@
    *
    * Il est lu par le garde juste en dessous, d'où sa place en tête.
    */
-  const VERSION = '3.4.1';
+  const VERSION = '3.4.3';
 
   /*
    * Une seule instance par page — et savoir laquelle
@@ -4161,6 +4161,10 @@
   let fetchAvantFiltre = null;
   /* Ce que la dernière lecture a écarté : le rapport que la case affiche. */
   let notifFiltre = { masques: 0, total: 0 };
+  /* Et ce que le direct a écarté depuis l'ouverture de la page. */
+  let notifDirect = 0;
+  /* Les dernières trames vues sur le canal — `__wmAuto.notifTrames`, mémoire seule. */
+  const notifTrames = [];
 
   function installNotifProxy() {
     if (notifProxyOn) return;
@@ -4202,6 +4206,228 @@
         return res;  // masquer ne doit jamais coûter le panneau de notifications
       }
     };
+  }
+
+  /*
+   * L'autre porte : le direct. Et ce garde-là N'ATTRAPE RIEN aujourd'hui.
+   *
+   * Il faut le dire net, parce que le code seul laisserait croire l'inverse.
+   * Le site tient un websocket avec Supabase, abonné à
+   * `realtime:notifications:<votre id>`, et une enchère qui se clôt arrive par
+   * là — la cloche s'incrémente sans qu'aucune requête ne parte. La 3.4.2 a
+   * donc filtré les trames. Sans effet : mesuré sur un compte réel, quatre
+   * invendus sont entrés pendant que le relevé ne montrait que
+   * `[object ArrayBuffer] — non textuel`.
+   *
+   * **Ces trames sont binaires.** Chercher une chaîne de caractères dedans ne
+   * peut rien donner, jamais. Seules les confirmations d'abonnement et les
+   * accusés de réception voyagent en texte.
+   *
+   * Ce qui retire réellement ces avis est plus bas : `installNotifDomFiltre`,
+   * qui regarde l'écran et non le transport. Celui-ci reste pour deux raisons,
+   * et aucune n'est l'espoir qu'il serve : il tient si le canal repasse un jour
+   * en texte, et il alimente `__wmAuto.notifTrames`, le relevé qui a fini par
+   * répondre à la question après deux versions à côté.
+   *
+   * On n'altère pas la trame, on la retient : l'écouteur du site n'est pas
+   * appelé pour celle-là. Rien à réécrire, donc rien à désynchroniser — la
+   * connexion, les accusés et les battements de cœur passent intacts.
+   *
+   * Envelopper `WebSocket` doit se faire AVANT que le site ne construise le
+   * sien : sa bibliothèque garde la référence trouvée au chargement. C'est la
+   * leçon déjà payée deux fois — d'où l'installation à `document-start`.
+   */
+  const NOTIF_CANAL = /realtime:notifications:/;
+  let wsProxyOn = false;
+
+  function installNotifWsProxy() {
+    if (wsProxyOn || typeof window.WebSocket !== 'function') return;
+    wsProxyOn = true;
+    const Natif = window.WebSocket;
+
+    /**
+     * La trame porte-t-elle un avis d'invendu ?
+     *
+     * Le canal ne sert plus de condition. Première version : on exigeait
+     * `realtime:notifications:` dans la trame. Résultat mesuré sur un compte
+     * réel — deux avis d'invendu sont apparus dans la cloche pendant que le
+     * relevé ne montrait que la confirmation d'abonnement. Ils passent donc
+     * ailleurs, et exiger le canal revenait à ne rien filtrer.
+     *
+     * Le type entre guillemets suffit à distinguer : `"marketplace_auction_unsold"`
+     * ne peut pas apparaître par accident, et le guillemet fermant écarte les
+     * dérivés comme `marketplace_auction_unsold_count`.
+     */
+    const estInvendu = (data) => {
+      if (typeof data !== 'string') return false;
+      return data.includes(`"${NOTIF_INVENDU}"`);
+    };
+
+    /*
+     * Et le relevé, cette fois SANS condition : toutes les trames, leur type
+     * compris. La version précédente ne notait que celles du canal des
+     * notifications, et c'est exactement ce qui a caché le problème — une
+     * trame binaire, ou postée sur un autre canal, ne laissait aucune trace.
+     * `__wmAuto.notifTrames` les rend telles quelles.
+     */
+    const relever = (data) => {
+      try {
+        const ligne = typeof data === 'string'
+          ? data.slice(0, 300)
+          : `[${Object.prototype.toString.call(data)} — non textuel]`;
+        // Le battement de cœur reviendrait toutes les trente secondes pour rien.
+        if (/"heartbeat"/.test(ligne)) return;
+        notifTrames.push(ligne);
+        if (notifTrames.length > 12) notifTrames.shift();
+      } catch (_) {
+        /* relever ne doit jamais coûter la trame relevée */
+      }
+    };
+
+    function Espion(...args) {
+      const s = new Natif(...args);
+      /*
+       * On enveloppe les écouteurs plutôt que la socket : le site en pose par
+       * `addEventListener` ou par `onmessage` selon la bibliothèque, et une
+       * seule des deux voies laisserait l'autre ouverte.
+       */
+      const garde = (fn) => function (e) {
+        try {
+          if (e) relever(e.data);
+          if (prefs.masquerInvendus && e && estInvendu(e.data)) {
+            notifDirect += 1;
+            if (prefs.tab === 'reglages') render();
+            return undefined;   // le site n'apprend jamais que celle-ci existe
+          }
+        } catch (_) {
+          /* trame illisible : elle passe, comme si nous n'étions pas là */
+        }
+        return fn.apply(this, arguments);
+      };
+
+      const ajoute = s.addEventListener.bind(s);
+      const retire = s.removeEventListener.bind(s);
+      const poses = new Map();
+      s.addEventListener = function (type, fn, opts) {
+        if (type !== 'message' || typeof fn !== 'function') return ajoute(type, fn, opts);
+        const enveloppe = garde(fn);
+        poses.set(fn, enveloppe);
+        return ajoute(type, enveloppe, opts);
+      };
+      s.removeEventListener = function (type, fn, opts) {
+        return retire(type, poses.get(fn) || fn, opts);
+      };
+      /*
+       * `onmessage` est un accesseur du prototype dans tout navigateur. On le
+       * relit plutôt que de le supposer : là où il manquerait, mieux vaut une
+       * voie non filtrée qu'un `TypeError` qui emporte la connexion du site.
+       */
+      const accesseur = Object.getOwnPropertyDescriptor(Natif.prototype, 'onmessage');
+      if (accesseur && typeof accesseur.set === 'function') {
+        Object.defineProperty(s, 'onmessage', {
+          configurable: true,
+          get() { return this._wmOnMessage || null; },
+          set(fn) {
+            this._wmOnMessage = fn;
+            accesseur.set.call(this, typeof fn === 'function' ? garde(fn) : fn);
+          },
+        });
+      }
+      return s;
+    }
+
+    Espion.prototype = Natif.prototype;
+    // `CONNECTING`, `OPEN`, `CLOSING`, `CLOSED` : du code les lit sur le constructeur.
+    for (const k of Object.keys(Natif)) Espion[k] = Natif[k];
+    for (const k of ['CONNECTING', 'OPEN', 'CLOSING', 'CLOSED']) Espion[k] = Natif[k];
+    window.WebSocket = Espion;
+  }
+
+  /*
+   * Le dernier filet, et le seul qui ne dépende d'aucun transport.
+   *
+   * Deux versions ont visé le chemin par lequel ces avis arrivent — la réponse
+   * HTTP, puis le websocket — et deux fois ils sont entrés quand même. Celui-ci
+   * ne vise plus le chemin : il regarde ce qui est à l'écran. Une ligne de
+   * notification est un `<button>` dans la liste de la cloche ; celle qui dit
+   * qu'une enchère s'est terminée sans mise est repliée, pas supprimée.
+   *
+   * `hidden` plutôt qu'un retrait : le site tient sa propre liste et
+   * redessinerait par-dessus une ligne arrachée. Décocher la case les rend
+   * toutes, sans rechargement.
+   *
+   * Ce que ça ne corrige pas, et il faut le dire : la pastille compte ce que
+   * le site croit avoir, pas ce qu'il montre. Elle peut donc annoncer plus de
+   * lignes que la liste n'en présente.
+   */
+  const INVENDU_TEXTE = /sans aucune mise|without any bids|no bids were placed/i;
+  /*
+   * Ce qui compte un avis : sert à ne jamais replier un conteneur pour un seul.
+   *
+   * Le drapeau `g` n'est pas décoratif — sans lui `match` ne rend que la
+   * PREMIÈRE occurrence, le compte valait toujours un, et la liste entière se
+   * repliait. Et l'apostrophe est acceptée droite ou courbe : le site emploie
+   * la courbe, un test écrit à la main emploie souvent l'autre.
+   */
+  const AVIS_TEXTE = /s['’]est termin|a été vendue|vous propose|a misé|was sold|has ended/gi;
+  let domObs = null;
+
+  function masquerLignesInvendues() {
+    let caches = 0;
+    try {
+      for (const el of document.querySelectorAll('button')) {
+        const t = el.textContent || '';
+        if (!INVENDU_TEXTE.test(t)) continue;
+        // Un bouton qui porte plusieurs avis n'est pas une ligne : c'est la liste.
+        if ((t.match(AVIS_TEXTE) || []).length > 1) continue;
+        if (el.hidden) { caches += 1; continue; }
+        el.hidden = true;
+        el.dataset.wmMasque = '1';
+        caches += 1;
+        /*
+         * Le compte que les Réglages affichent. Il vit ici et non dans le
+         * garde du websocket : c'est ce filet-ci qui fait le travail, et un
+         * compteur branché sur la porte inactive serait resté à zéro en
+         * laissant croire que rien n'arrive.
+         */
+        notifDirect += 1;
+      }
+    } catch (_) {
+      /* le DOM du site n'est pas à nous : on ne casse rien s'il change */
+    }
+    return caches;
+  }
+
+  /** Rendre ce qu'on a replié — décocher la case doit suffire. */
+  function rendreLignesInvendues() {
+    try {
+      for (const el of document.querySelectorAll('[data-wm-masque]')) {
+        el.hidden = false;
+        delete el.dataset.wmMasque;
+      }
+    } catch (_) {
+      /* rien à rendre */
+    }
+  }
+
+  function installNotifDomFiltre() {
+    if (domObs || typeof MutationObserver !== 'function') return;
+    /*
+     * La liste se remplit à l'ouverture de la cloche et à chaque avis reçu :
+     * un seul passage ne verrait rien. On repasse à chaque mutation, et le
+     * travail est borné — un `querySelectorAll('button')` sur une page de jeu.
+     */
+    domObs = new MutationObserver(() => {
+      if (prefs.masquerInvendus) masquerLignesInvendues();
+    });
+    quandLeDomEstPret(() => {
+      try {
+        domObs.observe(document.body, { childList: true, subtree: true });
+        if (prefs.masquerInvendus) masquerLignesInvendues();
+      } catch (_) {
+        /* pas de corps de page : rien à observer */
+      }
+    });
   }
 
 
@@ -6950,6 +7176,9 @@
       prefs.masquerInvendus = e.target.checked;
       saveStore({ masquerInvendus: prefs.masquerInvendus });
       notifFiltre = { masques: 0, total: 0 };
+      // Les lignes déjà repliées, elles, sont à l'écran : elles répondent au clic.
+      if (prefs.masquerInvendus) masquerLignesInvendues();
+      else rendreLignesInvendues();
       render();
     });
 
@@ -7316,10 +7545,23 @@
    */
   function noteInvendus() {
     if (!prefs.masquerInvendus) return 'Vous les voyez toutes.';
-    if (!notifFiltre.total) return 'Ouvrez vos notifications pour voir le compte.';
-    if (!notifFiltre.masques) return `Aucune à cacher sur vos ${notifFiltre.total} dernières.`;
-    return `${notifFiltre.masques} cachée${notifFiltre.masques > 1 ? 's' : ''}`
-      + ` sur vos ${notifFiltre.total} dernières notifications.`;
+    /*
+     * Le direct compte à part, et il le mérite : c'est par là qu'elles
+     * revenaient après la 3.4.1, une par enchère terminée, pendant que la
+     * liste chargée au départ était propre.
+     */
+    const s = (n) => (n > 1 ? 's' : '');
+    const direct = notifDirect
+      ? ` ${notifDirect} arrivée${s(notifDirect)} en direct depuis, cachée${s(notifDirect)} aussi.`
+      : '';
+    if (!notifFiltre.total) {
+      return direct
+        ? direct.trim()
+        : 'Ouvrez vos notifications pour voir le compte.';
+    }
+    if (!notifFiltre.masques) return `Aucune à cacher sur vos ${notifFiltre.total} dernières.${direct}`;
+    return `${notifFiltre.masques} cachée${s(notifFiltre.masques)}`
+      + ` sur vos ${notifFiltre.total} dernières notifications.${direct}`;
   }
 
   /**
@@ -12105,6 +12347,8 @@
    */
   restore();
   installNotifProxy();
+  installNotifWsProxy();
+  installNotifDomFiltre();
 
   /*
    * Le montage, lui, attend le DOM : il n'existe pas encore à `document-start`.
@@ -12445,5 +12689,9 @@
     // `__wmAuto.ownedIndex(true)` reconstruit l'index, `__wmAuto.owned.tagged`
     // liste les cartes hors de portée, `__wmAuto.isTagged(id)` tranche.
     ownedIndex, owned, isTagged,
+    // Ce que le canal des notifications a fait passer, pour voir sa vraie forme.
+    notifTrames,
+    // Le filet du DOM, atteignable pour l'éprouver : `__wmAuto.masquerLignesInvendues()`.
+    masquerLignesInvendues, rendreLignesInvendues,
   };
 })();
