@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WikiMasters Tools
 // @namespace    https://www.wiki-masters.com/
-// @version      3.2.0
+// @version      3.3.0
 // @description  Boîte à outils WikiMasters : ouverture automatique des paquets, suivi des tirages, cote des cartes et revente.
 // @match        https://www.wiki-masters.com/*
 // @match        https://wiki-masters.com/*
@@ -41,7 +41,7 @@
    *
    * Il est lu par le garde juste en dessous, d'où sa place en tête.
    */
-  const VERSION = '3.2.0';
+  const VERSION = '3.3.0';
 
   /*
    * Une seule instance par page — et savoir laquelle
@@ -5940,6 +5940,49 @@
      * volet qui en porte déjà cinq — et ne le trahit que par son chevron et le
      * compte, qui dit s'il s'est passé quelque chose sans qu'on l'ouvre.
      */
+    /*
+     * L'édition d'une carte, dépliée sous elle. Même forme que la suggestion
+     * de baisse — pleine largeur, décalée de 13 px sous son titre — parce que
+     * c'est la même chose : un propos qui porte sur la ligne du dessus.
+     */
+    .relist .fedit {
+      flex-basis: 100%; display: flex; flex-wrap: wrap; align-items: center; gap: 5px 8px;
+      margin: 3px 0 4px 13px; font-size: 10px; color: var(--dim);
+    }
+    .relist .fedit label { display: flex; align-items: center; gap: 5px; }
+    /* Dessiné, pas laissé au navigateur : les flèches du compteur natif
+       n'ajoutent qu'un ornement gris, et le champ doit suivre la palette. */
+    .relist .fedit input {
+      width: 62px; -moz-appearance: textfield; appearance: textfield;
+      padding: 3px 6px; border: 1px solid var(--line); border-radius: var(--r-sm);
+      background: var(--raise); color: var(--text);
+      font: 600 11px var(--sans); font-variant-numeric: tabular-nums;
+      transition: border-color .14s;
+    }
+    .relist .fedit input::-webkit-outer-spin-button,
+    .relist .fedit input::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
+    .relist .fedit input:focus { outline: 0; border-color: var(--live); }
+    .relist .fedit .durs { display: flex; flex-wrap: wrap; gap: 3px; }
+    .relist .fedit .durs button {
+      padding: 3px 6px; border: 1px solid var(--line); border-radius: var(--r-sm);
+      background: none; color: var(--dim);
+      font: 500 10px var(--sans); font-variant-numeric: tabular-nums; cursor: pointer;
+      transition: .14s;
+    }
+    .relist .fedit .durs button:hover { color: var(--text); background: var(--raise); }
+    /* La durée en vigueur : celle qui décrit la carte, pas une cible à viser —
+       d'où le vert de l'état et non l'ambre des gestes qui engagent. */
+    .relist .fedit .durs button.on {
+      color: var(--live); border-color: var(--live);
+      background: color-mix(in srgb, var(--live) 12%, transparent);
+    }
+    .relist .fedit .raz {
+      padding: 3px 7px; border: 1px solid rgba(240,169,75,.4); border-radius: 999px;
+      background: none; color: var(--warn); font: 500 10px var(--sans); cursor: pointer;
+    }
+    .relist .fedit .raz:hover { background: color-mix(in srgb, var(--warn) 16%, transparent); }
+    .relist .fedit .none { color: var(--dim); }
+
     .relist .jtoggle {
       display: flex; align-items: center; gap: 6px; width: 100%;
       margin: 9px 0 4px; padding: 8px 0 0;
@@ -6390,6 +6433,32 @@
       state.running ? stop('Arrêté manuellement.') : start()
     );
     ui.fold.addEventListener('click', () => setFolded(!ui.panel.classList.contains('folded')));
+    /*
+     * Le prix, sur « change » et non « input » : on écrit pendant la frappe,
+     * et chaque touche déclencherait un rendu qui remplacerait le champ sous
+     * les doigts. Le changement est pris quand le champ est quitté ou validé.
+     *
+     * Zéro ou négatif n'est pas un prix : on refuse et on rend la valeur
+     * précédente, plutôt que d'inscrire une annonce que le site rejettera.
+     */
+    ui.relist.addEventListener('change', (e) => {
+      const p = e.target.closest('[data-fprix]');
+      if (!p) return;
+      const w = state.watch[p.dataset.fprix];
+      if (!w) return;
+      const prix = Math.round(Number(p.value));
+      if (Number.isFinite(prix) && prix > 0 && prix !== w.price) {
+        logRelist(w.title, 'baisse', prix, `prix changé à la main (était ${w.price} wb)`);
+        w.price = prix;
+        // Le compte d'invendus se rapportait à l'ANCIEN prix : il ne dit plus
+        // rien du nouveau, et le garder armerait une suggestion de baisse sur
+        // un prix qu'on vient de choisir.
+        w.invendus = 0;
+        saveStore({ watch: state.watch, relistLog: state.relistLog });
+      }
+      render();
+    });
+
     ui.relist.addEventListener('click', (e) => {
       const off = e.target.closest('[data-unwatch]');
       if (off) return dropWatch(off.dataset.unwatch, 'retirée'), render();
@@ -6423,6 +6492,38 @@
           w.price = prix;
           w.invendus = 0;   // le compte repart : le nouveau prix n'a pas encore échoué
           saveStore({ watch: state.watch });
+        }
+        return render();
+      }
+      /*
+       * Ouvrir ou refermer l'édition d'une carte. Une seule à la fois : le
+       * clic sur une autre déplace le formulaire au lieu d'en ouvrir un second.
+       */
+      const ed = e.target.closest('[data-edit]');
+      if (ed) {
+        fileEdit = fileEdit === ed.dataset.edit ? null : ed.dataset.edit;
+        return render();
+      }
+      // La durée de CETTE carte. Celle qui court garde la sienne : le
+      // changement vaut pour les annonces suivantes.
+      const fd = e.target.closest('[data-fdur]');
+      if (fd) {
+        const w = state.watch[fd.dataset.fdur];
+        if (w) { w.minutes = Number(fd.dataset.min); saveStore({ watch: state.watch }); }
+        return render();
+      }
+      /*
+       * Remettre le compte d'invendus à zéro. C'est lui qui arme la suggestion
+       * de baisse ; l'effacer dit « ce prix n'a pas encore échoué », et
+       * n'engage rien d'autre — le prix ne bouge pas.
+       */
+      const fz = e.target.closest('[data-fraz]');
+      if (fz) {
+        const w = state.watch[fz.dataset.fraz];
+        if (w) {
+          logRelist(w.title, 'stop', w.price, 'compte d’invendus remis à zéro');
+          w.invendus = 0;
+          saveStore({ watch: state.watch, relistLog: state.relistLog });
         }
         return render();
       }
@@ -8766,8 +8867,11 @@
         ${w.paused
           ? `<button class="x" data-retry="${esc(card)}" title="Reprendre le suivi : remet le compteur d'échecs à zéro">↻</button>`
           : ''}
+        <button class="x" data-edit="${esc(card)}" aria-expanded="${fileEdit === card}"
+          title="Modifier le prix, la durée et le compte d'invendus de cette carte">✎</button>
         <button class="x" data-unwatch="${esc(card)}" title="Ne plus suivre cette carte">✕</button>
         ${suggestion(card, w)}
+        ${fileEdit === card ? editFile(card, w) : ''}
       </li>`;
     });
 
@@ -9167,6 +9271,37 @@
    */
   let repasseArme = 0;
   let repasseTimer = 0;
+
+  /*
+   * La carte dont on modifie les conditions, une seule à la fois.
+   *
+   * Le volet montrait une file qu'on ne pouvait que créer et vider : le prix
+   * ne se changeait qu'en suivant une suggestion de baisse — laquelle
+   * n'apparaît qu'après deux invendus au même prix, et jamais à la hausse — et
+   * la durée qu'en masse, pour toutes les cartes d'un coup.
+   *
+   * L'édition est repliée par défaut : la ligne porte déjà titre, prix,
+   * compteur et deux boutons dans 260 px. Elle s'ouvre sous sa carte, comme la
+   * suggestion de baisse juste au-dessus, et une seule à la fois — deux
+   * formulaires ouverts dans une liste, on ne sait plus lequel on remplit.
+   */
+  let fileEdit = null;
+
+  /** Les conditions d'une carte de la file : prix, durée, invendus. */
+  function editFile(card, w) {
+    const dur = DUREES.map((d) => `<button data-fdur="${esc(card)}" data-min="${d.minutes}"`
+      + `${(w.minutes || 10) === d.minutes ? ' class="on"' : ''}>${d.label}</button>`).join('');
+    return `<span class="fedit">
+      <label>Prix <input type="number" min="1" step="1" value="${w.price}"
+        data-fprix="${esc(card)}" title="Le prix des prochaines annonces de cette carte. Celle qui court, s’il y en a une, garde le sien."></label>
+      <span class="durs">${dur}</span>
+      ${w.invendus
+        ? `<button class="raz" data-fraz="${esc(card)}"
+             title="Le compte d’invendus déclenche la suggestion de baisse. Le remettre à zéro efface cet historique, sans toucher au prix.">${
+             w.invendus} invendu${w.invendus > 1 ? 's' : ''} · remettre à zéro</button>`
+        : '<span class="none">aucun invendu</span>'}
+    </span>`;
+  }
 
   const RELIST_LOG_MAX = 40;
 
@@ -10859,6 +10994,13 @@
    * sous 200 cartes — au-delà, le tri par prix range assez de cartes en fin de
    * liste pour que le silence devienne trompeur.
    */
+  /*
+   * Au-delà, le relevé des ventes ne sert plus à marquer une ligne « en
+   * vente » : il dit ce qui ÉTAIT vrai. Même fenêtre que le volet Relances,
+   * qui s'en sert pour décider s'il agit.
+   */
+  const VENTES_FRAICHES_MS = 120000;
+
   const COUV_PCT = 2;
   const COUV_CARTES = 200;
 
@@ -10872,6 +11014,21 @@
     syncJournal();
     refreshCompetition();
     refreshOwned();
+    /*
+     * Vos ventes, relues à l'ouverture.
+     *
+     * Elles ne l'étaient pas — la page relisait le journal, la concurrence et
+     * la taille de la collection, mais pas ce qui est en vente. Or c'est ce
+     * relevé qui décide du « en vente » d'une ligne et du surlignage « à
+     * lister maintenant ». Ouverte cinq minutes après le dernier tour du
+     * guetteur, la Revente affirmait donc l'état d'il y a cinq minutes : une
+     * carte vendue entre-temps y était encore « en vente », une carte qu'on
+     * venait de lister proposait toujours « Vendre ».
+     *
+     * `scanSales` porte son propre verrou de ré-entrée : l'appeler ici ne
+     * double aucun tour en vol.
+     */
+    scanSales();
     /*
      * Un compte gratuit s'est déjà vu refuser le marché : relancer le relevé à
      * chaque ouverture, c'est vingt-cinq requêtes refusées de plus pour le même
@@ -11541,10 +11698,24 @@
      * C'est la même prudence que le filtre « sans concurrence » applique déjà
      * en attendant son propre relevé.
      */
+    /*
+     * Et on ne s'en sert que si le relevé est FRAIS.
+     *
+     * Il ne testait que « a-t-on déjà lu une fois » : un relevé vieux de dix
+     * minutes servait donc à marquer des lignes « en vente » avec l'aplomb
+     * d'un relevé de la seconde. Se taire coûte un bouton « Vendre » proposé
+     * sur une carte déjà en vente — le site refusera, et on le saura tout de
+     * suite. Affirmer à tort coûte une carte qu'on croit vendue et qui ne
+     * l'est pas, ou l'inverse, et ça ne se voit jamais.
+     *
+     * Deux minutes, la même fenêtre que le volet Relances emploie pour décider
+     * s'il agit — c'est la durée au-delà de laquelle ce relevé cesse de valoir
+     * pour prendre une décision.
+     */
+    const ventesFraiches = state.sales.at && Date.now() - state.sales.at < VENTES_FRAICHES_MS;
     const mesVentes = new Set(
-      state.sales.at ? (state.sales.list || []).map((v) => v.card).filter(Boolean) : []
+      ventesFraiches ? (state.sales.list || []).map((v) => v.card).filter(Boolean) : []
     );
-    const age = sell.at ? fmtSpan(Date.now() - sell.at) : null;
     /*
      * La couverture se dit ICI, à côté de l'âge de la cote, parce que c'est la
      * question suivante : « de quand » ne vaut rien sans « sur quoi ».
@@ -11591,6 +11762,17 @@
        * qui est précisément celui où elle est la plus longue.
        */
       rows.length ? sell.note : '',
+      /*
+       * Le relevé des ventes est en retard. On le DIT, parce que sans lui la
+       * colonne d'action ne sait plus distinguer une carte déjà en vente d'une
+       * carte libre — et qu'un tableau qui a cessé de savoir ne doit pas avoir
+       * l'air de savoir encore. Il se relit tout seul à l'ouverture ; cette
+       * phrase ne dure donc que le temps de l'aller-retour, ou signale que le
+       * serveur ne répond pas.
+       */
+      !ventesFraiches
+        && 'Vos ventes en cours ne sont pas encore relues : les cartes déjà '
+           + 'en vente ne sont pas signalées comme telles.',
     ].filter(Boolean);
 
     /*
@@ -11624,12 +11806,25 @@
     const fig = (v, l, due) =>
       `<div class="f${due ? ' due' : ''}"><b>${esc(v)}</b><span>${esc(l)}</span></div>`;
     paint(sellUI.sum,
+      /*
+       * `fmtAge` et non `fmtSpan` pour les trois âges.
+       *
+       * `fmtSpan` mesure une durée : sous la minute, il écrit « 0 min ». C'est
+       * juste pour un décompte, absurde pour un relevé qui vient d'arriver —
+       * et ça se voyait dès qu'on ouvrait la page, puisqu'elle relit désormais
+       * vos ventes en s'ouvrant. `fmtAge` dit « à jour », et c'est déjà lui
+       * qui date les relevés du Marché : les deux surfaces parlent pareil.
+       */
       fig(rows.length.toLocaleString('fr-FR'), 'cartes')
       + fig(`~${valeur.toLocaleString('fr-FR')}`, 'wb estimés')
-      + (age ? fig(age, c ? `cote · ${c.pct} % de vos cartes` : 'cote', !!c) : '')
-      + (sell.compAt
-        ? fig(fmtSpan(Date.now() - sell.compAt), 'concurrence', sell.compTronque)
-        : fig('—', 'concurrence', true)));
+      + (sell.at ? fig(fmtAge(sell.at), c ? `cote · ${c.pct} % de vos cartes` : 'cote', !!c) : '')
+      + fig(fmtAge(sell.compAt), 'concurrence', !sell.compAt || sell.compTronque)
+      /*
+       * L'âge de VOS ventes, à côté de celui de la cote et de la concurrence.
+       * Il manquait, et c'est pourtant le seul des trois qui décide de ce
+       * qu'une ligne propose : « Vendre », « en vente », ou rien.
+       */
+      + fig(fmtAge(state.sales.at), 'vos ventes', !ventesFraiches));
     sellUI.caveat.hidden = !alertes.length;
     paint(sellUI.caveat, alertes.map((a) => `<span>${esc(a)}</span>`).join(''));
 
