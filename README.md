@@ -55,7 +55,8 @@ Rien envoyé nulle part.
 - **Tout souhaiter** : une recherche entière en liste de souhaits. Des centaines
   de cartes en un clic.
 - Une page de revente qui dit à quel prix vendre, et sur quelles cartes vous
-  seriez le seul vendeur.
+  seriez le seul vendeur. Une carte s'y met en file : elle part toute seule
+  quand un de vos dix emplacements se libère.
 
 ---
 
