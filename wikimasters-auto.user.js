@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WikiMasters Tools
 // @namespace    https://www.wiki-masters.com/
-// @version      2.17.0
+// @version      3.0.0
 // @description  Boîte à outils WikiMasters : ouverture automatique des paquets, suivi des tirages, cote des cartes et revente.
 // @match        https://www.wiki-masters.com/*
 // @match        https://wiki-masters.com/*
@@ -41,7 +41,7 @@
    *
    * Il est lu par le garde juste en dessous, d'où sa place en tête.
    */
-  const VERSION = '2.17.0';
+  const VERSION = '3.0.0';
 
   /*
    * Une seule instance par page — et savoir laquelle
@@ -5165,13 +5165,41 @@
       --warn: #F0A94B;
       --sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI Variable", "Segoe UI", sans-serif;
 
+      /*
+       * Trois rayons, et pas huit.
+       *
+       * Le panneau en portait 4, 5, 6, 7, 8, 9, 10 et 16 px, au gré des blocs
+       * écrits les uns après les autres. Aucun n'était faux ; c'est leur
+       * nombre qui l'était — deux boutons voisins de rôle identique n'avaient
+       * pas le même coin, et rien ne rimait.
+       *
+       * L'échelle suit l'imbrication, pas la taille : ce qui vit DANS quelque
+       * chose prend le petit, les objets autonomes le moyen, les cadres qui
+       * en contiennent d'autres le grand. Le panneau lui-même garde 16 px, et
+       * les pastilles leur 999.
+       *
+       * L'écart entre --r-md et --r-sm vaut trois pixels, soit le rembourrage
+       * du contrôle segmenté à un pixel près : un bouton posé dans son rail
+       * suit donc sa courbe au lieu de la couper.
+       */
+      --r-sm: 7px;
+      --r-md: 10px;
+      --r-lg: 14px;
+
       background: var(--bg);
       backdrop-filter: blur(18px) saturate(1.3);
       border: 1px solid var(--line);
       border-radius: 16px;
       color: var(--text);
       font: 13px/1.5 var(--sans);
-      box-shadow: 0 24px 64px rgba(0,0,0,.6), 0 2px 8px rgba(0,0,0,.4);
+      /*
+       * Le filet clair de la tranche haute, comme sur la boîte de la Revente :
+       * c'est ce qui donne au panneau son épaisseur sans éclaircir son fond —
+       * lequel est tenu par le plancher de contraste de « --dim ». Les deux
+       * surfaces de l'outil se détachent donc de la même façon.
+       */
+      box-shadow: 0 24px 64px rgba(0,0,0,.6), 0 2px 8px rgba(0,0,0,.4),
+                  inset 0 1px 0 rgba(255,255,255,.06);
       overflow: hidden;
       /* Le panneau ne dépasse jamais de l'écran : au-delà, le corps défile. */
       max-height: calc(100vh - 24px);
@@ -5242,7 +5270,7 @@
     .panel.folded .mini, .panel:not(.tab-paquets) .mini { display: inline; }
 
     .icon {
-      width: 26px; height: 26px; flex: none; border: 0; border-radius: 8px;
+      width: 26px; height: 26px; flex: none; border: 0; border-radius: var(--r-md);
       background: var(--raise); color: var(--muted); cursor: pointer;
       font-size: 12px; line-height: 1; transition: .16s;
     }
@@ -5305,7 +5333,7 @@
      * l'un des deux défauts ne fait que remplacer l'autre.
      */
     .reset {
-      margin-left: auto; padding: 3px 9px; border: 1px solid var(--line); border-radius: 7px;
+      margin-left: auto; padding: 3px 9px; border: 1px solid var(--line); border-radius: var(--r-sm);
       background: none; color: var(--muted); cursor: pointer; font: 11px var(--sans);
       transition: .14s;
     }
@@ -5375,6 +5403,17 @@
     }
     .log::-webkit-scrollbar-track, .body::-webkit-scrollbar-track { background: transparent; }
     .row { display: flex; gap: 9px; align-items: center; padding: 4px 0; }
+    /*
+     * La rareté reste une LETTRE ici, alors qu'elle est une pastille teintée
+     * dans la Revente et juste au-dessus, dans les filtres. Ce n'est pas un
+     * oubli : essayé, regardé, retiré.
+     *
+     * Les pastilles du dessus se cliquent — ce sont les filtres de rareté.
+     * Celles-ci ne se cliqueraient pas. Leur donner la même forme efface la
+     * seule chose qui distingue à l'œil ce qui agit de ce qui informe, et une
+     * colonne de quinze pastilles alourdit un journal qui doit se parcourir.
+     * La teinte suffit : c'est la même, elle relie déjà les deux.
+     */
     .row .r { width: 22px; flex: none; color: var(--c); font-size: 10px; font-weight: 700; }
     .row .n {
       flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
@@ -5391,7 +5430,7 @@
     }
     .row:hover .px { color: var(--muted); }
     .row .go {
-      flex: none; width: 18px; height: 18px; border-radius: 6px; display: grid; place-items: center;
+      flex: none; width: 18px; height: 18px; border-radius: var(--r-sm); display: grid; place-items: center;
       color: var(--dim); font-size: 10px; font-weight: 600; text-decoration: none;
       cursor: pointer; opacity: 0; transition: .14s;
     }
@@ -5416,10 +5455,10 @@
        Enchères, ventes, relances et journal empilés faisaient un panneau haut
        comme l'écran, avec un ascenseur par liste. Trois volets : on n'en montre
        qu'un, et le corps du panneau redevient le seul à défiler. */
-    .subs { display: flex; gap: 3px; padding: 2px; border-radius: 9px; background: rgba(255,255,255,.03); }
+    .subs { display: flex; gap: 3px; padding: 2px; border-radius: var(--r-md); background: rgba(255,255,255,.03); }
     .subs button {
       flex: 1; min-width: 0; display: flex; align-items: center; justify-content: center; gap: 4px;
-      padding: 5px 4px; border: 0; border-radius: 7px; background: transparent; color: var(--dim);
+      padding: 5px 4px; border: 0; border-radius: var(--r-sm); background: transparent; color: var(--dim);
       font: 600 10.5px/1 var(--sans); letter-spacing: -.005em; cursor: pointer;
       white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
       transition: background .15s, color .15s;
@@ -5432,6 +5471,9 @@
       font-style: normal;
     }
     .subs .cnt.hot { background: color-mix(in srgb, var(--warn) 22%, transparent); color: var(--warn); }
+    /* Un relevé qui ne se rafraîchit plus : présent, mais il ne s'annonce pas
+       comme courant. Voir le compteur « pale » dans renderSubs. */
+    .subs .cnt.pale { opacity: .45; }
     .subs button.on .cnt { color: var(--text); }
 
     .mkt { display: flex; flex-direction: column; }
@@ -5468,7 +5510,7 @@
     }
     .mkt ul { list-style: none; margin: 0; padding: 0; }
     .mkt li { display: flex; align-items: baseline; gap: 7px; padding: 4px; border-top: 1px solid var(--line);
-              border-radius: 5px; cursor: pointer; }
+              border-radius: var(--r-sm); cursor: pointer; }
     .mkt li:hover { background: var(--raise); }
     .mkt li:first-child { border-top: 0; }
     .mkt .dot { width: 5px; height: 5px; flex: none; border-radius: 50%; background: var(--live); }
@@ -5497,7 +5539,7 @@
     .mkt .gauge i.full { background: var(--warn); }
 
     .mkoff {
-      padding: 9px 10px; border: 1px dashed var(--line); border-radius: 10px;
+      padding: 9px 10px; border: 1px dashed var(--line); border-radius: var(--r-lg);
       color: var(--dim); font-size: 11px; line-height: 1.5;
     }
     .mkoff b { color: var(--muted); font-weight: 600; }
@@ -5519,7 +5561,7 @@
      */
     .gdon { display: grid; gap: 2px; padding: 8px 10px; margin-bottom: 6px;
             border: 1px solid color-mix(in srgb, var(--live) 35%, transparent);
-            border-radius: 10px; background: color-mix(in srgb, var(--live) 7%, transparent); }
+            border-radius: var(--r-lg); background: color-mix(in srgb, var(--live) 7%, transparent); }
     .gdon .t { display: flex; align-items: baseline; gap: 6px; font-size: 12px; color: var(--text); }
     .gdon .t i { flex: none; font-style: normal; font-size: 10px; font-weight: 700; color: var(--c); }
     .gdon .t b { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis;
@@ -5527,13 +5569,13 @@
     .gdon .m { font-size: 10px; color: var(--muted); font-variant-numeric: tabular-nums; }
     .gdon .m b { color: var(--live); font-weight: 600; }
 
-    .gskip { padding: 7px 10px; border: 1px dashed var(--line); border-radius: 10px;
+    .gskip { padding: 7px 10px; border: 1px dashed var(--line); border-radius: var(--r-lg);
              font-size: 10px; line-height: 1.5; color: var(--dim); }
     .gskip b { color: var(--muted); font-weight: 600; }
 
     /* Le dernier événement signalé. Il vaut ce que vaut une notification qu'on
        aurait ratée : présent, discret, et il s'efface de lui-même. */
-    .gnote { margin-bottom: 7px; padding: 6px 9px; border-radius: 8px;
+    .gnote { margin-bottom: 7px; padding: 6px 9px; border-radius: var(--r-md);
              background: color-mix(in srgb, var(--live) 9%, transparent);
              color: var(--live); font-size: 10px; line-height: 1.45; }
 
@@ -5548,12 +5590,12 @@
      * cadres différents dans un même onglet se seraient disputés l'attention.
      */
     .troc { padding: 9px 10px; margin-bottom: 8px; border: 1px solid var(--line);
-            border-radius: 10px; font-size: 10px; line-height: 1.55; color: var(--dim); }
+            border-radius: var(--r-lg); font-size: 10px; line-height: 1.55; color: var(--dim); }
     .troc .h { font-size: 11px; color: var(--text); font-weight: 600; margin-bottom: 5px; }
     .troc b { color: var(--muted); font-weight: 600; font-variant-numeric: tabular-nums; }
     .troc .l {
       display: flex; align-items: baseline; gap: 6px; width: calc(100% + 12px);
-      margin: 0 -6px; padding: 4px 6px; border: 0; border-radius: 7px;
+      margin: 0 -6px; padding: 4px 6px; border: 0; border-radius: var(--r-sm);
       background: none; color: var(--dim); font: inherit; text-align: left; cursor: pointer;
       transition: background .14s;
     }
@@ -5567,7 +5609,7 @@
     .troc .plus { margin-top: 6px; color: var(--muted); }
 
     .gwish { padding: 9px 10px; margin-bottom: 8px; border: 1px solid var(--line);
-             border-radius: 10px; font-size: 10px; line-height: 1.55; color: var(--dim); }
+             border-radius: var(--r-lg); font-size: 10px; line-height: 1.55; color: var(--dim); }
     .gwish .h { display: flex; align-items: baseline; gap: 6px;
                 font-size: 11px; color: var(--text); font-weight: 600; margin-bottom: 3px; }
     /*
@@ -5576,16 +5618,31 @@
      * que celle du Marché — on la trouve quand on la cherche, elle ne dispute
      * rien aux deux boutons de copie.
      */
+    /*
+     * 20 px, pas 11.
+     *
+     * Mesurée dans le panneau, cette poignée faisait 11 × 11 : la plus petite
+     * cible de tout l'outil, plus petite que le ✕ des relances qu'on a déjà
+     * élargi à 20 px pour cette raison, et plus petite que la poignée de
+     * redimensionnement. Un glyphe de 11 px n'est pas une cible — c'est un
+     * dessin qu'on vise.
+     *
+     * La surface grandit, le glyphe non : « width/height » portent le clic,
+     * « place-items » recentre le ↻ dedans. Et « align-self » parce que la
+     * ligne de titre aligne ses enfants sur la ligne de base — une boîte de
+     * 20 px y pendrait sous le texte.
+     */
     .gwish .h .rf {
-      margin: 0 0 0 auto; padding: 0; width: auto; border: 0; background: none;
+      margin: 0 0 0 auto; padding: 0; width: 20px; height: 20px; align-self: center;
+      display: grid; place-items: center; border: 0; border-radius: var(--r-sm); background: none;
       color: var(--dim); font-size: 11px; line-height: 1; cursor: pointer; transition: .14s;
     }
-    .gwish .h .rf:hover { color: var(--live); background: none; }
+    .gwish .h .rf:hover { color: var(--live); background: var(--raise); }
     .gwish b { color: var(--muted); font-weight: 600; font-variant-numeric: tabular-nums; }
     .gwish em { font-style: normal; color: var(--live); font-weight: 600; }
     .gwish button {
       margin-top: 7px; width: 100%; padding: 6px 8px; border: 1px solid var(--line);
-      border-radius: 8px; background: color-mix(in srgb, var(--live) 10%, transparent);
+      border-radius: var(--r-md); background: color-mix(in srgb, var(--live) 10%, transparent);
       color: var(--live); font: inherit; font-size: 11px; font-weight: 600;
       cursor: pointer; transition: .14s;
     }
@@ -5622,11 +5679,22 @@
     .mkfoot:empty { display: none; }
     .mkfoot span { white-space: nowrap; }
     .mkfoot .g { color: var(--live); font-variant-numeric: tabular-nums; }
+    /*
+     * Même correction de cible que la poignée de la Guilde : sans rembourrage,
+     * « rafraîchir » n'offrait au clic que la hauteur de ses lettres.
+     *
+     * Pas de marge négative pour compenser ce rembourrage : elle tirait le
+     * bouton six pixels au-delà du pied, qui se mettait alors à déborder —
+     * 266 px de contenu pour 260 de large, à toutes les largeurs du panneau.
+     * Le texte s'arrête donc six pixels avant le bord, ce qui ne se remarque
+     * pas, plutôt que de créer une barre de défilement qui, elle, se remarque.
+     */
     .mkfoot .rf {
-      margin-left: auto; flex: none; padding: 0; border: 0; background: none;
-      color: var(--dim); font: 11px var(--sans); cursor: pointer;
+      margin-left: auto; flex: none; padding: 3px 6px;
+      border: 0; border-radius: var(--r-sm); background: none;
+      color: var(--dim); font: 11px var(--sans); cursor: pointer; transition: .14s;
     }
-    .mkfoot .rf:hover { color: var(--text); }
+    .mkfoot .rf:hover { color: var(--text); background: var(--raise); }
     .mkfoot .rf[disabled] { cursor: default; opacity: .6; }
     .mkfoot .note { flex-basis: 100%; margin: 0; }
     /* Les deux options qui pilotent cet onglet vivaient dans « Réglages » : on
@@ -5643,7 +5711,32 @@
     @container (max-width: 310px) {
       .mkt .tag { display: none; }
       .relist .suivi .w { display: none; }
-      .subs button { font-size: 10px; gap: 3px; }
+      /*
+       * Mesuré à 260 px : les quatre boutons tombent à 52 px, et la pastille
+       * de comptage dépassait de 2 px sur trois d'entre eux. Le bouton porte
+       * « overflow: hidden » — elle n'écartait donc rien, elle se faisait
+       * raboter, et une pastille arrondie rabotée a un côté droit plat.
+       *
+       * Quatre pixels regagnés par bouton sur le rembourrage, deux sur celui
+       * de la pastille : de quoi la laisser entière.
+       */
+      .subs button { font-size: 10px; gap: 2px; padding: 5px 2px; }
+      .subs .cnt { padding: 1px 3px; }
+      /*
+       * Les cinq onglets, eux aussi, débordaient de deux pixels à 260 px —
+       * et « Réglages », le plus long, est celui que le panneau rabotait.
+       * « flex: 1 » ne les égalise pas : aucun ne descend sous la largeur de
+       * son texte, et le rembourrage est la seule chose qui reste à rendre.
+       */
+      /*
+       * « .panel .tabs » et non « .tabs » : la règle de base des onglets est
+       * écrite PLUS BAS dans cette feuille, et une requête de conteneur
+       * n'ajoute aucune spécificité — à égalité, c'est la dernière qui gagne,
+       * donc la règle large l'emportait et ce bloc ne servait à rien. Le
+       * sélecteur du conteneur devant, la spécificité passe devant elle.
+       */
+      .panel .tabs { padding: 10px 8px 0; gap: 2px; }
+      .panel .tabs button { padding: 7px 2px 9px; }
       /* L'en-tête porte déjà le titre, le décompte, replier et Start : à la
          borne basse, la version le ferait passer à la ligne. Elle reste en
          toutes lettres au pied des Réglages. */
@@ -5693,14 +5786,27 @@
      * propose, elle n'agit pas — d'où un bouton bien visible plutôt qu'un
      * message qu'on prendrait pour un compte rendu de ce qui a déjà eu lieu.
      */
-    .relist .baisse { flex-basis: 100%; display: flex; align-items: center; gap: 7px;
+    /*
+     * « span.baisse », et non « .baisse ».
+     *
+     * La classe sert à deux choses sans rapport : ce span, qui propose un prix
+     * plus bas sous une carte suivie, et le li d'une baisse au journal. Écrite
+     * sans le nom d'élément, la règle attrapait aussi le li — qui héritait de
+     * sa marge gauche de 13 px et se retrouvait décalé d'un cran par rapport
+     * aux lignes voisines, vu à l'écran. Les autres règles du journal visent
+     * déjà « li.baisse » explicitement.
+     *
+     * (Pas d'accent grave dans ce commentaire : il vit dans un littéral de
+     * gabarit, et le premier fermerait la chaîne.)
+     */
+    .relist span.baisse { flex-basis: 100%; display: flex; align-items: center; gap: 7px;
                       margin: 1px 0 2px 13px; font-size: 10px; color: var(--dim); }
-    .relist .baisse button {
+    .relist span.baisse button {
       padding: 2px 8px; border: 1px solid rgba(240,169,75,.4); border-radius: 999px;
       background: none; color: var(--warn); cursor: pointer;
       font: 600 10px var(--sans); font-variant-numeric: tabular-nums;
     }
-    .relist .baisse button:hover { background: rgba(240,169,75,.16); }
+    .relist span.baisse button:hover { background: rgba(240,169,75,.16); }
     .relist .empty { font-size: 11px; color: var(--dim); line-height: 1.45; }
     .relist li.wait .dot { background: var(--dim); }
     .relist li.pause .dot { background: var(--warn); opacity: .5; }
@@ -5713,7 +5819,7 @@
     .relist .x {
       flex: none; width: 20px; height: 20px; padding: 0; line-height: 1;
       font: 10px/1 var(--sans); color: var(--dim); background: transparent;
-      border: 0; border-radius: 4px; cursor: pointer;
+      border: 0; border-radius: var(--r-sm); cursor: pointer;
     }
     .relist .x:hover { color: var(--text); background: var(--raise); }
     .relist .rh.sub { margin: 9px 0 4px; padding-top: 8px; border-top: 1px solid var(--line); }
@@ -5721,7 +5827,7 @@
     .relist .ra { display: flex; gap: 6px; margin-bottom: 7px; }
     .relist .ra button {
       flex: 1; padding: 5px 6px; font: 500 10.5px/1.3 var(--sans); color: var(--muted);
-      background: var(--raise); border: 1px solid var(--line); border-radius: 7px; cursor: pointer;
+      background: var(--raise); border: 1px solid var(--line); border-radius: var(--r-sm); cursor: pointer;
     }
     .relist .ra button:hover { color: var(--text); background: rgba(255,255,255,.09); }
 
@@ -5745,7 +5851,7 @@
     .achv .none { margin-top: 5px; color: var(--muted); font-size: 10px; line-height: 1.45; }
     .achv .none b { color: var(--live); }
     .achv .claim {
-      display: block; margin-top: 6px; padding: 5px 8px; border-radius: 6px;
+      display: block; margin-top: 6px; padding: 5px 8px; border-radius: var(--r-md);
       border: 1px solid var(--live); background: color-mix(in srgb, var(--live) 12%, transparent);
       color: var(--live); font-size: 11px; font-weight: 600; text-decoration: none; cursor: pointer;
     }
@@ -5757,13 +5863,26 @@
        consulte pour des raisons différentes. */
     .tabs { flex: none; display: flex; gap: 3px; padding: 10px 14px 0; }
     .tabs button {
-      flex: 1; position: relative; padding: 7px 4px;
+      flex: 1; position: relative; padding: 7px 4px 9px;
       font: 600 11.5px/1 var(--sans); letter-spacing: -.005em;
-      color: var(--muted); background: transparent; border: 0; border-radius: 8px;
+      color: var(--muted); background: transparent; border: 0; border-radius: var(--r-md);
       cursor: pointer; transition: background .15s, color .15s;
     }
-    .tabs button:hover { color: var(--text); background: var(--raise); }
-    .tabs button.on { color: var(--text); background: var(--raise); }
+    /*
+     * Le survol et l'onglet ouvert portaient EXACTEMENT le même fond
+     * (« var(--raise) ») : la souris posée sur un onglet voisin en affichait
+     * deux identiques, et lequel des deux était ouvert ne se lisait plus.
+     *
+     * Deux registres distincts, donc : le survol reste un fond, plus faible
+     * qu'avant ; l'ouvert se signale par un trait d'accent sous l'intitulé.
+     * Une couleur et une forme, là où il n'y avait qu'une intensité.
+     */
+    .tabs button:hover { color: var(--text); background: rgba(255,255,255,.04); }
+    .tabs button.on { color: var(--text); background: transparent; }
+    .tabs button.on::after {
+      content: ''; position: absolute; left: 50%; bottom: 2px; transform: translateX(-50%);
+      width: 16px; height: 2px; border-radius: 2px; background: var(--live);
+    }
     .tabs .badge {
       position: absolute; top: 5px; right: 7px; width: 5px; height: 5px;
       border-radius: 50%; background: var(--warn);
@@ -5783,8 +5902,15 @@
      * qui les justifie ; elle n'était nulle part à l'écran. Deux intertitres
      * suffisent, sans rien déplacer d'autre.
      */
-    .sect { color: var(--dim); font-size: 10px; font-weight: 600;
-            letter-spacing: .04em; text-transform: uppercase; }
+    /*
+     * Les intertitres étaient en capitales espacées. Le texte est déjà écrit
+     * en minuscules dans le balisage — « Ce qu'il fait à votre place » — et la
+     * capitalisation lui venait du CSS seul : la retirer rend la phrase telle
+     * qu'elle a été écrite, avec ses accents, et lui laisse sa ponctuation
+     * naturelle. Un cran de graisse et de taille reprend le rang qu'elle
+     * perd, sans la faire crier.
+     */
+    .sect { color: var(--muted); font-size: 11px; font-weight: 600; letter-spacing: -.005em; }
     /* Le titre appartient au groupe qu'il ouvre : il s'en rapproche, et le
        second s'écarte du groupe précédent — sinon les six cases restent une
        liste unique avec deux lignes de texte dedans. */
@@ -5795,7 +5921,7 @@
     .tune + .tune { margin-top: -7px; }
     .diag {
       margin-top: 4px; padding: 5px 10px; border: 1px solid var(--line);
-      border-radius: 7px; background: none; color: var(--muted);
+      border-radius: var(--r-md); background: none; color: var(--muted);
       font: 11px var(--sans); cursor: pointer; transition: .14s;
     }
     .diag:hover { color: var(--text); border-color: var(--dim); background: var(--raise); }
@@ -5816,18 +5942,53 @@
 
     .opt { display: flex; gap: 9px; align-items: center; padding: 5px 0; cursor: pointer; color: var(--muted); font-size: 12px; }
     .opt:hover { color: var(--text); }
-    .opt input { accent-color: var(--live); margin: 0; width: 14px; height: 14px; }
+    /*
+     * L'interrupteur, dessiné ici plutôt que laissé au navigateur.
+     *
+     * « accent-color » ne teinte qu'une case du système : elle gardait sa
+     * forme carrée, sa coche et son épaisseur de bordure, celles de Windows.
+     * Six l'une sous l'autre dans les Réglages, c'était ce qui datait le
+     * panneau le plus sûrement — le reste est dessiné, elles ne l'étaient pas.
+     *
+     * Elle passe à DROITE (« order: 2 » et la marge automatique) : dans une
+     * colonne d'options, l'œil descend la liste des intitulés, et les états
+     * s'alignent alors en une seule colonne qu'on lit d'un coup. À gauche,
+     * chaque état était à une distance différente du bord, derrière un texte
+     * de longueur variable.
+     *
+     * Dans le Marché (« .mopt »), les options sont en ligne et non en colonne :
+     * la marge automatique n'y trouve pas d'espace libre et ne fait rien.
+     * L'interrupteur y suit simplement son intitulé — même ordre, donc même
+     * lecture, sans règle particulière.
+     */
+    .opt input {
+      order: 2; flex: none; margin: 0 0 0 auto;
+      appearance: none; -webkit-appearance: none;
+      width: 30px; height: 18px; border-radius: 999px;
+      background: rgba(255,255,255,.09);
+      box-shadow: inset 0 0 0 1px var(--line);
+      cursor: pointer; transition: background .18s, box-shadow .18s;
+    }
+    .opt input::after {
+      content: ''; display: block; width: 14px; height: 14px; margin: 2px;
+      border-radius: 50%; background: var(--muted);
+      transition: transform .18s cubic-bezier(.3,.8,.4,1), background .18s;
+    }
+    .opt:hover input { background: rgba(255,255,255,.14); }
+    .opt input:checked { background: var(--live); box-shadow: none; }
+    /* 12 px = 30 (piste) − 14 (bouton) − 2 × 2 (marge) : il s'arrête au bord. */
+    .opt input:checked::after { transform: translateX(12px); background: #06130C; }
     .tune { margin-top: 9px; color: var(--dim); font-size: 11px; }
     .revente {
       width: 100%; padding: 8px 0; border: 1px solid var(--live);
-      border-radius: 9px; background: color-mix(in srgb, var(--live) 12%, transparent);
+      border-radius: var(--r-md); background: color-mix(in srgb, var(--live) 12%, transparent);
       color: var(--live); cursor: pointer; font: 600 11px var(--sans); transition: .16s;
     }
     .revente:hover { background: color-mix(in srgb, var(--live) 22%, transparent); }
     .revente[hidden] { display: none; }
     .acts { display: flex; gap: 7px; margin-top: 7px; }
     .acts button {
-      flex: 1; padding: 8px 0; border: 0; border-radius: 9px; background: var(--raise);
+      flex: 1; padding: 8px 0; border: 0; border-radius: var(--r-md); background: var(--raise);
       color: var(--muted); cursor: pointer; font: 500 11px var(--sans); transition: .16s;
     }
     .acts button:hover { background: rgba(255,255,255,.09); color: var(--text); }
@@ -5837,12 +5998,19 @@
     .grip {
       /* 18 px plutôt que 14 : la poignée se vise au doigt depuis qu'elle
          répond au tactile, et 14 px ne s'attrapent pas. */
-      position: absolute; right: 2px; bottom: 2px; width: 18px; height: 18px;
+      position: absolute; right: 3px; bottom: 3px; width: 18px; height: 18px;
       cursor: nwse-resize; z-index: 5; touch-action: none;
+      /*
+       * Deux traits, pas deux dégradés. Les bandes obliques tirées de
+       * « linear-gradient » sortaient crénelées — un dégradé n'est pas
+       * anticrénelé sur ses bornes — et l'ensemble avait le grain d'une
+       * poignée de fenêtre des années 2000. Deux filets arrondis, tracés en
+       * SVG, tiennent le même rôle proprement et à n'importe quelle échelle.
+       */
       background:
-        linear-gradient(135deg, transparent 45%, var(--dim) 45%, var(--dim) 55%, transparent 55%),
-        linear-gradient(135deg, transparent 70%, var(--dim) 70%, var(--dim) 80%, transparent 80%);
-      opacity: .5;
+        url("data:image/svg+xml;charset=utf8,%3Csvg xmlns='http://www.w3.org/2000/svg' width='18' height='18'%3E%3Cg stroke='%23717C8D' stroke-width='1.5' stroke-linecap='round'%3E%3Cpath d='M6.5 15.5L15.5 6.5'/%3E%3Cpath d='M11.5 15.5L15.5 11.5'/%3E%3C/g%3E%3C/svg%3E")
+        no-repeat center;
+      opacity: .55; transition: opacity .14s;
     }
     .grip:hover { opacity: 1; }
     .panel.folded .grip { display: none; }
@@ -5898,7 +6066,7 @@
           <div class="bar idle" data-bar><i></i></div>
           <div class="ribbon" data-ribbon title="Derniers tirages, teintés par rareté"></div>
 
-          <div class="rule figs">
+          <div class="figs">
             <span class="fig"><b data-packs>0</b><span data-packs-unit>paquets</span></span>
             <span class="fig"><b data-cards>0</b><span data-cards-unit>cartes</span></span>
             <button class="reset" data-reset title="Remet les compteurs à zéro et vide le journal des tirages. Deux clics : le premier demande confirmation.">Réinitialiser</button>
@@ -6924,7 +7092,20 @@
       : '';
 
     paint(ui.gdons, note + (file.size
-      ? `<div class="rh sub">Hors lot, à donner aussi</div>` +
+      /*
+       * « sect suite », et non « rh sub ».
+       *
+       * Ce titre empruntait les classes de l'en-tête des relances, qui ne
+       * vivent que sous « .relist » — le même balisage, dans le volet
+       * Relances, est bien à l'intérieur et fonctionne. Ici il est dans
+       * l'onglet Guilde : aucune des deux règles ne l'atteignait, et il
+       * s'affichait à la taille par défaut du navigateur, 13 px sans graisse,
+       * au milieu d'un panneau dont tous les intertitres font 11 px en 600.
+       *
+       * « .sect.suite » est l'intertitre séparé du panneau, celui des
+       * Réglages. C'est exactement ce rôle-ci.
+       */
+      ? `<div class="sect suite">Hors lot, à donner aussi</div>` +
         [...file.values()].map((s) => `
           <div class="gdon" style="--c:${RARITY_COLOR[s.rarete] || '#8C8275'}"
                title="${esc(s.pours.join(', '))}">
@@ -8066,7 +8247,7 @@
       const c = compteurs[s.key] || {};
       return `<button data-sub="${s.key}"${prefs.mktSub === s.key ? ' class="on"' : ''}` +
         `${c.title ? ` title="${esc(c.title)}"` : ''}>${s.label}` +
-        (c.n ? `<i class="cnt${c.hot ? ' hot' : ''}">${c.n}</i>` : '') +
+        (c.n ? `<i class="cnt${c.hot ? ' hot' : ''}${c.pale ? ' pale' : ''}">${c.n}</i>` : '') +
         `</button>`;
     }).join(''));
   }
@@ -8099,11 +8280,26 @@
 
     const suivies = Object.keys(state.watch || {}).length;
     const pausees = Object.values(state.watch || {}).filter((w) => w.paused).length;
+    /*
+     * Surveillance décochée : les deux premiers compteurs ne comptent plus
+     * rien. Ils étaient peints ici, AVANT le retour anticipé qui remplace le
+     * volet par « Surveillance désactivée » — on lisait donc « Enchères 3 »
+     * au-dessus d'un panneau qui annonce ne rien suivre, et « 1 surenchérie »
+     * en ambre pour une enchère que plus personne ne relève. Un badge
+     * d'alerte sur un guetteur à l'arrêt est pire qu'un badge absent : il
+     * promet une veille qui n'a pas lieu.
+     *
+     * Le dernier relevé reste affiché — c'est une information, et l'effacer
+     * ferait croire à zéro enchère — mais en sourdine, et sans jamais passer
+     * en ambre. L'infobulle dit pourquoi.
+     */
+    const veille = prefs.watchBids;
+    const perime = veille ? '' : '\nSurveillance décochée : dernier relevé connu, il ne se met plus à jour.';
     renderSubs({
-      ench: { n: bids.length, hot: perdues > 0,
-              title: perdues ? `${perdues} enchère(s) surenchérie(s)` : 'Tes mises en cours' },
-      vent: { n: occupes, hot: !libres,
-              title: `${occupes} vente(s) sur ${max} emplacements` },
+      ench: { n: bids.length, hot: veille && perdues > 0, pale: !veille,
+              title: (perdues ? `${perdues} enchère(s) surenchérie(s)` : 'Tes mises en cours') + perime },
+      vent: { n: occupes, hot: veille && !libres, pale: !veille,
+              title: `${occupes} vente(s) sur ${max} emplacements` + perime },
       rel: { n: suivies, hot: pausees > 0,
              title: pausees ? `${pausees} carte(s) en pause` : 'Cartes remises en vente automatiquement' },
       souh: { n: souhaits.length, hot: souhaits.length > 0,
@@ -8417,7 +8613,7 @@
         : `<div class="empty">Aucune carte suivie. ${prefs.relistUnsold
             ? `Une vente qui se termine sans acheteur s'inscrit toute seule.`
             : `Cochez « Relances auto » en bas pour que les ventes sans acheteur s'inscrivent seules.`}</div>`) +
-      (journal.length ? `<div class="rh sub">Journal</div><ul class="jour">${journal.join('')}</ul>` : ''));
+      (journal.length ? `<div class="rh sub">Journal</div><ul>${journal.join('')}</ul>` : ''));
   }
 
   /** Compte à rebours recalculé depuis l'échéance absolue, jamais décrémenté. */
@@ -9046,6 +9242,22 @@
       if (n.type === 'marketplace_auction_sold') {
         delete state.lastListing[id];
         dropWatch(id, 'vendue');              // objectif atteint : on cesse de la suivre
+        /*
+         * Une vente change ce qu'on possède, et la Revente n'en savait rien.
+         *
+         * Elle ne retire une ligne que dans `pruneSold`, qui relit la
+         * collection — mais seulement à l'ouverture, et pas plus d'une fois
+         * par `PRUNE_TTL`. Une carte vendue restait donc au tableau, bouton
+         * « Vendre » compris, jusqu'à dix minutes après son départ, et
+         * indéfiniment si la Revente restait ouverte.
+         *
+         * On n'efface PAS la ligne ici : `card_id` désigne le type de carte,
+         * pas l'exemplaire, et les doublons le partagent. Vendre un exemplaire
+         * sur deux en laisse un, dont la cote reste juste. Seule la relecture
+         * de la collection sait trancher — on la rend simplement possible tout
+         * de suite, au lieu de la faire attendre son tour.
+         */
+        sell.prunedAt = 0;
       } else if (prefs.relistUnsold) {
         // Invendue : on l'inscrit, la réconciliation se charge du reste.
         const t = await listingTerms(id, n.data?.auction_id || null);
@@ -9064,7 +9276,13 @@
     state.journal.sort((a, b) => b.at - a.at);
     state.journal = state.journal.slice(0, JOURNAL_MAX);
     saveStore({ journal: state.journal, asks: state.asks });
-    if (sell.open) renderSell();
+    /*
+     * La Revente ouverte pendant qu'une vente se conclut : elle affichait
+     * encore la carte partie, sans rien pour l'en déloger — `pruneSold` ne
+     * s'exécute qu'à l'ouverture. On relit donc maintenant, puisque le verrou
+     * de fraîcheur vient d'être levé juste au-dessus.
+     */
+    if (sell.open) { pruneSold(); renderSell(); }
   }
 
   const THIN_SALES = 5;  // en dessous, la cote repose sur trop peu de transactions
@@ -10225,27 +10443,148 @@
       <style>
         :host { all: initial; }
         * { box-sizing: border-box; margin: 0; }
+        /*
+         * Le fond de la page passe de 86 % à 94 % d'opacité, et le flou de 10 à
+         * 20 px.
+         *
+         * L'élévation ne peut PAS venir d'une boîte plus claire : « --dim »
+         * (#717C8D) est calé à 4,54:1 sur #0D0F13, soit quatre centièmes
+         * au-dessus du plancher AA. Éclaircir le fond de la modale, ne
+         * serait-ce que vers #101319, le fait retomber à 4,43:1 — et c'est le
+         * ton de l'amplitude et des en-têtes de colonnes, les plus petits
+         * textes du tableau. On gagne donc le relief en ENFONÇANT ce qu'il y a
+         * derrière, jamais en remontant ce qu'il y a devant.
+         */
         .wrap {
-          position: absolute; inset: 0; background: rgba(8,10,13,.86);
-          backdrop-filter: blur(10px); display: flex; align-items: center; justify-content: center;
-          padding: 28px; font: 13px/1.5 ui-sans-serif, system-ui, sans-serif; color: #F1F4F8;
+          position: absolute; inset: 0; background: rgba(6,8,11,.94);
+          backdrop-filter: blur(20px) saturate(.9);
+          display: flex; align-items: center; justify-content: center;
+          padding: 28px; font: 13px/1.5 ui-sans-serif, system-ui, -apple-system,
+            "Segoe UI Variable", "Segoe UI", sans-serif; color: #F1F4F8;
         }
+        /*
+         * 1 180 px et non 980 : à neuf colonnes, la largeur d'avant laissait le
+         * titre des cartes se faire couper sur un écran qui avait la place. La
+         * boîte reste bornée — au-delà, l'œil ne fait plus le lien entre le nom
+         * à gauche et le prix à droite.
+         *
+         * L'arête claire du haut, elle, est ce qui remplace le fond éclairci :
+         * un filet blanc à 7 % là où la lumière frapperait la tranche. C'est
+         * tout ce qui sépare visuellement la boîte du fond, et ça suffit.
+         */
         .box {
-          width: min(980px, 100%); max-height: 100%; display: flex; flex-direction: column;
-          background: #0D0F13; border: 1px solid rgba(255,255,255,.08); border-radius: 16px;
-          box-shadow: 0 30px 80px rgba(0,0,0,.6); overflow: hidden;
+          width: min(1180px, 100%); max-height: 100%; display: flex; flex-direction: column;
+          background: #0D0F13; border: 1px solid rgba(255,255,255,.09); border-radius: 18px;
+          box-shadow: 0 40px 100px rgba(0,0,0,.7), 0 2px 10px rgba(0,0,0,.5),
+                      inset 0 1px 0 rgba(255,255,255,.07);
+          overflow: hidden;
         }
-        .top { display: flex; align-items: center; gap: 12px; padding: 16px 18px; border-bottom: 1px solid rgba(255,255,255,.07); }
-        .top h2 { font-size: 16px; font-weight: 650; letter-spacing: -.01em; }
-        .sum { color: #949DAD; font-size: 12px; }
-        .x { margin-left: auto; width: 28px; height: 28px; border: 0; border-radius: 8px;
-             background: rgba(255,255,255,.05); color: #949DAD; cursor: pointer; font-size: 14px; }
-        .x:hover { color: #F1F4F8; }
-        .bar { display: flex; flex-wrap: wrap; gap: 10px; align-items: center;
-               padding: 12px 18px; border-bottom: 1px solid rgba(255,255,255,.07); color: #949DAD; font-size: 12px; }
-        .bar label { display: flex; align-items: center; gap: 6px; }
-        .bar input[type=number] { width: 56px; background: rgba(255,255,255,.05); border: 1px solid rgba(255,255,255,.08);
-              border-radius: 6px; color: #F1F4F8; padding: 4px 6px; font: 12px ui-sans-serif, system-ui, sans-serif; }
+        /*
+         * L'en-tête portait le titre et, à sa suite, quatre faits distincts
+         * cousus par des points médians : « 15 cartes · ~1 234 wb · cote il y a
+         * 41 min · concurrence il y a 6 min ». C'est une phrase qu'on relit
+         * deux fois pour y trouver un nombre.
+         *
+         * Ils deviennent des relevés étiquetés, valeur au-dessus, intitulé
+         * en-dessous — la disposition que le panneau emploie déjà pour ses
+         * compteurs (« .fig »). Les deux surfaces de l'outil disent donc leurs
+         * chiffres de la même façon, et le point médian disparaît.
+         */
+        .top { display: flex; align-items: flex-start; gap: 28px; padding: 18px 20px 16px;
+               border-bottom: 1px solid rgba(255,255,255,.07); }
+        .top h2 { font-size: 17px; font-weight: 650; letter-spacing: -.015em; padding-top: 2px; }
+        .sum { display: flex; align-items: flex-start; gap: 26px; flex-wrap: wrap; }
+        /* Le relevé chiffré : valeur au-dessus, intitulé en-dessous. Défini une
+           fois — l'en-tête et le journal s'en servent tous les deux, et les
+           deux blocs de la page disent donc leurs chiffres à l'identique. */
+        .f { display: flex; flex-direction: column; gap: 3px; }
+        .f b { font-size: 15px; font-weight: 650; letter-spacing: -.01em; line-height: 1.1;
+               font-variant-numeric: tabular-nums; }
+        .f span { color: #717C8D; font-size: 11px; line-height: 1.1; }
+        /* Un relevé qui alerte — cote distancée, concurrence incomplète —
+           prend l'ambre, la même que ⚠ ailleurs dans l'outil. */
+        .f.due b { color: #F0A94B; }
+        .x { margin-left: auto; flex: none; width: 30px; height: 30px; border: 0; border-radius: 9px;
+             background: rgba(255,255,255,.05); color: #949DAD; cursor: pointer; font-size: 14px;
+             transition: background .14s, color .14s; }
+        .x:hover { color: #F1F4F8; background: rgba(255,255,255,.1); }
+        /*
+         * La bande des mises en garde. Ambre, comme ⚠ et comme le tri par
+         * prix : c'est la couleur du « ce chiffre est plus mince qu'il n'en a
+         * l'air » dans tout l'outil. Elle n'existe que lorsqu'il y a quelque
+         * chose à dire — « [hidden] » la retire du flux, elle ne réserve pas
+         * de hauteur vide au-dessus des filtres.
+         */
+        .caveat {
+          display: flex; flex-direction: column; gap: 3px;
+          padding: 10px 20px; border-bottom: 1px solid rgba(255,255,255,.07);
+          background: rgba(240,169,75,.07); color: #F0A94B;
+          font-size: 11.5px; line-height: 1.5;
+        }
+        .caveat[hidden] { display: none; }
+
+        /*
+         * La barre de filtres. C'est ici que la page trahissait son âge : la
+         * case à cocher, la liste déroulante et le compteur étaient les
+         * widgets du système. Trois objets dessinés par Windows au milieu
+         * d'une interface dessinée à la main — coche bleue, chevron gris,
+         * flèches de compteur — chacun avec ses propres angles, sa propre
+         * graisse et sa propre idée de la hauteur de ligne.
+         *
+         * Tout est redessiné ci-dessous. Aucune règle ne change ce que les
+         * contrôles FONT : ce sont les mêmes éléments, avec les mêmes
+         * écouteurs et le même clavier — une case reste cochable à la barre
+         * d'espace, la liste garde le menu natif à l'ouverture.
+         *
+         * Les commandes se regroupent aussi : « ventes mini » et « rareté »
+         * restreignent la liste, « sans concurrence » et « masquer » la
+         * filtrent. Un séparateur les sépare, au lieu d'un rang unique où
+         * huit contrôles se suivaient sans hiérarchie.
+         */
+        .bar { display: flex; flex-wrap: wrap; gap: 8px 14px; align-items: center;
+               padding: 11px 20px; border-bottom: 1px solid rgba(255,255,255,.07);
+               color: #949DAD; font-size: 12px; }
+        .bar label { display: flex; align-items: center; gap: 7px; white-space: nowrap; }
+        /* Le temps du relevé : la barre entière se retire, en bloc. */
+        .bar.inerte { opacity: .45; }
+        .bar.inerte label { cursor: default; }
+        .bar .sep { flex: none; width: 1px; height: 18px; background: rgba(255,255,255,.16); }
+
+        /* Le compteur : les flèches natives sont retirées, la valeur se tape
+           ou se corrige au clavier — elles n'ajoutaient qu'un ornement gris. */
+        .bar input[type=number] {
+          width: 52px; -moz-appearance: textfield; appearance: textfield;
+          background: rgba(255,255,255,.05); border: 1px solid rgba(255,255,255,.09);
+          border-radius: 8px; color: #F1F4F8; padding: 5px 8px;
+          font: 500 12px ui-sans-serif, system-ui, sans-serif; font-variant-numeric: tabular-nums;
+          transition: border-color .14s, background .14s;
+        }
+        .bar input[type=number]::-webkit-outer-spin-button,
+        .bar input[type=number]::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
+        .bar input[type=number]:hover { background: rgba(255,255,255,.08); }
+        .bar input[type=number]:focus { outline: 0; border-color: #35D68F; background: rgba(255,255,255,.08); }
+
+        /*
+         * La case à cocher. « appearance: none » la vide de son rendu système,
+         * et la coche est tracée en propre : deux côtés d'un carré, tourné de
+         * 45°. Pas de glyphe ✓ — il change de dessin selon la police
+         * installée, et la case doit avoir le même trait partout.
+         */
+        .bar input[type=checkbox] {
+          flex: none; appearance: none; -webkit-appearance: none;
+          width: 16px; height: 16px; margin: 0; border-radius: 5px;
+          background: rgba(255,255,255,.05); box-shadow: inset 0 0 0 1px rgba(255,255,255,.14);
+          cursor: pointer; transition: background .14s, box-shadow .14s;
+        }
+        .bar input[type=checkbox]:hover { background: rgba(255,255,255,.1); }
+        .bar input[type=checkbox]:checked { background: #35D68F; box-shadow: none; }
+        .bar input[type=checkbox]:checked::after {
+          content: ''; display: block; width: 4px; height: 8px; margin: 2px auto 0;
+          border: solid #06130C; border-width: 0 2px 2px 0; transform: rotate(45deg);
+        }
+        /* Le filtre neutralisé le temps du relevé : il ne doit pas avoir l'air
+           d'agir. Le curseur le dit autant que l'opacité, portée par le label. */
+        .bar input[type=checkbox]:disabled { cursor: default; }
         .tags { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
         .tags > [data-tag] { display: flex; gap: 6px; flex-wrap: wrap; }
         .tagchip {
@@ -10255,11 +10594,34 @@
         }
         .tagchip:hover { color: #F1F4F8; }
         .tagchip.on { background: rgba(53,214,143,.18); border-color: #35D68F; color: #35D68F; }
-        .bar select { background: #14171C; border: 1px solid rgba(255,255,255,.08); border-radius: 6px;
-              color: #F1F4F8; padding: 4px 6px; font: 12px ui-sans-serif, system-ui, sans-serif; }
-        .bar button { margin-left: auto; padding: 6px 12px; border: 0; border-radius: 8px;
-              background: rgba(255,255,255,.06); color: #949DAD; cursor: pointer; font: 500 12px ui-sans-serif, system-ui, sans-serif; }
-        .bar button:hover { color: #F1F4F8; }
+        /*
+         * La liste déroulante. Le chevron du système est remplacé par un tracé
+         * en SVG, posé en image de fond — il suit la couleur du texte et garde
+         * la même épaisseur de trait que le reste de l'interface. Le menu qui
+         * s'ouvre au clic reste celui du navigateur : c'est la seule partie
+         * qu'une page ne peut pas dessiner sans réécrire le contrôle entier,
+         * et le réécrire lui coûterait son clavier.
+         */
+        .bar select {
+          appearance: none; -webkit-appearance: none;
+          background: rgba(255,255,255,.05)
+            url("data:image/svg+xml;charset=utf8,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'%3E%3Cpath d='M1 1l4 4 4-4' fill='none' stroke='%23949DAD' stroke-width='1.6' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E")
+            no-repeat right 9px center;
+          border: 1px solid rgba(255,255,255,.09); border-radius: 8px;
+          color: #F1F4F8; padding: 5px 28px 5px 9px;
+          font: 500 12px ui-sans-serif, system-ui, sans-serif; cursor: pointer;
+          transition: border-color .14s, background-color .14s;
+        }
+        .bar select:hover { background-color: rgba(255,255,255,.09); }
+        .bar select:focus { outline: 0; border-color: #35D68F; }
+        /* Le menu déroulant, lui, est peint par le navigateur : sans couleur
+           explicite ses options tombaient en noir sur blanc. */
+        .bar select option { background: #14171C; color: #F1F4F8; }
+
+        .bar button { margin-left: auto; flex: none; padding: 6px 13px; border: 0; border-radius: 8px;
+              background: rgba(255,255,255,.06); color: #949DAD; cursor: pointer;
+              font: 500 12px ui-sans-serif, system-ui, sans-serif; transition: background .14s, color .14s; }
+        .bar button:hover { color: #F1F4F8; background: rgba(255,255,255,.1); }
         /*
          * Cote distancée. La même ambre que ⚠ et que le tri par prix — c'est
          * la couleur du « ce chiffre est plus mince qu'il n'en a l'air » dans
@@ -10277,53 +10639,182 @@
          * fenêtre étroite. Elles défilent maintenant.
          */
         table { width: 100%; min-width: 720px; border-collapse: collapse; }
-        th { position: sticky; top: 0; background: #0D0F13; text-align: left; color: #717C8D;
-             font-size: 11px; font-weight: 500; padding: 9px 12px; border-bottom: 1px solid rgba(255,255,255,.07); }
-        td { padding: 8px 12px; border-bottom: 1px solid rgba(255,255,255,.04); font-variant-numeric: tabular-nums; }
-        tr:hover td { background: rgba(255,255,255,.03); }
-        .r { font-weight: 700; font-size: 11px; }
-        .t { max-width: 340px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        th { position: sticky; top: 0; z-index: 1; background: #0D0F13; text-align: left; color: #717C8D;
+             font-size: 11px; font-weight: 500; padding: 10px 14px;
+             border-bottom: 1px solid rgba(255,255,255,.07); }
+        td { padding: 9px 14px; border-bottom: 1px solid rgba(255,255,255,.04);
+             font-variant-numeric: tabular-nums; }
+        tr:hover td { background: rgba(255,255,255,.035); }
+        /*
+         * La rareté était deux lettres colorées, seules dans leur colonne.
+         * C'était l'unique endroit du tableau où la palette du jeu servait à
+         * quelque chose, et à cette taille les six teintes — dont quatre
+         * pastels très proches — ne se distinguaient plus.
+         *
+         * Elles deviennent des pastilles teintées, exactement celles que le
+         * panneau emploie pour ses raretés (« .chip »). Le fond porte la
+         * couleur autant que le texte : la teinte se lit sur une surface, plus
+         * sur deux glyphes de onze pixels. Les valeurs, elles, restent celles
+         * relevées sur le site — elles ne s'inventent pas.
+         */
+        .r { width: 1%; white-space: nowrap; }
+        .r i {
+          display: inline-block; min-width: 28px; padding: 2px 7px; border-radius: 999px;
+          background: color-mix(in srgb, var(--c) 22%, transparent); color: var(--c);
+          font: 700 10px ui-sans-serif, system-ui, sans-serif; font-style: normal;
+          text-align: center; letter-spacing: .01em;
+        }
+        /* L'action est en bout de ligne : elle s'aligne sur ce bord, comme les
+           nombres s'alignent sur le leur. Sans quoi les boutons flottaient au
+           milieu d'une colonne large, à distance variable de la ligne suivante. */
+        th:last-child, td:last-child { text-align: right; }
+        .t { max-width: 340px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+             font-weight: 500; }
         .num { text-align: right; }
-        .med { font-weight: 650; }
-        .amp { color: #717C8D; font-size: 11px; }
+        /*
+         * Le prix visé est la réponse à la question que pose la page. Il portait
+         * la même taille que les six autres nombres de sa ligne, à une graisse
+         * près. Il passe à 14 px : c'est le seul écart de taille du tableau, et
+         * il désigne la colonne qu'on est venu lire.
+         */
+        .med { font-size: 14px; font-weight: 650; letter-spacing: -.01em; }
+        .amp { color: #717C8D; font-size: 11px; white-space: nowrap; }
         .th { color: #949DAD; font-size: 11px; white-space: nowrap; }
         .free { color: #35D68F; }
         .busy { color: #F0A94B; }
         /* Peu de ventes : le prix visé n'est pas un prix de marché. */
         .thin { color: #F0A94B; cursor: help; }
         .th .liq { color: #717C8D; margin-left: 6px; }
-        .tag { padding: 1px 6px; border-radius: 999px; background: rgba(53,214,143,.15); color: #35D68F; font-size: 10px; }
-        .go { padding: 5px 11px; border: 1px solid rgba(255,255,255,.12); border-radius: 7px;
-              background: none; color: #F1F4F8; cursor: pointer; font: 500 11px ui-sans-serif, system-ui, sans-serif; }
-        .go:hover { background: rgba(53,214,143,.15); border-color: #35D68F; color: #35D68F; }
+        .tag { padding: 1px 7px; border-radius: 999px; background: rgba(53,214,143,.15); color: #35D68F; font-size: 10px; }
+        /*
+         * « Vendre », répété sur chaque ligne, faisait une colonne d'une
+         * quinzaine de cadres identiques — le motif le plus lourd de l'écran,
+         * pour une action qui ne concerne qu'une ligne à la fois.
+         *
+         * Le bouton perd donc son contour au repos et ne le reprend qu'au
+         * survol de SA ligne. Il reste lisible et cliquable en permanence — ce
+         * n'est pas une action cachée, seulement une action qui cesse de
+         * dessiner un cadre autour d'elle-même quinze fois de suite.
+         */
+        .go { padding: 5px 12px; border: 1px solid rgba(255,255,255,.12); border-radius: 8px;
+              background: none; color: #F1F4F8; cursor: pointer;
+              font: 500 11px ui-sans-serif, system-ui, sans-serif;
+              transition: background .14s, border-color .14s, color .14s; }
+        /*
+         * Le contour ne s'efface QUE dans le tableau — « td .go », pas « .go ».
+         * La même classe habille « Relâcher les filtres », qui vit seul au
+         * milieu d'un tableau vide : sans ligne à survoler, il n'aurait jamais
+         * repris son cadre et se lisait comme du texte mort. C'est le seul
+         * bouton de cet écran-là, il doit rester un bouton.
+         */
+        td .go { border-color: transparent; color: #949DAD; }
+        tr:hover td .go { border-color: rgba(255,255,255,.12); color: #F1F4F8; }
+        .go:hover, .go:focus-visible { background: rgba(53,214,143,.15); border-color: #35D68F; color: #35D68F; }
+        /* Un écran tactile n'a pas de survol : le contour y est permanent. */
+        @media (hover: none) { td .go { border-color: rgba(255,255,255,.12); color: #F1F4F8; } }
         /* Une carte étiquetée n'a pas de bouton : rien à cliquer par mégarde. */
-        .protege { display: inline-block; padding: 5px 9px; border: 1px dashed rgba(255,255,255,.14);
-                   border-radius: 7px; color: #717C8D; font: 500 11px ui-sans-serif, system-ui, sans-serif; }
-        .note { padding: 12px 18px; color: #717C8D; font-size: 11px; border-top: 1px solid rgba(255,255,255,.07); }
-        .empty { padding: 40px; text-align: center; color: #717C8D; }
+        .protege { display: inline-block; padding: 4px 9px; border: 1px dashed rgba(255,255,255,.14);
+                   border-radius: 8px; color: #717C8D; font: 500 11px ui-sans-serif, system-ui, sans-serif; }
+        /*
+         * Déjà en vente. Verte, parce que ce n'est pas un empêchement mais un
+         * fait accompli : la carte est au marché, l'emplacement est pris, il
+         * n'y a rien à faire de plus. Le tiret de « protégée » dirait le
+         * contraire — qu'on est bloqué.
+         */
+        .encours { display: inline-block; padding: 4px 9px; border-radius: 8px;
+                   background: rgba(53,214,143,.12); color: #35D68F;
+                   font: 500 11px ui-sans-serif, system-ui, sans-serif; }
+        .note { padding: 13px 20px; color: #717C8D; font-size: 11px; line-height: 1.55;
+                max-width: 90ch; border-top: 1px solid rgba(255,255,255,.07); }
+        .empty { padding: 48px 40px; text-align: center; color: #717C8D; line-height: 1.6; }
+        /* La jauge du relevé : mêmes 3 px, même vert et même transition que
+           celle de la régénération, dans le panneau. */
+        .empty .prog {
+          height: 3px; width: min(320px, 60%); margin: 0 auto 20px;
+          border-radius: 2px; background: rgba(255,255,255,.07); overflow: hidden;
+        }
+        .empty .prog i {
+          display: block; height: 100%; border-radius: 2px; background: #35D68F;
+          transition: width .4s linear;
+        }
         .slots { color: #35D68F; font-weight: 600; }
         /* Autant de lignes surlignées que d'emplacements libres : ce sont les
            cartes à lister maintenant, sans avoir à compter soi-même. */
         tr.next td { background: rgba(53,214,143,.06); }
+        tr.next:hover td { background: rgba(53,214,143,.1); }
         tr.next td:first-child { box-shadow: inset 2px 0 0 #35D68F; }
-        .journal { border-top: 1px solid rgba(255,255,255,.07); padding: 12px 18px; }
-        .journal h3 { font-size: 12px; font-weight: 600; color: #949DAD; margin-bottom: 8px; }
-        .journal .j { display: flex; gap: 10px; align-items: baseline; padding: 3px 0; font-size: 12px; }
+        /*
+         * Le journal se lisait comme une suite de la page, sans rien qui le
+         * distingue du tableau au-dessus : même fond, même graisse, collé
+         * dessous. C'est pourtant l'autre sujet — ce que TU as demandé et ce
+         * que tu as obtenu, quand le tableau dit ce que le marché vaut.
+         *
+         * Il s'enfonce donc au lieu de s'élever : un fond légèrement plus
+         * sombre que la boîte, qui le range visiblement au second plan. Aucun
+         * texte en « --dim » n'y vit — les tons employés ici sont le blanc, le
+         * vert et l'ambre — le plancher de contraste ne s'y applique donc pas.
+         */
+        .journal { border-top: 1px solid rgba(255,255,255,.07); padding: 14px 20px;
+                   background: rgba(0,0,0,.28); }
+        /*
+         * Vide, il ne réserve rien. Tant qu'il n'avait ni fond ni filet, une
+         * boîte vide de 28 px de rembourrage passait inaperçue ; le fond l'a
+         * rendue visible — une bande sombre et muette entre le tableau et la
+         * note, pendant tout le relevé, sur un compte qui n'a encore rien
+         * vendu. C'est le fond qui l'a révélée, pas lui qui l'a créée.
+         */
+        .journal:empty { display: none; }
+        /*
+         * Le journal est la boucle de retour de la page : le tableau dit à quel
+         * prix vendre, le journal dit si ce prix s'est vendu. Il était pourtant
+         * la partie la plus pauvre de l'écran, et pour deux raisons.
+         *
+         * Il occupait douze rangs pleine largeur — 230 px pris au tableau, qui
+         * est le sujet — pour un contenu large de 400. Il passe en colonnes :
+         * autant qu'il en tient, et les douze entrées se rangent en trois
+         * rangs. Le tableau récupère la différence.
+         *
+         * Et chaque ligne disait « demandé 240 vendu 240 », le même nombre
+         * deux fois, sur toutes les ventes conclues au prix demandé —
+         * c'est-à-dire presque toutes. Le seul cas intéressant est celui où les
+         * deux DIFFÈRENT : une enchère qui monte. On n'écrit donc qu'un
+         * nombre, et la flèche ne paraît que lorsqu'il y en a deux à comparer.
+         */
+        .jhead { display: flex; align-items: flex-start; gap: 26px; margin-bottom: 11px; }
+        .jhead h3 { align-self: center; font-size: 12px; font-weight: 600; color: #F1F4F8;
+                    letter-spacing: -.005em; margin-right: 2px; }
+        .journal .list {
+          display: grid; grid-template-columns: repeat(auto-fill, minmax(250px, 1fr));
+          gap: 2px 28px;
+        }
+        .journal .j { display: flex; gap: 9px; align-items: baseline; font-size: 12px; }
+        .journal .j i { flex: none; width: 5px; height: 5px; border-radius: 50%;
+                        background: #35D68F; transform: translateY(-1px); }
+        .journal .j.ko i { background: #F0A94B; }
         .journal .n { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis;
                       white-space: nowrap; color: #F1F4F8; }
-        .journal .ok { color: #35D68F; }
-        .journal .ko { color: #F0A94B; }
-        .journal .ask { color: #717C8D; font-variant-numeric: tabular-nums; }
+        .journal .px { flex: none; color: #949DAD; font-variant-numeric: tabular-nums; }
+        /* Le prix atteint, quand il dépasse celui demandé : c'est le seul
+           chiffre du journal qui soit une bonne nouvelle, il la porte. */
+        .journal .px em { font-style: normal; color: #35D68F; font-weight: 600; }
+        .journal .j.ko .px { color: #F0A94B; }
+
+        /* Le clavier doit voir où il est : la Revente est une modale, on peut
+           la parcourir entièrement à la tabulation. */
+        :focus-visible { outline: 2px solid #35D68F; outline-offset: 2px; }
+        @media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
       </style>
       <div class="wrap" data-wrap>
         <div class="box">
           <div class="top">
-            <h2>Revente</h2><span class="sum" data-sum></span>
+            <h2>Revente</h2><div class="sum" data-sum></div>
             <button class="x" data-close>✕</button>
           </div>
+          <div class="caveat" data-caveat hidden></div>
           <div class="bar">
             <label>Ventes mini <input type="number" data-min min="1" max="50"></label>
             <label>Rareté <select data-rar></select></label>
+            <span class="sep"></span>
             <label data-freelabel title="N'afficher que les cartes que personne d'autre ne propose en ce moment">
               <input type="checkbox" data-free> Sans concurrence</label>
             <span class="tags" data-taglabel hidden>Masquer <button class="tagchip" data-all>toutes les étiquetées</button><span data-tag></span></span>
@@ -10343,10 +10834,10 @@
     document.body.appendChild(host);
 
     const q = (s) => root.querySelector(s);
-    sellUI = { host, root, sum: q('[data-sum]'), scroll: q('[data-scroll]'),
+    sellUI = { host, root, sum: q('[data-sum]'), caveat: q('[data-caveat]'), scroll: q('[data-scroll]'),
       journal: q('[data-journal]'), min: q('[data-min]'), rar: q('[data-rar]'), free: q('[data-free]'), tag: q('[data-tag]'),
       taglabel: q('[data-taglabel]'), all: q('[data-all]'), freeLabel: q('[data-freelabel]'),
-      rescan: q('[data-rescan]') };
+      rescan: q('[data-rescan]'), bar: q('.bar') };
 
     q('[data-close]').addEventListener('click', closeSell);
     q('[data-wrap]').addEventListener('click', (e) => { if (e.target === q('[data-wrap]')) closeSell(); });
@@ -10414,21 +10905,44 @@
       paint(sellUI.journal, '');
       return;
     }
-    const vendues = state.journal.filter((e) => e.vendue).length;
-    paint(sellUI.journal,
-      `<h3>Tes ventes — ${vendues} vendue${vendues > 1 ? 's' : ''} sur ${state.journal.length}</h3>` +
-      j
-        .map(
-          (e) => `<div class="j">
-            <span class="${e.vendue ? 'ok' : 'ko'}">${e.vendue ? '✓' : '✕'}</span>
-            <span class="n">${esc(e.title)}</span>
-            <span class="ask">${e.ask != null ? `demandé ${e.ask.toLocaleString('fr-FR')}` : ''}</span>
-            <span class="${e.vendue ? 'ok' : 'ko'}">${
-              e.vendue ? `vendu ${(e.final ?? 0).toLocaleString('fr-FR')}` : 'sans acheteur'
-            }</span>
-          </div>`
-        )
-        .join(''));
+    const vendues = state.journal.filter((e) => e.vendue);
+    const sans = state.journal.length - vendues.length;
+    /*
+     * Encaissé, et non « valeur » : ce sont des enchères closes, l'argent est
+     * arrivé. Le chiffre existait déjà au pied de l'onglet Marché sans jamais
+     * paraître ici — alors que c'est ICI qu'on fixe les prix qui le produisent.
+     *
+     * `final_price` arrive en chaîne de caractères : sans la conversion, la
+     * somme concatène « 1050 » et « 2500 » au lieu de les additionner.
+     */
+    const gains = vendues.reduce((s, e) => s + (Number(e.final) || 0), 0);
+    const nb = (v) => Number(v).toLocaleString('fr-FR');
+    /*
+     * Le compte brut, pas seulement le taux. Un « 75 % » se lit bien et ne dit
+     * pas s'il porte sur quatre ventes ou sur quatre cents, et les invendues
+     * ont leur propre relevé plutôt que d'être le reste d'une soustraction
+     * qu'on laisserait faire au lecteur.
+     */
+    const tete = `<div class="jhead"><h3>Tes ventes</h3>`
+      + `<div class="f"><b>${nb(vendues.length)} / ${nb(state.journal.length)}</b><span>vendues</span></div>`
+      + `<div class="f"><b>${nb(gains)}</b><span>wb encaissés</span></div>`
+      + (sans ? `<div class="f due"><b>${nb(sans)}</b><span>sans acheteur</span></div>` : '')
+      + '</div>';
+
+    paint(sellUI.journal, tete + '<div class="list">' + j
+      .map((e) => {
+        // Trois cas, trois écritures. Le prix demandé ne se répète que
+        // lorsqu'il diffère de celui atteint — sinon c'est le même nombre deux
+        // fois sur presque toutes les lignes.
+        const px = !e.vendue
+          ? `${e.ask != null ? `${nb(e.ask)} · ` : ''}sans acheteur`
+          : e.ask != null && e.final != null && Number(e.final) !== Number(e.ask)
+            ? `${nb(e.ask)} → <em>${nb(e.final)}</em>`
+            : nb(e.final ?? e.ask ?? 0);
+        return `<div class="j${e.vendue ? '' : ' ko'}"><i></i>`
+          + `<span class="n">${esc(e.title)}</span><span class="px">${px}</span></div>`;
+      })
+      .join('') + '</div>');
   }
 
 
@@ -10436,6 +10950,23 @@
     if (!sellUI) return;
     sellUI.host.style.display = sell.open ? '' : 'none';
     if (!sell.open) return;
+
+    /*
+     * Pendant le relevé, les filtres ne filtrent rien : il n'y a pas de
+     * tableau. Ils restaient pourtant pleinement offerts, « Rafraîchir la
+     * cote » compris — lequel ne fait rien non plus, un garde de ré-entrée
+     * l'arrête net dans « scanCote ». Quatre commandes vives qui n'agissent
+     * pas, pendant les deux minutes où l'on attend justement quelque chose.
+     *
+     * C'est la règle déjà posée pour « Sans concurrence » un peu plus bas :
+     * une commande ne doit pas avoir l'air d'agir tant qu'elle n'agit pas.
+     * L'attribut « disabled » vaut mieux que « pointer-events », qui laisse
+     * le clavier atteindre un bouton mort.
+     */
+    sellUI.bar.classList.toggle('inerte', sell.scanning);
+    for (const el of sellUI.bar.querySelectorAll('input, select, button')) {
+      el.disabled = sell.scanning;
+    }
 
     // Le sélecteur n'apparaît que si le compte utilise des étiquettes.
     sellUI.taglabel.hidden = !sell.tags.length;
@@ -10455,50 +10986,106 @@
       // Deux temps distincts, et il faut les distinguer : on lit d'abord la
       // collection, on cote ensuite. Un compteur figé sur « 0 » n'a jamais dit
       // lequel des deux était en cours.
+      // Le relevé emprunte la même disposition que la page finie : c'est le
+      // même compteur qui monte, il n'a pas à changer de forme en cours de route.
+      sellUI.caveat.hidden = true;
       if (!sell.total) {
-        sellUI.sum.textContent = `lecture de votre collection · ${sell.read} cartes`;
+        paint(sellUI.sum,
+          `<div class="f"><b>${sell.read.toLocaleString('fr-FR')}</b><span>cartes lues</span></div>`);
         paint(sellUI.scroll,
           '<div class="empty">Lecture de votre collection, 50 cartes par page…</div>');
         return;
       }
-      sellUI.sum.textContent = `cotation ${sell.done} / ${sell.total}`;
-      paint(sellUI.scroll, '<div class="empty">Lecture de l’historique des ventes, carte par carte…</div>');
+      paint(sellUI.sum,
+        `<div class="f"><b>${sell.done.toLocaleString('fr-FR')} / ${sell.total.toLocaleString('fr-FR')}</b>`
+        + '<span>cartes cotées</span></div>');
+      /*
+       * Une jauge, parce que le relevé dure deux minutes.
+       *
+       * « N / N » est exact et ne se lit pas d'un coup d'œil : il
+       * faut diviser pour savoir si l'on est au tiers ou aux trois quarts.
+       * Trois pixels de haut le disent sans un chiffre, et c'est déjà
+       * l'idiome du panneau pour la régénération des paquets — même hauteur,
+       * même vert, même transition.
+       *
+       * Seulement à la cotation : la lecture de la collection, elle, ne
+       * connaît pas son total tant que le serveur ne l'a pas dit, et une
+       * jauge sans dénominateur mentirait sur ce qu'il reste.
+       */
+      const pct = Math.min(100, Math.round((sell.done / sell.total) * 100));
+      paint(sellUI.scroll,
+        `<div class="empty"><div class="prog"><i style="width:${pct}%"></i></div>`
+        + 'Lecture de l’historique des ventes, carte par carte…</div>');
       return;
     }
 
     const rows = sellRows();
     const valeur = rows.reduce((a, x) => a + (x.q3 || x.med), 0);
     const libres = state.slots.at ? state.slots.max - state.slots.used : null;
-    const age = sell.at ? ` · cote il y a ${fmtSpan(Date.now() - sell.at)}` : '';
     /*
-     * La couverture se dit ICI, sur la même ligne que l'âge de la cote, parce
-     * que c'est la question suivante : « de quand » ne vaut rien sans « sur
-     * quoi ». Formulée en cartes manquantes plutôt qu'en pourcentage seul — un
-     * « 17 % » ne dit pas s'il en manque cent ou dix mille.
+     * Ce que tu as DÉJÀ en vente.
+     *
+     * Le tableau l'ignorait complètement : une carte dont l'enchère court
+     * gardait son bouton « Vendre », et pouvait même être surlignée comme
+     * « à lister maintenant ». La colonne « En vente » ne dit rien de ce
+     * cas-là — elle compte les annonces des AUTRES joueurs, pas les tiennes.
+     *
+     * Le relevé n'existe que si la surveillance tourne ; sans lui on ne
+     * prétend rien, plutôt que de présenter comme libre ce qu'on n'a pas lu.
+     * C'est la même prudence que le filtre « sans concurrence » applique déjà
+     * en attendant son propre relevé.
+     */
+    const mesVentes = new Set(
+      state.sales.at ? (state.sales.list || []).map((v) => v.card).filter(Boolean) : []
+    );
+    const age = sell.at ? fmtSpan(Date.now() - sell.at) : null;
+    /*
+     * La couverture se dit ICI, à côté de l'âge de la cote, parce que c'est la
+     * question suivante : « de quand » ne vaut rien sans « sur quoi ».
+     * Formulée en cartes manquantes plutôt qu'en pourcentage seul — un « 17 % »
+     * ne dit pas s'il en manque cent ou dix mille.
      */
     const c = couvertureDistancee();
     /*
      * Deux nombres, pas trois. « N de vos N cartes (17 %) — N
      * sans prix » disait trois fois la même chose : les deux premiers
-     * s'additionnent pour faire le troisième. Mesuré dans la vraie modale, la
-     * ligne entière passait de 755 px à 625 pour 831 disponibles — la marge
-     * qu'il faut pour qu'une collection à six chiffres ne la fasse pas passer
-     * à deux lignes.
+     * s'additionnent pour faire le troisième.
      */
-    const couv = c
-      ? ` · cote sur ${c.pct} % de vos cartes — ${c.manquantes.toLocaleString('fr-FR')} sans prix, en fin de tri`
-      : '';
     /*
      * Un relevé de concurrence interrompu se dit. Le filtre « sans
      * concurrence » repose entièrement dessus : le laisser passer pour complet
      * ferait proposer comme exclusives des cartes qu'on n'a pas fini de lire.
      */
-    const conc = sell.compAt
-      ? ` · concurrence il y a ${fmtSpan(Date.now() - sell.compAt)}` +
-        (sell.compTronque ? ' (dernier relevé interrompu — le serveur a freiné)' : '')
-      : sell.compTronque
-        ? ' · relevé de la concurrence interrompu — « sans concurrence » n’est pas fiable'
-        : ' · relevé de la concurrence en cours — « sans concurrence » ne filtre pas encore';
+    const concGene = !sell.compAt || sell.compTronque;
+    /*
+     * Les mises en garde quittent la ligne des chiffres.
+     *
+     * Elles y étaient cousues aux relevés par des points médians — « 15 cartes
+     * · ~1 234 wb · cote il y a 41 min · relevé de la concurrence interrompu —
+     * “sans concurrence” n'est pas fiable ». Une phrase entière, en gris, en
+     * quatrième position d'une énumération de nombres : c'est l'endroit d'un
+     * écran où l'on regarde le moins. Elles prennent leur propre bande, en
+     * ambre, sous l'en-tête — et n'apparaissent que lorsqu'il y a lieu.
+     */
+    const alertes = [
+      c && `La cote couvre ${c.pct} % de vos cartes : ${c.manquantes.toLocaleString('fr-FR')} `
+        + 'sont sans prix et tombent en fin de tri.',
+      !sell.compAt && sell.compTronque
+        && 'Relevé de la concurrence interrompu — « sans concurrence » n’est pas fiable.',
+      !sell.compAt && !sell.compTronque
+        && 'Relevé de la concurrence en cours — « sans concurrence » ne filtre pas encore.',
+      sell.compAt && sell.compTronque
+        && 'Dernier relevé de la concurrence interrompu — le serveur a freiné.',
+      /*
+       * La note du serveur — « les prix sont réservés aux comptes PRO » — ne
+       * monte dans la bande QUE si le tableau a des lignes. Sans lignes, c'est
+       * elle que le corps affiche en grand, au centre : la mettre aussi dans
+       * la bande écrivait deux fois la même phrase, l'une sous l'autre, à
+       * trois lignes d'intervalle. Vu à l'écran sur le cas du compte gratuit,
+       * qui est précisément celui où elle est la plus longue.
+       */
+      rows.length ? sell.note : '',
+    ].filter(Boolean);
 
     /*
      * La case ne doit pas avoir l'air d'agir tant qu'elle n'agit pas : cochée
@@ -10528,8 +11115,17 @@
 
     // Les deux nombres de la même ligne s'écrivaient dans deux formats : « 1234
     // cartes · ~56 789 wb ».
-    sellUI.sum.textContent = `${rows.length.toLocaleString('fr-FR')} cartes · ~${valeur.toLocaleString('fr-FR')} wb${age}${couv}${conc}`
-      + (sell.note ? ` · ${sell.note}` : '');
+    const fig = (v, l, due) =>
+      `<div class="f${due ? ' due' : ''}"><b>${esc(v)}</b><span>${esc(l)}</span></div>`;
+    paint(sellUI.sum,
+      fig(rows.length.toLocaleString('fr-FR'), 'cartes')
+      + fig(`~${valeur.toLocaleString('fr-FR')}`, 'wb estimés')
+      + (age ? fig(age, c ? `cote · ${c.pct} % de vos cartes` : 'cote', !!c) : '')
+      + (sell.compAt
+        ? fig(fmtSpan(Date.now() - sell.compAt), 'concurrence', sell.compTronque)
+        : fig('—', 'concurrence', true)));
+    sellUI.caveat.hidden = !alertes.length;
+    paint(sellUI.caveat, alertes.map((a) => `<span>${esc(a)}</span>`).join(''));
 
     if (!rows.length) {
       /*
@@ -10560,10 +11156,24 @@
          <th class="num">En vente</th><th class="num">Prix visé</th>
          <th class="num">Médiane</th><th>Amplitude</th><th></th>
        </tr></thead><tbody>` +
-      rows
+      /*
+       * Le surlignage « à lister maintenant » comptait les premières lignes du
+       * tableau, sans regarder si elles étaient listables. Il désignait donc
+       * des cartes étiquetées — qui n'ont même pas de bouton — et des cartes
+       * dont l'enchère courait déjà. Autant de lignes vertes qui ne menaient à
+       * rien, et autant d'emplacements libres promis à personne.
+       *
+       * On décompte maintenant sur ce qui est réellement à faire.
+       */
+      (() => { let restants = libres || 0; return rows
         .map(
-          (x, i) => `<tr class="${libres && i < libres ? 'next' : ''}">
-            <td class="r" style="color:${RARITY_COLOR[x.r] || '#949DAD'}">${x.r}</td>
+          (x) => {
+            const dejaEnVente = mesVentes.has(x.id);
+            const listable = !dejaEnVente && !x.tags.length;
+            const aLister = listable && restants > 0;
+            if (aLister) restants -= 1;
+            return `<tr class="${aLister ? 'next' : ''}">
+            <td class="r"><i style="--c:${RARITY_COLOR[x.r] || '#949DAD'}">${x.r}</i></td>
             <td class="t">${esc(x.t)} ${x.tags.map((t) => `<span class="tag">${esc(t)}</span>`).join('')}</td>
             <td class="th">${
               x.theme
@@ -10583,10 +11193,13 @@
             <td class="amp">${x.min.toLocaleString('fr-FR')} – ${x.max.toLocaleString('fr-FR')}</td>
             <td>${x.tags.length
               ? `<span class="protege" title="Carte étiquetée : hors de portée de la revente. Retire l’étiquette sur le site pour pouvoir la vendre.">protégée</span>`
-              : `<button class="go" data-sell="${esc(x.t)}" data-prix="${x.q3 || x.med}">Vendre</button>`}</td>
-          </tr>`
+              : dejaEnVente
+                ? `<span class="encours" title="Votre enchère court déjà sur cette carte. Elle occupe un de vos emplacements de vente ; son échéance est dans l’onglet Marché, volet Ventes.">en vente</span>`
+                : `<button class="go" data-sell="${esc(x.t)}" data-prix="${x.q3 || x.med}">Vendre</button>`}</td>
+          </tr>`;
+          }
         )
-        .join('') +
+        .join(''); })() +
       '</tbody></table>');
   }
 
