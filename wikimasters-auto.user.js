@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WikiMasters Tools
 // @namespace    https://www.wiki-masters.com/
-// @version      3.0.0
+// @version      3.1.1
 // @description  Boîte à outils WikiMasters : ouverture automatique des paquets, suivi des tirages, cote des cartes et revente.
 // @match        https://www.wiki-masters.com/*
 // @match        https://wiki-masters.com/*
@@ -41,7 +41,7 @@
    *
    * Il est lu par le garde juste en dessous, d'où sa place en tête.
    */
-  const VERSION = '3.0.0';
+  const VERSION = '3.1.1';
 
   /*
    * Une seule instance par page — et savoir laquelle
@@ -435,6 +435,17 @@
     folded: false,
     tab: 'paquets',       // onglet actif : paquets | succes | marche | guilde | reglages
     mktSub: 'ench',       // volet du Marché : ench | vent | rel
+    /*
+     * Le journal des relances, replié par défaut.
+     *
+     * Six issues, dont les refus et les baisses prennent deux lignes chacun :
+     * il occupait la moitié du volet en permanence, au-dessus du bouton
+     * Revente et sous les cartes suivies — soit entre les deux choses qu'on
+     * vient y faire. On le consulte de temps en temps, pas à chaque coup d'œil.
+     * Son intitulé porte le compte, donc replié il dit encore s'il s'est passé
+     * quelque chose.
+     */
+    relistLogOuvert: false,
   };
 
   // ------------------------------------------------------------- préférences
@@ -562,6 +573,7 @@
     if (Array.isArray(s.publiees)) state.publiees = s.publiees;
     restoreLot(s.lot);
     if (['ench', 'vent', 'rel', 'souh'].includes(s.mktSub)) prefs.mktSub = s.mktSub;
+    if (typeof s.relistLogOuvert === 'boolean') prefs.relistLogOuvert = s.relistLogOuvert;
     // Reprise de l'ancien réglage à étiquette unique.
     if (typeof s.sellHideTag === 'string' && s.sellHideTag) sellPrefs.hideTags = [s.sellHideTag];
     if (Array.isArray(s.sellHideTags)) sellPrefs.hideTags = s.sellHideTags;
@@ -4734,6 +4746,14 @@
     // Vrai tant que cette boucle-ci est la boucle courante.
     const mine = () => state.running && epoch === loopEpoch;
 
+    /*
+     * Refus consécutifs dont l'échéance était déjà passée. Il autorise UNE
+     * relecture du profil par série : si le profil et l'ouverture se
+     * contredisent durablement, insister remplacerait un martèlement par un
+     * autre. Remis à zéro dès qu'un paquet s'ouvre.
+     */
+    let refusPerimes = 0;
+
     while (mine()) {
       /*
        * Le verrou, repris à CHAQUE tour — pas seulement au démarrage.
@@ -4866,6 +4886,7 @@
         // reste à jour sans relevé complet.
         priceCards(data.cards.map((c) => ({ id: c.id, t: c.wikipedia_title, r: c.rarity, tags: [] })));
         setStatus('Paquet ouvert');
+        refusPerimes = 0;   // la série de refus périmés est close
         await sleep(jittered(state.delayMs));
         continue;
       }
@@ -4877,10 +4898,50 @@
           learnCadence(target);
           state.nextRegenAt = target;
         }
-        // Sans échéance annoncée, on attend une cadence mesurée plutôt qu'un
-        // délai fixe : 90 s de repli feraient sept sondages inutiles par cycle
-        // sur un compte sans PRO, où la régénération prend dix minutes.
-        const deadline = Number.isFinite(target) ? target : Date.now() + state.cadenceMs;
+        /*
+         * Sans échéance annoncée, on attend une cadence mesurée plutôt qu'un
+         * délai fixe : 90 s de repli feraient sept sondages inutiles par cycle
+         * sur un compte sans PRO, où la régénération prend dix minutes.
+         *
+         * Une échéance DÉJÀ PASSÉE compte pour non annoncée, et c'est le point.
+         *
+         * `waitUntil` sort aussitôt d'une échéance dans le passé — sa boucle
+         * ne s'exécute pas une fois — et la boucle repostait donc sur-le-champ,
+         * sans le moindre délai. Plus rien ne la freinait que le refus du
+         * serveur : 403, retente immédiate, 429, léger recul, 403 encore.
+         * Relevé dans la console d'un vrai compte, en alternance serrée, là où
+         * un refus doit produire un silence de plusieurs minutes.
+         *
+         * On ne peut pas savoir d'ici POURQUOI le serveur rend un horodatage
+         * périmé — réserve épuisée qu'il n'a pas recréditée, compte bridé,
+         * horloges décalées. Mais aucune de ces raisons ne justifie de le
+         * marteler : on retombe sur la cadence mesurée, exactement comme
+         * lorsqu'il n'annonce rien du tout.
+         */
+        const annoncee = Number.isFinite(target) && target > Date.now();
+        const deadline = annoncee ? target : Date.now() + state.cadenceMs;
+
+        /*
+         * Échéance périmée : avant d'attendre une cadence en aveugle, on
+         * DEMANDE. Le profil porte `packs_remaining` et se lit par une requête
+         * ordinaire — pas par l'ouverture, qui est l'endpoint que le serveur
+         * limite. Si le profil dit qu'il en reste, le refus était en retard sur
+         * lui-même : on repart sans attendre trois minutes pour rien.
+         *
+         * Une seule relecture par série, et jamais plus vite que le délai
+         * mesuré. Si l'ouverture et le profil se contredisent durablement,
+         * insister ne ferait que remplacer un martèlement par un autre : au
+         * second refus périmé d'affilée, on attend pour de bon.
+         */
+        if (!annoncee && refusPerimes === 0) {
+          refusPerimes += 1;
+          const prof = await refreshPacks(true);
+          if (!mine()) return;
+          if (prof && state.reserve > 0) {
+            await sleep(jittered(state.delayMs));
+            continue;
+          }
+        }
         await waitUntil(deadline, 'Prochain paquet dans', mine);
         continue;
       }
@@ -5141,6 +5202,22 @@
   const PANEL_CSS = `
     :host { all: initial; }
     * { box-sizing: border-box; margin: 0; }
+
+    /*
+     * « hidden » cache pour de bon.
+     *
+     * L'attribut ne doit son effet qu'à une règle de la feuille par défaut du
+     * navigateur, et TOUTE règle d'auteur qui pose un « display » la bat —
+     * « .opt { display: flex } » suffit. Un élément marqué caché restait donc
+     * à l'écran, et c'est silencieux : le code croit l'avoir retiré.
+     *
+     * Le fichier le rattrapait jusqu'ici classe par classe — « .maj[hidden] »,
+     * « .openrar[hidden] », « .revente[hidden] », « .relist[hidden] »… Autant
+     * de correctifs identiques, et un de plus à écrire à chaque fois qu'on
+     * cache quelque chose. La règle est posée une fois, elle vaut pour tout ce
+     * qui viendra.
+     */
+    [hidden] { display: none !important; }
 
     .panel {
       --bg: rgba(13,15,19,.94);
@@ -5811,7 +5888,8 @@
     .relist li.wait .dot { background: var(--dim); }
     .relist li.pause .dot { background: var(--warn); opacity: .5; }
     .relist li.stop .dot { background: var(--dim); }
-    .relist .st { flex: none; font-size: 10px; color: var(--dim); }
+    .relist .st { flex: none; font-size: 10px; color: var(--dim);
+                  font-variant-numeric: tabular-nums; }
     .relist li.ok .st { color: var(--live); }
     .relist li.pause .st { color: var(--warn); }
     /* 20 px, pas 16 : ✕ retire la carte du suivi, et c'était la plus petite
@@ -5830,6 +5908,51 @@
       background: var(--raise); border: 1px solid var(--line); border-radius: var(--r-sm); cursor: pointer;
     }
     .relist .ra button:hover { color: var(--text); background: rgba(255,255,255,.09); }
+
+    /*
+     * Les sept durées. Elles s'enroulent : à 260 px il en tient trois par
+     * ligne, à 640 les sept d'un coup — c'est une rangée de choix, pas un
+     * tableau, rien ne dépend de leur alignement.
+     *
+     * La durée armée prend l'ambre, celle des gestes qui engagent, et double
+     * la couleur d'une coche : le second clic annule des enchères, il ne doit
+     * pas se distinguer du premier par la seule intensité d'un fond.
+     */
+    .relist .duree { display: flex; flex-wrap: wrap; align-items: center; gap: 4px;
+                     margin-bottom: 7px; }
+    .relist .duree > span { flex-basis: 100%; margin-bottom: 1px;
+                            font-size: 10px; color: var(--dim); }
+    .relist .duree button {
+      padding: 4px 8px; border: 1px solid var(--line); border-radius: var(--r-sm);
+      background: var(--raise); color: var(--muted);
+      font: 500 10.5px/1 var(--sans); font-variant-numeric: tabular-nums;
+      cursor: pointer; transition: .14s;
+    }
+    .relist .duree button:hover { color: var(--text); background: rgba(255,255,255,.09); }
+    .relist .duree button.arme {
+      color: var(--warn); border-color: var(--warn);
+      background: color-mix(in srgb, var(--warn) 14%, transparent);
+    }
+
+    /*
+     * L'intitulé du journal, devenu la poignée qui le déplie. Il garde
+     * l'apparence d'un intertitre — il n'a pas à se déguiser en bouton dans un
+     * volet qui en porte déjà cinq — et ne le trahit que par son chevron et le
+     * compte, qui dit s'il s'est passé quelque chose sans qu'on l'ouvre.
+     */
+    .relist .jtoggle {
+      display: flex; align-items: center; gap: 6px; width: 100%;
+      margin: 9px 0 4px; padding: 8px 0 0;
+      border: 0; border-top: 1px solid var(--line); background: none;
+      color: var(--muted); font: 600 11px var(--sans); text-align: left; cursor: pointer;
+    }
+    .relist .jtoggle:hover { color: var(--text); }
+    .relist .jtoggle i { font-style: normal; font-size: 10px; color: var(--dim); }
+    .relist .jtoggle span {
+      margin-left: auto; padding: 1px 6px; border-radius: 999px;
+      background: rgba(255,255,255,.07); color: var(--dim);
+      font-size: 10px; font-weight: 600; font-variant-numeric: tabular-nums;
+    }
 
     .goal .top { display: flex; gap: 8px; align-items: baseline; }
     .goal .name { font-size: 12px; font-weight: 600; }
@@ -6108,12 +6231,30 @@
             <div class="relist" data-relist></div>
             <button class="revente" data-revente>Revente — cote de vos cartes</button>
             <div class="mkfoot" data-mkfoot></div>
+            <!--
+              Un seul interrupteur à la fois : celui du volet ouvert.
+
+              Les trois s'affichaient ensemble et s'enroulaient sur deux lignes
+              dès 300 px, sous un onglet qui empile déjà le plus de choses.
+              Deux d'entre eux ne commandaient rien de ce qu'on avait sous les
+              yeux.
+
+              Ils restent ICI, et ne repartent pas dans les Réglages : le volet
+              éteint dit « Cochez Surveillance en bas de cet onglet », et cette
+              phrase n'a de sens que si la case y est. C'est le correctif qu'ils
+              avaient valu la première fois — on garde le remède à portée de qui
+              voit le problème, on ne montre simplement plus les deux autres.
+
+              L'attribut « data-mopt » porte les volets que chaque option
+              commande. (Pas d'accent grave ici : ce commentaire vit dans un
+              littéral de gabarit, et le premier fermerait la chaîne.)
+            -->
             <div class="mopt">
-              <label class="opt" title="Relève enchères et ventes. Ne touche à rien tant que vous regardez : il ne change d’onglet et ne recharge qu’en arrière-plan, après une minute d’absence.">
+              <label class="opt" data-mopt="ench vent" title="Relève enchères et ventes. Ne touche à rien tant que vous regardez : il ne change d’onglet et ne recharge qu’en arrière-plan, après une minute d’absence.">
                 <input type="checkbox" data-opt-bids> Surveillance</label>
-              <label class="opt" title="Une vente terminée sans acheteur est relancée au même prix et pour la même durée — le prix que vous avez choisi, jamais un autre. Après deux invendus d'affilée, le volet Relances propose un prix plus bas ; il ne s'applique que si vous cliquez.">
+              <label class="opt" data-mopt="rel" title="Une vente terminée sans acheteur est relancée au même prix et pour la même durée — le prix que vous avez choisi, jamais un autre. Après deux invendus d'affilée, le volet Relances propose un prix plus bas ; il ne s'applique que si vous cliquez.">
                 <input type="checkbox" data-opt-relist> Relances auto</label>
-              <label class="opt" title="Signale les cartes de votre liste de souhaits mises aux enchères. Lit le marché récent, sans rien y publier.">
+              <label class="opt" data-mopt="souh" title="Signale les cartes de votre liste de souhaits mises aux enchères. Lit le marché récent, sans rien y publier.">
                 <input type="checkbox" data-opt-wish> Souhaits</label>
             </div>
           </section>
@@ -6285,10 +6426,48 @@
         }
         return render();
       }
+      if (e.target.closest('[data-journal-toggle]')) {
+        prefs.relistLogOuvert = !prefs.relistLogOuvert;
+        saveStore({ relistLogOuvert: prefs.relistLogOuvert });
+        return render();
+      }
       if (e.target.closest('[data-watch-all]')) return void watchCurrentSales();
       if (e.target.closest('[data-unwatch-all]')) {
         for (const c of Object.keys(state.watch)) dropWatch(c, null);
         return render();
+      }
+      /*
+       * Repasser toutes les ventes à une autre durée, en deux temps.
+       *
+       * Le premier clic ARME la durée choisie et le libellé annonce combien de
+       * ventes sont concernées ; le second, sur la même durée, agit. Choisir
+       * une autre durée pendant l'armement déplace la cible au lieu de partir :
+       * sept boutons collés se cliquent de travers, et une annulation ne se
+       * reprend pas.
+       */
+      const dur = e.target.closest('[data-duree]');
+      if (dur) {
+        const minutes = Number(dur.dataset.duree);
+        if (repasseArme !== minutes) {
+          repasseArme = minutes;
+          clearTimeout(repasseTimer);
+          repasseTimer = setTimeout(() => { repasseArme = 0; render(); }, 6000);
+          return render();
+        }
+        repasseArme = 0;
+        clearTimeout(repasseTimer);
+        render();
+        repasserToutEn(minutes).then((r) => {
+          state.bidNote = r.refus
+            ? r.refus
+            : `${r.annulees} vente${r.annulees > 1 ? 's' : ''} repassée${r.annulees > 1 ? 's' : ''} en `
+              + `${fmtDuree(r.minutes)}`
+              + (r.misees ? ` · ${r.misees} gardée${r.misees > 1 ? 's' : ''}, une mise court dessus` : '')
+              + (r.refusees ? ` · ${r.refusees} refusée${r.refusees > 1 ? 's' : ''} par le serveur` : '');
+          state.bidNoteAt = Date.now();
+          render();
+        });
+        return;
       }
     });
 
@@ -8261,8 +8440,30 @@
    */
   function renderMarket() {
     const sub = prefs.mktSub;
+    // Seul l'interrupteur du volet ouvert reste à l'écran — voir `data-mopt`.
+    for (const l of ui.panel.querySelectorAll('[data-mopt]')) {
+      l.hidden = !l.dataset.mopt.split(' ').includes(sub);
+    }
     const bids = stillRunning(state.bids.list);
-    const sales = stillRunning(state.sales.list);
+    /*
+     * Les ventes ne disparaissent PAS à la seconde où leur compte atteint zéro.
+     *
+     * La pastille du volet répète `sellingCount`, l'instantané du serveur, qui
+     * ne vieillit pas entre deux relevés. La liste, elle, était passée à
+     * `stillRunning`, qui retire une ligne dès que son échéance est franchie —
+     * seconde par seconde, dans le navigateur. Deux vues du MÊME relevé, dont
+     * une seule vieillissait : l'écart se creusait en continu, et on lisait
+     * « Ventes 5 » au-dessus de trois lignes.
+     *
+     * Une enchère close n'a d'ailleurs pas disparu : elle attend que le serveur
+     * la tranche, et elle occupe encore son emplacement — c'est bien pourquoi
+     * le serveur la compte. On la garde donc à l'écran le temps qu'il s'est
+     * donné pour trancher, `SETTLE_MS`, et le rendu la grise : la classe
+     * « done » et son point éteint existaient déjà pour ce cas, sans que rien
+     * ne puisse jamais les atteindre.
+     */
+    const sales = (state.sales.list || []).filter(
+      (x) => x.end == null || x.end > Date.now() - SETTLE_MS);
     const souhaits = stillRunning(state.wishHits.list);
     const perdues = bids.filter((b) => b.status === 'surencheri').length;
     const menees = bids.length - perdues;
@@ -8542,12 +8743,26 @@
       const infobulle = `${w.title} — annonce de ${w.minutes || 10} min à ${w.price} wb` +
         (w.invendus ? ` · invendue ${w.invendus} fois` : '') +
         (w.paused ? ` · en pause après ${w.fails} tentatives` : '');
+      /*
+       * Pour une carte en vente, le compte à rebours REMPLACE les mots.
+       *
+       * La ligne portait « en vente » ET l'échéance dans deux colonnes
+       * voisines — deux façons de dire la même chose. Et la seconde était
+       * masquée sous 310 px, c'est-à-dire à la largeur par défaut du panneau :
+       * le compteur existait et ne se voyait jamais. Il avait été retiré parce
+       * que les colonnes de précision mangeaient le titre, à l'époque où la
+       * ligne portait aussi le nombre d'échecs.
+       *
+       * Le point vert dit déjà « en vente ». Les mots partent, le compteur
+       * prend leur place, et la ligne ne s'élargit pas d'un pixel.
+       */
+      const enCompte = enLigne && info;
       return `<li class="${cls}" title="${esc(infobulle)}">
         <span class="dot"></span>
         <span class="t">${esc(w.title)}</span>
         <span class="p">${w.price} wb</span>
-        <span class="st">${etat}</span>
-        <span class="w">${info}</span>
+        <span class="st">${enCompte ? info : etat}</span>
+        <span class="w">${enCompte ? '' : info}</span>
         ${w.paused
           ? `<button class="x" data-retry="${esc(card)}" title="Reprendre le suivi : remet le compteur d'échecs à zéro">↻</button>`
           : ''}
@@ -8559,6 +8774,16 @@
     const actions =
       (aInscrire ? `<button data-watch-all>+ Suivre mes ${aInscrire} vente${aInscrire > 1 ? 's' : ''}</button>` : '') +
       (suivies.length ? `<button data-unwatch-all>Tout arrêter</button>` : '');
+
+    /*
+     * Combien de ventes le geste toucherait vraiment. Celles qui portent une
+     * mise n'en sont pas : le serveur refuse de les annuler, et c'est juste —
+     * on ne retire pas sa carte à quelqu'un qui s'est engagé. Les annoncer
+     * dans le compte promettrait ce qui n'arrivera pas.
+     */
+    const ventesAnnulables = frais
+      ? ventes.filter((v) => v.card && v.auction && !v.offered).length
+      : 0;
 
     /*
      * Une ligne de journal montrait un titre, un prix et un âge — jamais ce qui
@@ -8608,12 +8833,37 @@
       (entete ? `<span class="${entCls}">${entete}</span>` : '') +
       `</div>` +
       (actions ? `<div class="ra">${actions}</div>` : '') +
+      /*
+       * Repasser toutes les ventes à une autre durée.
+       *
+       * Sept boutons plutôt qu'une liste déroulante : ce sont les sept mêmes
+       * que le formulaire du site, dans le même ordre — on choisit ici ce
+       * qu'on choisirait là-bas, sans avoir à traduire.
+       *
+       * Deux temps, comme « Réinitialiser » : une annulation est définitive
+       * pour l'enchère en cours, et sept cibles serrées côte à côte se cliquent
+       * de travers. Le premier clic arme et annonce ce qui va arriver, le
+       * second agit — et l'armement retombe seul.
+       */
+      (ventesAnnulables
+        ? `<div class="duree"><span>${repasseArme
+            ? `Repasser ${ventesAnnulables} vente${ventesAnnulables > 1 ? 's' : ''} en`
+            : 'Tout repasser en'}</span>` +
+          DUREES.map((d) => `<button data-duree="${d.minutes}"${
+            repasseArme === d.minutes ? ' class="arme"' : ''}>${
+            repasseArme === d.minutes ? '✓ ' : ''}${d.label}</button>`).join('') +
+          '</div>'
+        : '') +
       (lignes.length
         ? `<ul class="suivi">${lignes.join('')}</ul>`
         : `<div class="empty">Aucune carte suivie. ${prefs.relistUnsold
             ? `Une vente qui se termine sans acheteur s'inscrit toute seule.`
             : `Cochez « Relances auto » en bas pour que les ventes sans acheteur s'inscrivent seules.`}</div>`) +
-      (journal.length ? `<div class="rh sub">Journal</div><ul>${journal.join('')}</ul>` : ''));
+      (journal.length
+        ? `<button class="jtoggle" data-journal-toggle aria-expanded="${!!prefs.relistLogOuvert}">`
+          + `<i>${prefs.relistLogOuvert ? '▾' : '▸'}</i>Journal<span>${log.length}</span></button>`
+          + (prefs.relistLogOuvert ? `<ul>${journal.join('')}</ul>` : '')
+        : ''));
   }
 
   /** Compte à rebours recalculé depuis l'échéance absolue, jamais décrémenté. */
@@ -8824,6 +9074,100 @@
     return new Map([...owned.map, ...m]);
   }
 
+  /**
+   * Tout repasser à une autre durée.
+   *
+   * Le geste du soir : la journée on vend en dix minutes, le soir on veut la
+   * même chose en une heure. À la main, c'est ouvrir chaque enchère, cliquer
+   * « Annuler et récupérer ma carte », rouvrir la fiche, relancer, choisir la
+   * durée — pour chacune.
+   *
+   * Ce qu'on NE fait pas ici : republier. Annuler suffit, parce que la boucle
+   * de relance sait déjà tout le reste — retrouver l'exemplaire possédé,
+   * compter les emplacements, écarter les cartes étiquetées, réessayer quand le
+   * serveur tarde à rendre la carte, journaliser l'issue. Écrire un second
+   * chemin de publication à côté du premier, c'était deux fois les mêmes
+   * garde-fous et une occasion de les désaccorder. On pose la durée sur le
+   * suivi, on annule, et la machine existante fait le travail à la durée neuve.
+   *
+   * D'où la condition d'entrée : sans « Relances auto », rien ne republierait
+   * et les cartes resteraient en collection. On refuse plutôt que de laisser
+   * quelqu'un vider ses ventes sans retour.
+   */
+  async function repasserToutEn(minutes) {
+    if (!prefs.relistUnsold) {
+      return { refus: 'Cochez « Relances auto » d’abord : sans elle, rien ne remettrait vos cartes en vente.' };
+    }
+    const frais = Date.now() - state.sales.at < 120000;
+    const ventes = (state.sales.list || []).filter((v) => v.card && v.auction);
+    if (!frais || !ventes.length) {
+      return { refus: 'Aucune vente en cours connue — attendez le prochain relevé du Marché.' };
+    }
+
+    let annulees = 0;
+    let misees = 0;
+    let refusees = 0;
+
+    for (const v of ventes) {
+      // La durée est posée AVANT l'annulation : si le tour de relance passe
+      // entre les deux, il republie déjà à la bonne durée.
+      const w = state.watch[v.card];
+      if (w) w.minutes = minutes;
+      else enrolWatch(v.card, v.title, v.price, minutes, 0);
+
+      /*
+       * Une mise déjà posée interdit l'annulation, côté serveur. On ne tente
+       * même pas : la requête serait refusée, et surtout la carte appartient
+       * moralement à l'enchère en cours. Elle repartira à la durée neuve quand
+       * celle-ci se terminera sans acheteur.
+       */
+      if (v.offered) { misees += 1; continue; }
+
+      const r = await annulerVente(v.auction);
+      if (r.ok) {
+        annulees += 1;
+        state.slots.used = Math.max(0, state.slots.used - 1);
+        delete state.lastListing[v.card];
+        if (state.watch[v.card]) state.watch[v.card].auction = null;
+        logRelist(v.title, 'stop', v.price, `annulée pour repasser en ${fmtDuree(minutes)}`);
+      } else {
+        refusees += 1;
+        logRelist(v.title, 'refus', v.price,
+          r.status === 0 ? 'réseau' : `le serveur a refusé l’annulation (${r.status})`);
+      }
+      /*
+       * Les annulations suivent le rythme du MARCHÉ, pas celui des paquets.
+       * `state.delayMs` est calé sur `/api/packs/open` et n'a rien à dire ici :
+       * une annulation frappe la même API que les mises en vente, donc le même
+       * intervalle — 7 à 12 s, tiré au hasard comme elles.
+       */
+      const [bas, haut] = CFG.relistGapMs;
+      await sleep(bas + Math.random() * (haut - bas));
+    }
+
+    saveStore({ watch: state.watch, relistLog: state.relistLog, lastListing: state.lastListing });
+    // Le prochain tour republie : on ne le fait pas attendre son repos.
+    state.nextRelistAt = 0;
+    reconcileWatch();
+    return { annulees, misees, refusees, minutes };
+  }
+
+  /** « 90 » → « 1 h 30 ». Pour dire une durée d'annonce à l'écran. */
+  function fmtDuree(min) {
+    const t = DUREES.find((d) => d.minutes === min);
+    if (t) return t.label;
+    return min < 60 ? `${min} min` : `${Math.floor(min / 60)} h${min % 60 ? ` ${min % 60}` : ''}`;
+  }
+
+  /*
+   * La durée actuellement ARMÉE, et sa minuterie de désarmement. Elles vivent
+   * ici et non dans `state` : un armement ne survit pas à un rechargement de
+   * page, et l'écrire dans le stockage ferait repartir la Revente avec un
+   * geste destructeur à moitié engagé.
+   */
+  let repasseArme = 0;
+  let repasseTimer = 0;
+
   const RELIST_LOG_MAX = 40;
 
   /* Une relance est une action sortante : son issue doit se lire d'un coup
@@ -8856,6 +9200,46 @@
    * vendue ailleurs, retirée à la main, ou disparue de la collection.
    */
   const WATCH_PAUSE_TTL = 604800000;   // 7 jours
+  const WATCH_PAUSE_RETRY = 1800000;   // 30 min : la pause se desserre seule, voir reconcileWatch
+
+  /*
+   * Les sept durées que le site propose, relevées sur son propre formulaire de
+   * mise aux enchères — sept boutons, pas une liste déroulante, et « 1 h »
+   * présélectionnée. Le champ envoyé est un entier libre ; ce sont ces
+   * valeurs-là qu'un joueur peut choisir à la main, donc les seules qu'on
+   * propose ici.
+   */
+  const DUREES = [
+    { label: '10 min', minutes: 10 },
+    { label: '30 min', minutes: 30 },
+    { label: '1 h', minutes: 60 },
+    { label: '3 h', minutes: 180 },
+    { label: '6 h', minutes: 360 },
+    { label: '12 h', minutes: 720 },
+    { label: '24 h', minutes: 1440 },
+  ];
+
+  /**
+   * Annule une enchère et récupère la carte.
+   *
+   * Le site ne l'offre PAS depuis la liste « Mes ventes » : le bouton
+   * « Annuler et récupérer ma carte » vit sur la page de l'enchère elle-même,
+   * un clic plus loin. C'est sa route.
+   *
+   * Une enchère qui porte déjà une mise ne s'annule pas — le serveur le refuse
+   * aux joueurs, et c'est très bien : on ne retire pas sa carte à quelqu'un qui
+   * s'est engagé. On n'essaie donc même pas quand on sait qu'il y a une mise,
+   * et on encaisse le refus sans le traiter comme une panne quand on l'ignore.
+   */
+  async function annulerVente(auctionId) {
+    if (!auctionId) return { ok: false, status: 0 };
+    try {
+      const r = await api(`/api/marketplace/${auctionId}`, 'DELETE');
+      return { ok: r.status >= 200 && r.status < 300, status: r.status, data: r.data };
+    } catch (_) {
+      return { ok: false, status: 0 };
+    }
+  }
   /*
    * Un prix demandé attend l'issue que la notification apporte — et
    * `/api/notifications` n'en garde que cinquante. Une notification manquée
@@ -9082,6 +9466,36 @@
         state.watch[c].seenListedAt = Date.now();
       }
 
+      /*
+       * La pause se lève d'elle-même.
+       *
+       * Elle était TERMINALE : vingt échecs d'affilée — le plus souvent « carte
+       * introuvable en collection », qui arrive quand le serveur tarde à la
+       * rendre après une clôture — et la carte s'arrêtait là. Il fallait aller
+       * cliquer ↻ sur chacune, une par une, ou attendre sept jours qu'elle soit
+       * simplement oubliée. C'est la corvée, et elle punissait une lenteur du
+       * serveur comme une erreur définitive.
+       *
+       * La supprimer tout court ferait réessayer sans fin une carte réellement
+       * partie. On garde donc le frein, mais on le desserre seul : après
+       * `WATCH_PAUSE_RETRY`, les compteurs repartent à zéro et la carte
+       * retente. Une carte vraiment absente coûte alors deux tentatives par
+       * heure au lieu d'une toutes les quinze secondes — et plus personne n'a
+       * à cliquer.
+       */
+      let reveillees = 0;
+      for (const c of ids) {
+        const w = state.watch[c];
+        if (w.paused && Date.now() - (w.pausedAt || 0) > WATCH_PAUSE_RETRY) {
+          w.paused = false;
+          w.fails = 0;
+          reveillees += 1;
+        }
+      }
+      // Écrit ici, et non par le drapeau du bas : ce tour peut rendre la main
+      // avant lui — quand il n'y a rien à replacer — et le réveil serait perdu.
+      if (reveillees) saveStore({ watch: state.watch });
+
       const manquantes = ids.filter(
         (c) => !dejaEnLigne(c, enVente) && !state.watch[c].paused
       );
@@ -9294,6 +9708,23 @@
    * moment par d'autres joueurs. Le marché est dispersé — 14 500 enchères pour
    * 13 600 cartes distinctes — donc une carte sans concurrence peut être
    * proposée haut et attendre son acheteur, ce qui est tout l'intérêt.
+   *
+   * « par d'autres joueurs » est MESURÉ, pas supposé.
+   *
+   * Rien ici ne filtre le vendeur : on additionne toutes les annonces que
+   * `/api/marketplace` rend. La question s'est posée de savoir si nos propres
+   * annonces s'y trouvaient — auquel cas une carte que l'on est seul à vendre
+   * afficherait « En vente 1 » en ambre, et paraîtrait disputée par soi-même.
+   *
+   * Éprouvé sur le compte réel le 9 septembre 2026 : une carte mise en vente,
+   * que personne d'autre ne proposait, garde « — » après un relevé neuf
+   * (`sell.compAt = 0` puis réouverture, pour passer outre les dix minutes de
+   * cache ci-dessous — sans quoi l'observation ne prouve rien). L'API exclut
+   * donc le vendeur qui l'interroge.
+   *
+   * Conséquence pratique : NE PAS soustraire ses propres annonces de ce
+   * compte. Ce serait corriger une erreur qui n'existe pas, et en créer une —
+   * un sous-comptage, cette fois.
    */
   const MARKET_TTL = 600000;
 
