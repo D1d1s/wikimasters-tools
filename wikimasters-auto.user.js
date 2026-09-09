@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WikiMasters Tools
 // @namespace    https://www.wiki-masters.com/
-// @version      2.15.0
+// @version      2.16.0
 // @description  Boîte à outils WikiMasters : ouverture automatique des paquets, suivi des tirages, cote des cartes et revente.
 // @match        https://www.wiki-masters.com/*
 // @match        https://wiki-masters.com/*
@@ -41,7 +41,7 @@
    *
    * Il est lu par le garde juste en dessous, d'où sa place en tête.
    */
-  const VERSION = '2.15.0';
+  const VERSION = '2.16.0';
 
   /*
    * Une seule instance par page — et savoir laquelle
@@ -901,6 +901,14 @@
       // Le total sert uniquement à afficher une progression honnête.
       const { data } = await api('/api/my-collection/stats');
       valueTotal = (data && data.total) || 0;
+      /*
+       * Le même nombre sert à dire ce que la cote couvre. Le prendre au passage
+       * évite une seconde requête, et surtout : sans lui, l'avertissement du
+       * tri par prix ne pourrait s'afficher qu'après une ouverture de la
+       * Revente — c'est-à-dire jamais, pour qui trie sa collection sans jamais
+       * passer par elle.
+       */
+      if (valueTotal > 0) sell.owned = { n: valueTotal, at: Date.now() };
 
       const cartes = await fetchCollectionRaw((n) => {
         valueRead = n;
@@ -1102,6 +1110,12 @@
     if (!location.pathname.startsWith('/collection')) return;
     const row = document.querySelector(FILTER_ROW);
     if (!row) return;
+    /*
+     * L'avertissement doit être là AVANT qu'on se fie au tri, pas après l'avoir
+     * allumé une fois. Une requête, gardée cinq minutes, et seulement s'il y a
+     * une cote dont on puisse dire quelque chose.
+     */
+    if (sell.rows.length) refreshOwned();
 
     let btn = row.querySelector('[data-wm-value-sort]');
     if (!btn) {
@@ -1169,10 +1183,23 @@
         + 'Le tri s’allume ensuite.';
     } else {
       b.textContent = 'Prix ↓';
+      /*
+       * « les cartes jamais vendues passent derrière » était vrai et
+       * insuffisant : il laissait croire que le reste, lui, est classé. Quand
+       * la cote couvre 17 % de la collection, ce sont quatre cartes sur cinq
+       * qui tombent en fin de liste, et l'infobulle promettait un tri de tout.
+       * Le chiffre est ici parce que c'est ici qu'on décide de s'y fier.
+       */
+      const cv = couvertureDistancee();
+      const part = cv
+        ? ` Attention : la cote ne couvre que ${cv.vues.toLocaleString('fr-FR')} de vos `
+          + `${cv.total.toLocaleString('fr-FR')} cartes — les ${cv.manquantes.toLocaleString('fr-FR')} `
+          + 'autres tombent en fin de liste faute de prix. « Rafraîchir la cote », dans la Revente, les relève.'
+        : '';
       b.title = byValue
         ? 'Collection entière triée par moyenne des ventes — les cartes jamais vendues passent '
           + `derrière. Classement établi il y a ${fmtSpan(Date.now() - valueAt)} : éteignez puis `
-          + 'rallumez pour le refaire.'
+          + 'rallumez pour le refaire.' + part
         : valueFail
           ? sell.tronque
             ? 'Lecture de la collection incomplète — le serveur a ralenti l’outil. '
@@ -1180,7 +1207,9 @@
             : sell.refus
               ? 'Le serveur a refusé de lire votre collection — réessayez'
               : 'La lecture de la collection a échoué — réessayez'
-          : 'Trier toute la collection par moyenne des ventes, la plus chère en tête';
+          // Le point : sans lui, l'avertissement se collait à la phrase —
+          // « la plus chère en tête Attention : la cote… », relevé à l'écran.
+          : 'Trier toute la collection par moyenne des ventes, la plus chère en tête.' + part;
     }
 
     b.style.cssText = valueBusy || sell.scanning
@@ -9091,6 +9120,26 @@
   const sell = { open: false, scanning: false, done: 0, total: 0, read: 0, rows: [], at: 0, tags: [],
                  checked: new Set(), themes: {}, comp: new Map(), compAt: 0, compTronque: false,
                  prunedAt: 0,   // dernière vérification de ce qui est encore possédé
+                 /*
+                  * De quoi dire si la cote est DISTANCÉE.
+                  *
+                  * `sell.at` répond « de quand date la dernière cote », jamais
+                  * « sur quelle part de la collection ». Or la cote se remplit
+                  * cinq cartes par paquet ouvert : entre deux relevés complets
+                  * elle décroche à mesure que la collection grossit, et rien ne
+                  * le disait. Mesuré sur le compte réel : 17 % de N lignes,
+                  * soit quatre cartes sur cinq sans prix — un tri « par prix »
+                  * qui range l'essentiel de la collection en fin de liste, sans
+                  * que personne puisse le savoir.
+                  *
+                  * `scanTotal` est la taille de la collection au dernier relevé
+                  * COMPLET, `owned` sa taille aujourd'hui. L'écart des deux est
+                  * ce que « Rafraîchir la cote » comblerait vraiment — à la
+                  * différence des cartes lues mais jamais vendues, que ce bouton
+                  * ne peut pas coter et qu'on se garde de compter ici.
+                  */
+                 scanAt: 0, scanTotal: 0,
+                 owned: { n: 0, at: 0 },
                  // Pourquoi le tableau est vide — ou incomplet — quand il l'est.
                  // Lignes relues à cause du glissement de pagination, écartées.
                  note: '', refus: 0, tronque: false, freinages: 0, doublons: 0,
@@ -9105,6 +9154,14 @@
         sell.at = d.at || 0;
         sell.tags = d.tags || [];
         sell.themes = d.themes || {};
+        /*
+         * Une cote relue du cache n'a plus de relevé complet derrière elle tant
+         * qu'on n'a pas retenu lequel. Sans ces deux valeurs, la couverture se
+         * tairait exactement là où elle sert le plus : au rechargement suivant,
+         * sur une cote vieille de trois jours.
+         */
+        sell.scanAt = d.scanAt || 0;
+        sell.scanTotal = d.scanTotal || 0;
         /*
          * Le cache porte des cotes calculées par l'ancienne règle, où le
          * « 3e quartile » d'un échantillon mince valait le maximum. On les
@@ -9137,7 +9194,8 @@
     try {
       localStorage.setItem(
         SELL_KEY,
-        JSON.stringify({ rows: sell.rows, at: sell.at, tags: sell.tags, themes: sell.themes })
+        JSON.stringify({ rows: sell.rows, at: sell.at, tags: sell.tags, themes: sell.themes,
+                         scanAt: sell.scanAt, scanTotal: sell.scanTotal })
       );
     } catch (_) {
       /* trop volumineux ou stockage plein : le scan reste en mémoire */
@@ -9558,6 +9616,17 @@
     // Le relevé vient de lire la collection entière : inutile que la prochaine
     // ouverture de la Revente la relise pour savoir ce qui est encore possédé.
     if (!sell.tronque) sell.prunedAt = Date.now();
+    /*
+     * L'ancre de la couverture. Une lecture tronquée n'en pose pas : elle n'a
+     * pas vu la collection entière, et l'écrire ferait passer pour couvert ce
+     * qu'elle n'a jamais lu — la faute même que `sell.tronque` évite deux blocs
+     * plus haut en fusionnant au lieu d'écraser.
+     */
+    if (!sell.tronque) {
+      sell.scanAt = Date.now();
+      sell.scanTotal = cards.length;
+      sell.owned = { n: cards.length, at: Date.now() };
+    }
     sell.scanning = false;
     saveCote();
     renderSell();
@@ -9912,10 +9981,108 @@
     }
   }
 
+  /*
+   * La taille de la collection, en UNE requête.
+   *
+   * `/api/my-collection/stats` porte `total` — c'est déjà lui que le tri par
+   * prix interroge pour afficher une progression honnête. Le relire ici coûte
+   * un aller-retour là où compter les cartes en coûte N, et c'est le
+   * seul chiffre qui manquait pour dire de quelle part de la collection la cote
+   * rend compte.
+   *
+   * Échec silencieux et assumé : sans ce nombre, la couverture ne s'affiche
+   * pas. Une Revente qui refuserait de s'ouvrir parce qu'un compteur d'appoint
+   * n'a pas répondu serait une régression pour une information de confort.
+   */
+  const COUNT_TTL = 300000;   // 5 min : la collection ne bouge que par paquet ouvert
+
+  /*
+   * Deux gardes, et aucune n'est du zèle : ce relevé est appelé depuis
+   * `injectValueSort`, qui repasse à CHAQUE rendu de la page collection.
+   *
+   * `ownedEnCours` empêche la rafale — sans lui, dix rendus dans la même
+   * seconde lancent dix requêtes. `ownedTry` horodate la TENTATIVE, pas le
+   * succès : sans lui, un serveur qui refuse laisse `owned.at` à zéro, la garde
+   * de fraîcheur ne retient plus rien, et l'échec se rejoue à chaque rendu.
+   * C'est le même piège que le compteur figé de la Revente, du côté réseau.
+   */
+  let ownedEnCours = false;
+  let ownedTry = 0;
+
+  async function refreshOwned() {
+    if (ownedEnCours) return;
+    if (Date.now() - sell.owned.at < COUNT_TTL) return;
+    if (Date.now() - ownedTry < COUNT_TTL) return;
+    ownedEnCours = true;
+    ownedTry = Date.now();
+    try {
+      const { data } = await api('/api/my-collection/stats');
+      const n = data && data.total;
+      if (!Number.isFinite(n) || n <= 0) return;
+      sell.owned = { n, at: Date.now() };
+      renderSell();
+      paintValueSort();
+    } catch (_) {
+      /* réseau : on garde le compte précédent, et la couverture se tait */
+    } finally {
+      ownedEnCours = false;
+    }
+  }
+
+  /**
+   * Ce que la cote couvre, ou `null` quand on ne peut rien en dire.
+   *
+   * Deux manques bien distincts, et un seul serait mensonger :
+   * `manquantes` sont les cartes arrivées depuis le dernier relevé complet —
+   * celles que « Rafraîchir la cote » ira vraiment chercher. Les cartes lues
+   * mais jamais vendues n'en font pas partie : elles n'ont pas de prix parce
+   * qu'il n'en existe aucun, et aucun bouton n'y changera rien.
+   */
+  function couverture() {
+    const total = sell.owned.n;
+    if (!total) return null;
+
+    /*
+     * Deux régimes, et c'est le second qui a motivé tout ceci.
+     *
+     * Sans relevé complet, la cote n'a jamais été qu'un dépôt : cinq cartes par
+     * paquet, cumulées. La part couverte est alors le nombre de lignes qu'elle
+     * porte — et « Rafraîchir la cote » va chercher tout le reste. C'est le cas
+     * mesuré à 17 %, celui où le silence coûtait le plus cher.
+     *
+     * Avec un relevé complet daté, la collection entière a été vue ce jour-là :
+     * ne manque que ce qui est arrivé depuis.
+     */
+    const vues = sell.scanAt && sell.scanTotal
+      ? Math.min(sell.scanTotal, total)
+      : Math.min(sell.rows.length, total);
+    return { total, vues, manquantes: Math.max(0, total - vues),
+             complet: !!sell.scanAt,
+             pct: Math.round((vues / total) * 100) };
+  }
+
+  /*
+   * Le seuil à partir duquel on en parle.
+   *
+   * Cinq cartes par paquet : au lendemain d'un relevé complet il en manque
+   * quelques dizaines, et l'annoncer ferait clignoter une alerte permanente
+   * pour un écart qui ne change aucune décision. On se tait donc sous 2 % ET
+   * sous 200 cartes — au-delà, le tri par prix range assez de cartes en fin de
+   * liste pour que le silence devienne trompeur.
+   */
+  const COUV_PCT = 2;
+  const COUV_CARTES = 200;
+
+  function couvertureDistancee() {
+    const c = couverture();
+    return c && c.manquantes >= COUV_CARTES && 100 - c.pct >= COUV_PCT ? c : null;
+  }
+
   function openSell() {
     sell.open = true;
     syncJournal();
     refreshCompetition();
+    refreshOwned();
     /*
      * Un compte gratuit s'est déjà vu refuser le marché : relancer le relevé à
      * chaque ouverture, c'est vingt-cinq requêtes refusées de plus pour le même
@@ -9993,6 +10160,14 @@
         .bar button { margin-left: auto; padding: 6px 12px; border: 0; border-radius: 8px;
               background: rgba(255,255,255,.06); color: #949DAD; cursor: pointer; font: 500 12px ui-sans-serif, system-ui, sans-serif; }
         .bar button:hover { color: #F1F4F8; }
+        /*
+         * Cote distancée. La même ambre que ⚠ et que le tri par prix — c'est
+         * la couleur du « ce chiffre est plus mince qu'il n'en a l'air » dans
+         * tout le panneau. Pas de clignotement : l'écart se comble quand on
+         * veut, il n'urge pas.
+         */
+        .bar button.due { background: rgba(240,169,75,.16); color: #F0A94B; }
+        .bar button.due:hover { background: rgba(240,169,75,.24); color: #F0A94B; }
         .scroll { overflow: auto; }
         /*
          * « min-width » : le conteneur était prêt à défiler, mais une table en
@@ -10070,7 +10245,8 @@
     const q = (s) => root.querySelector(s);
     sellUI = { host, root, sum: q('[data-sum]'), scroll: q('[data-scroll]'),
       journal: q('[data-journal]'), min: q('[data-min]'), rar: q('[data-rar]'), free: q('[data-free]'), tag: q('[data-tag]'),
-      taglabel: q('[data-taglabel]'), all: q('[data-all]'), freeLabel: q('[data-freelabel]') };
+      taglabel: q('[data-taglabel]'), all: q('[data-all]'), freeLabel: q('[data-freelabel]'),
+      rescan: q('[data-rescan]') };
 
     q('[data-close]').addEventListener('click', closeSell);
     q('[data-wrap]').addEventListener('click', (e) => { if (e.target === q('[data-wrap]')) closeSell(); });
@@ -10195,6 +10371,24 @@
     const libres = state.slots.at ? state.slots.max - state.slots.used : null;
     const age = sell.at ? ` · cote il y a ${fmtSpan(Date.now() - sell.at)}` : '';
     /*
+     * La couverture se dit ICI, sur la même ligne que l'âge de la cote, parce
+     * que c'est la question suivante : « de quand » ne vaut rien sans « sur
+     * quoi ». Formulée en cartes manquantes plutôt qu'en pourcentage seul — un
+     * « 17 % » ne dit pas s'il en manque cent ou dix mille.
+     */
+    const c = couvertureDistancee();
+    /*
+     * Deux nombres, pas trois. « N de vos N cartes (17 %) — N
+     * sans prix » disait trois fois la même chose : les deux premiers
+     * s'additionnent pour faire le troisième. Mesuré dans la vraie modale, la
+     * ligne entière passait de 755 px à 625 pour 831 disponibles — la marge
+     * qu'il faut pour qu'une collection à six chiffres ne la fasse pas passer
+     * à deux lignes.
+     */
+    const couv = c
+      ? ` · cote sur ${c.pct} % de vos cartes — ${c.manquantes.toLocaleString('fr-FR')} sans prix, en fin de tri`
+      : '';
+    /*
      * Un relevé de concurrence interrompu se dit. Le filtre « sans
      * concurrence » repose entièrement dessus : le laisser passer pour complet
      * ferait proposer comme exclusives des cartes qu'on n'a pas fini de lire.
@@ -10211,6 +10405,21 @@
      * pendant le relevé, elle affirmait N cartes exclusives dont 159 ne
      * l'étaient pas. On la neutralise le temps que la concurrence soit connue.
      */
+    /*
+     * Le bouton porte le remède : c'est lui qui doit changer d'air, pas
+     * seulement la ligne du haut. Un compte à jour le laisse en gris — rien à
+     * faire, rien à signaler.
+     */
+    if (sellUI.rescan) {
+      sellUI.rescan.classList.toggle('due', !!c);
+      sellUI.rescan.title = c
+        ? `${c.manquantes.toLocaleString('fr-FR')} de vos cartes n’ont pas de prix`
+          + `${c.complet ? `, arrivées depuis le dernier relevé complet il y a ${fmtSpan(Date.now() - sell.scanAt)}` : ''}`
+          + '. Le relevé les cote toutes — deux minutes environ, sans rien mettre en vente.'
+        : 'Relire l’historique des ventes de toute la collection. '
+          + 'Deux minutes environ, sans rien mettre en vente.';
+    }
+
     sellUI.free.disabled = !concurrenceConnue();
     sellUI.freeLabel.style.opacity = concurrenceConnue() ? '' : '.4';
     sellUI.freeLabel.title = concurrenceConnue()
@@ -10219,7 +10428,7 @@
 
     // Les deux nombres de la même ligne s'écrivaient dans deux formats : « 1234
     // cartes · ~56 789 wb ».
-    sellUI.sum.textContent = `${rows.length.toLocaleString('fr-FR')} cartes · ~${valeur.toLocaleString('fr-FR')} wb${age}${conc}`
+    sellUI.sum.textContent = `${rows.length.toLocaleString('fr-FR')} cartes · ~${valeur.toLocaleString('fr-FR')} wb${age}${couv}${conc}`
       + (sell.note ? ` · ${sell.note}` : '');
 
     if (!rows.length) {
@@ -10616,6 +10825,9 @@
     version: VERSION,
     start, stop, resetStats, exportCsv, exportJson, claimBonusPacks,
     state, prefs, CFG, sell, openSell, diagCote, diagTri,
+    // Ce que la cote couvre, et si l'écart mérite d'être signalé :
+    // `__wmAuto.couverture()` rend le détail, `couvertureDistancee()` le filtre.
+    couverture, couvertureDistancee,
     // De quoi vérifier la protection par étiquette sans lire le code :
     // `__wmAuto.ownedIndex(true)` reconstruit l'index, `__wmAuto.owned.tagged`
     // liste les cartes hors de portée, `__wmAuto.isTagged(id)` tranche.
