@@ -1,11 +1,11 @@
 // ==UserScript==
 // @name         WikiMasters Tools
 // @namespace    https://www.wiki-masters.com/
-// @version      3.3.0
+// @version      3.4.1
 // @description  Boîte à outils WikiMasters : ouverture automatique des paquets, suivi des tirages, cote des cartes et revente.
 // @match        https://www.wiki-masters.com/*
 // @match        https://wiki-masters.com/*
-// @run-at       document-idle
+// @run-at       document-start
 // @grant        none
 // @updateURL    https://raw.githubusercontent.com/D1d1s/wikimasters-tools/main/wikimasters-auto.user.js
 // @downloadURL  https://raw.githubusercontent.com/D1d1s/wikimasters-tools/main/wikimasters-auto.user.js
@@ -41,7 +41,7 @@
    *
    * Il est lu par le garde juste en dessous, d'où sa place en tête.
    */
-  const VERSION = '3.3.0';
+  const VERSION = '3.4.1';
 
   /*
    * Une seule instance par page — et savoir laquelle
@@ -74,6 +74,29 @@
     return;
   }
   window.__wmToolsLoaded = true;
+
+  /*
+   * Le script démarre AVANT la page (`@run-at document-start`), et il le fait
+   * pour une seule raison : le site lit ses notifications une fois, au
+   * chargement, et ne les redemande jamais — ouvrir la cloche ne déclenche
+   * aucune requête. Démarré après lui, le filtre des invendus arrivait trop
+   * tard et ne voyait jamais cette lecture. Mesuré sur un compte réel : le
+   * filtre rendait bien 0 invendu quand on l'appelait, et la cloche du site
+   * les montrait tous.
+   *
+   * Ce que ça coûte : à cet instant, `document.body` n'existe pas encore. Tout
+   * ce qui touche à l'écran passe donc par ici, et attend. Le reste — le
+   * filtre, les réglages relus, les minuteries — part tout de suite, ce qui
+   * est justement le point.
+   */
+  function quandLeDomEstPret(fn) {
+    // `readyState` absent : banc d'essai, où le DOM factice est prêt d'emblée.
+    if (document.readyState && document.readyState === 'loading') {
+      document.addEventListener('DOMContentLoaded', fn, { once: true });
+    } else {
+      fn();
+    }
+  }
 
   /** `a` est-il antérieur à `b` ? Comparaison segment par segment. */
   function plusVieux(a, b) {
@@ -431,6 +454,7 @@
     watchBids: true,
     watchWish: false,     // signaler les cartes de la liste de souhaits mises en vente
     relistUnsold: false,  // remettre en vente les invendus, au même prix et durée
+    masquerInvendus: true, // retirer les fins d'enchère sans preneur du panneau du site
     logRarity: null,      // rareté isolée dans le journal, null = tout
     folded: false,
     tab: 'paquets',       // onglet actif : paquets | succes | marche | guilde | reglages
@@ -3116,7 +3140,12 @@
       if (myId) return myId;
     }
     try {
-      const d = await api('/api/notifications');
+      /*
+       * La réponse brute : un compte qui relance beaucoup n'a presque que des
+       * avis d'invendu, et c'est justement ceux-là que le masquage retire. Ce
+       * repli aurait cessé de trouver l'identifiant chez qui en a le plus.
+       */
+      const d = await api('/api/notifications', 'GET', null, fetchAvantFiltre);
       const n = (d.data && d.data.notifications) || [];
       myId = n.length ? n[0].user_id : null;
     } catch (_) {
@@ -4103,8 +4132,88 @@
 
   // ------------------------------------------------------------------- réseau
 
-  async function api(url, method = 'GET', body) {
-    const res = await fetch(url, {
+  /*
+   * Les fins d'enchère sans preneur, retirées du panneau du site.
+   *
+   * Le serveur envoie `marketplace_auction_unsold` à CHAQUE clôture sans mise,
+   * et `/api/notifications` ne garde que les cinquante dernières. Une carte
+   * relancée toutes les dix minutes en produit six par heure : trois cartes en
+   * boucle retournent la boîte en moins de trois heures, et tout ce qui compte
+   * — une vente conclue, une offre d'échange, un message — en est chassé. Sur
+   * un compte réel, neuf avis sur dix disaient la même chose.
+   *
+   * On filtre la RÉPONSE, pas l'affichage : le site dessine son panneau à
+   * partir de ce tableau, donc la liste et le compteur suivent sans qu'on
+   * touche à son DOM. Rien n'est effacé côté serveur — décocher la case rend
+   * les avis à la seconde suivante.
+   *
+   * Ce que ça ne répare pas : la borne des cinquante est au serveur. Un avis
+   * important déjà chassé de la boîte ne revient pas, et les invendus
+   * continuent d'en pousser d'autres dehors. Pour tarir la source il faut
+   * allonger la durée des ventes — « Tout repasser en », volet Relances.
+   *
+   * L'information n'est perdue pour personne : le Journal des ventes du
+   * panneau dit la même chose, en mieux — « demandée 2 000, invendue ».
+   */
+  const NOTIF_INVENDU = 'marketplace_auction_unsold';
+  let notifProxyOn = false;
+  /* La réponse telle que le serveur l'envoie, pour nos propres lectures. */
+  let fetchAvantFiltre = null;
+  /* Ce que la dernière lecture a écarté : le rapport que la case affiche. */
+  let notifFiltre = { masques: 0, total: 0 };
+
+  function installNotifProxy() {
+    if (notifProxyOn) return;
+    notifProxyOn = true;
+    const passe = window.fetch;
+    fetchAvantFiltre = passe;
+    window.fetch = async function (input) {
+      const res = await passe.apply(this, arguments);
+      try {
+        if (!prefs.masquerInvendus) return res;
+        const url = typeof input === 'string' ? input : (input && input.url) || '';
+        if (!url.includes('/api/notifications')) return res;
+
+        const data = await res.clone().json();
+        const liste = data && data.notifications;
+        if (!Array.isArray(liste)) return res;
+
+        const garde = liste.filter((n) => !n || n.type !== NOTIF_INVENDU);
+        const avant = notifFiltre;
+        notifFiltre = { masques: liste.length - garde.length, total: liste.length };
+        /*
+         * Redessiner, mais seulement si quelqu'un regarde le chiffre et qu'il a
+         * changé. Sans ça la note restait sur « rien de lu depuis l'ouverture
+         * de la page » pendant que la cloche venait d'être lue : seul un
+         * changement d'onglet la rattrapait, et le réglage passait pour mort.
+         */
+        if (prefs.tab === 'reglages'
+            && (avant.masques !== notifFiltre.masques || avant.total !== notifFiltre.total)) {
+          render();
+        }
+        if (!notifFiltre.masques) return res;   // rien à retirer : la réponse d'origine suffit
+        data.notifications = garde;
+
+        return new Response(JSON.stringify(data), {
+          status: res.status,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      } catch (_) {
+        return res;  // masquer ne doit jamais coûter le panneau de notifications
+      }
+    };
+  }
+
+
+  /**
+   * @param {Function} [viaFetch] pour court-circuiter nos propres filtres de
+   *   réponse. Le journal des ventes se nourrit des avis d'invendu que
+   *   `installNotifProxy` retire au site : il lui faut la réponse brute, sans
+   *   quoi le compte d'invendus — celui qui arme la suggestion de baisse —
+   *   cesserait de monter le jour où l'on coche la case.
+   */
+  async function api(url, method = 'GET', body, viaFetch) {
+    const res = await (viaFetch || fetch)(url, {
       method,
       credentials: 'same-origin',
       headers: { 'Content-Type': 'application/json' },
@@ -6321,6 +6430,9 @@
             <label class="opt"><input type="checkbox" data-opt-notify> Notifications bureau</label>
             <div class="note-vente">Mettre en vente et donner restent à votre main. Les relances
               automatiques se cochent dans <b>Marché</b>, et le panneau ne donne jamais seul.</div>
+            <div class="sect suite">Notifications du site</div>
+            <label class="opt" title="Le jeu vous envoie une notification « aucune offre n'a été faite pendant l'enchère » à chaque vente qui ne trouve pas preneur. Elles noient les autres. Cette case les cache. Rien n'est effacé : décochez et elles reviennent."><input type="checkbox" data-opt-masqinv> Cacher les « aucune offre »</label>
+            <div class="tune" data-notifnote></div>
             <div class="sect suite">Ce qu'il a constaté</div>
             <div class="tune" data-bonusnote></div>
             <div class="tune" data-dbnote></div>
@@ -6372,6 +6484,7 @@
       reset: q('[data-reset]'),
       bonusnote: q('[data-bonusnote]'),
       dbnote: q('[data-dbnote]'),
+      notifnote: q('[data-notifnote]'),
       diag: q('[data-diag]'),
       gwish: q('[data-gwish]'),
       troc: q('[data-troc]'),
@@ -6386,6 +6499,7 @@
       optAutoresume: q('[data-opt-autoresume]'),
       optBids: q('[data-opt-bids]'),
       optRelist: q('[data-opt-relist]'),
+      optMasqInv: q('[data-opt-masqinv]'),
       relist: q('[data-relist]'),
       tabs: q('[data-tabs]'),
       badge: q('[data-badge]'),
@@ -6428,6 +6542,7 @@
     ui.optAutoresume.checked = prefs.autoResume;
     ui.optBids.checked = prefs.watchBids;
     ui.optRelist.checked = prefs.relistUnsold;
+    ui.optMasqInv.checked = prefs.masquerInvendus;
 
     ui.toggle.addEventListener('click', () =>
       state.running ? stop('Arrêté manuellement.') : start()
@@ -6825,6 +6940,19 @@
       }
     });
 
+    /*
+     * Le masquage prend effet à la lecture suivante, pas au clic : c'est le
+     * site qui redemande sa liste. Le compte affiché date donc de la dernière
+     * lecture, et on le remet à zéro pour ne pas laisser croire qu'il est
+     * frais — la prochaine ouverture de la cloche le rétablira.
+     */
+    ui.optMasqInv.addEventListener('change', (e) => {
+      prefs.masquerInvendus = e.target.checked;
+      saveStore({ masquerInvendus: prefs.masquerInvendus });
+      notifFiltre = { masques: 0, total: 0 };
+      render();
+    });
+
     ui.optDb.addEventListener('change', (e) => {
       prefs.db = e.target.checked;
       saveStore({ db: prefs.db });
@@ -7177,7 +7305,21 @@
        */
       ui.bonusnote.textContent = state.bonusNote;
       ui.dbnote.textContent = state.dbNote;
+      ui.notifnote.textContent = noteInvendus();
     }
+  }
+
+  /*
+   * Ce que le masquage a retiré, dit en proportion plutôt qu'en nombre sec :
+   * « 44 sur 50 » est exactement la plainte de départ, et c'est le chiffre qui
+   * dit s'il faut allonger la durée des ventes plutôt que continuer à masquer.
+   */
+  function noteInvendus() {
+    if (!prefs.masquerInvendus) return 'Vous les voyez toutes.';
+    if (!notifFiltre.total) return 'Ouvrez vos notifications pour voir le compte.';
+    if (!notifFiltre.masques) return `Aucune à cacher sur vos ${notifFiltre.total} dernières.`;
+    return `${notifFiltre.masques} cachée${notifFiltre.masques > 1 ? 's' : ''}`
+      + ` sur vos ${notifFiltre.total} dernières notifications.`;
   }
 
   /**
@@ -9802,7 +9944,8 @@
   async function syncJournalVraiment() {
     let notifs;
     try {
-      const d = await api('/api/notifications');
+      // La réponse brute : c'est ici qu'on lit les invendus que le site ne voit plus.
+      const d = await api('/api/notifications', 'GET', null, fetchAvantFiltre);
       notifs = (d.data && d.data.notifications) || [];
     } catch (_) {
       return;
@@ -11942,21 +12085,49 @@
    */
   console.info(`[WikiMasters Tools] ${VERSION} — démarrage`);
 
-  try {
-    restore();
-    loadCote();
-    buildPanel();
-    buildSellUI();
-    render();
-    watchForHumanCheck();
-    applyPendingSearch();
-    watchCollection();
-    startBidWatcher(); // armé en permanence ; le tick vérifie l'option et la page
-    console.info('[WikiMasters Tools] panneau monté');
-  } catch (err) {
-    console.error('[WikiMasters Tools] échec au démarrage :', err);
-    throw err;
-  }
+  /*
+   * Les deux gestes qui ne peuvent pas attendre le DOM, dans cet ordre.
+   *
+   * Ils sont ici, et pas plus haut, parce que `restore()` lit des constantes
+   * déclarées tout au long de ce fichier — appelé au milieu, il lève avant
+   * même que la page existe. Ils sont ici, et pas dans le montage, parce que
+   * le site demande ses notifications dès qu'il s'exécute et ne les redemande
+   * plus : le filtre posé après lui ne voit jamais cette lecture.
+   *
+   * À `document-start`, tout ce fichier s'évalue avant le premier script de la
+   * page. Une ligne à la fin du fichier reste donc en avance sur le site — la
+   * position dans le fichier ne coûte rien, la position dans le TEMPS est tout.
+   *
+   * `restore()` passe devant : le filtre lit un réglage, et sans lui la
+   * première lecture du site serait filtrée même pour qui a décoché la case.
+   * Il porte aussi le plancher de débit appris — le banc l'a rappelé en
+   * perdant deux contrôles le jour où il est passé derrière le montage.
+   */
+  restore();
+  installNotifProxy();
+
+  /*
+   * Le montage, lui, attend le DOM : il n'existe pas encore à `document-start`.
+   */
+  quandLeDomEstPret(() => {
+    try {
+      loadCote();
+      buildPanel();
+      buildSellUI();
+      render();
+      watchForHumanCheck();
+      applyPendingSearch();
+      watchCollection();
+      startBidWatcher(); // armé en permanence ; le tick vérifie l'option et la page
+      console.info('[WikiMasters Tools] panneau monté');
+    } catch (err) {
+      console.error('[WikiMasters Tools] échec au démarrage :', err);
+      throw err;
+    }
+
+    // Le démarrage automatique suppose le panneau monté : il écrit son état.
+    if (prefs.autostart) startWhenFree();
+  });
 
   // Les pages Profil et Succès se rendent côté client : on relève après montage.
   setTimeout(() => {
@@ -12100,8 +12271,6 @@
     setTimeout(() => startWhenFree(tries + 1), 1000);
   }
 
-  if (prefs.autostart) startWhenFree();
-
   /*
    * Diagnostic de la cote — `__wmAuto.diagCote()` dans la console.
    *
@@ -12237,6 +12406,7 @@
       ['notifications', prefs.notify],
       ['souhaits', prefs.watchWish],
       ['relances auto', prefs.relistUnsold],
+      ['invendus masqués', prefs.masquerInvendus],
     ]
       .map(([n, v]) => `${n} ${oui(v)}`)
       .join(' · ');
