@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WikiMasters Tools
 // @namespace    https://www.wiki-masters.com/
-// @version      3.6.0
+// @version      3.6.1
 // @description  Boîte à outils WikiMasters : ouverture automatique des paquets, suivi des tirages, cote des cartes et revente.
 // @match        https://www.wiki-masters.com/*
 // @match        https://wiki-masters.com/*
@@ -41,7 +41,7 @@
    *
    * Il est lu par le garde juste en dessous, d'où sa place en tête.
    */
-  const VERSION = '3.6.0';
+  const VERSION = '3.6.1';
 
   /*
    * Une seule instance par page — et savoir laquelle
@@ -10340,7 +10340,8 @@
    * portées par l'exemplaire en collection, à côté de son identifiant. Aucune
    * requête de plus, et la protection est aussi fraîche que l'index lui-même.
    */
-  const owned = { map: new Map(), tagged: new Set(), at: 0, tried: 0, tronque: false };
+  const owned = { map: new Map(), tagged: new Set(), copies: new Map(), at: 0, tried: 0,
+                  tronque: false };
 
   /*
    * Une carte étiquetée ne se vend pas. L'étiquette est posée sur l'exemplaire,
@@ -10364,6 +10365,17 @@
 
     const m = new Map();
     const etiquetees = new Set();
+    /*
+     * COMBIEN d'exemplaires, et pas seulement lesquels.
+     *
+     * C'est la seule chose qui autorise à mettre en vente une carte gardée :
+     * si vous en avez plusieurs, en vendre une ne vous en prive pas. Sur un
+     * exemplaire unique, l'étiquette garde son dernier mot — et l'index doit
+     * donc savoir compter, pas seulement reconnaître.
+     */
+    const combien = new Map();
+    // Les cartes dont on a vu au moins un exemplaire LIBRE : voir la boucle.
+    const libres = new Set();
     let complet = true;
     let fini = false;
     for (let base = 0; base < 80 && !fini; base += 8) {
@@ -10384,8 +10396,43 @@
         const col = d.collection || [];
         for (const c of col) {
           if (!c.card_id) continue;
-          if (c.id) m.set(c.card_id, c.id);
-          if ((c.tags || []).length) etiquetees.add(c.card_id);
+          combien.set(c.card_id, (combien.get(c.card_id) || 0) + 1);
+          /*
+           * UN EXEMPLAIRE VENDABLE, pas le dernier venu.
+           *
+           * L'étiquette et le favori vivent sur l'EXEMPLAIRE — c'est le jeu qui
+           * les y range, `user_cards` porte `starred` et ses tags ligne par
+           * ligne. Ici on écrasait la distinction : le dernier exemplaire
+           * rencontré gagnait la place dans l'index, et une seule ligne
+           * étiquetée suffisait à marquer toute la carte comme protégée.
+           *
+           * Signalé à l'usage, et le cas est exactement celui-là : une
+           * Légendaire en double, l'originale gardée sous étiquette, le double
+           * qu'on veut vendre. Le double héritait de la protection de sa
+           * jumelle et ne repartait jamais — sans un mot, puisque « protégée »
+           * est un état normal.
+           *
+           * On retient donc en priorité un exemplaire LIBRE, et la carte n'est
+           * déclarée protégée que si TOUS le sont. C'est ce que « protégée »
+           * a toujours voulu dire : je garde cette carte — pas « je garde
+           * l'une de ces deux, devinez laquelle ».
+           */
+          const protege = !!(c.tags || []).length || !!c.starred;
+          if (!protege) {
+            // Un exemplaire LIBRE : c'est celui-là qu'on retient pour vendre,
+            // et la carte cesse d'être protégée, quel que soit l'ordre des
+            // pages — un exemplaire protégé croisé plus tard ne la reprotège
+            // pas.
+            if (c.id) m.set(c.card_id, c.id);
+            libres.add(c.card_id);
+            etiquetees.delete(c.card_id);
+          } else if (!libres.has(c.card_id)) {
+            // Protégé, et rien de libre vu jusqu'ici : il sert de repli pour
+            // l'index, et la carte reste protégée tant qu'aucun libre ne
+            // paraît.
+            if (c.id) m.set(c.card_id, c.id);
+            etiquetees.add(c.card_id);
+          }
         }
         if (col.length < 50) fini = true;
       }
@@ -10409,6 +10456,7 @@
     if (complet && m.size) {
       owned.map = m;
       owned.tagged = etiquetees;
+      owned.copies = combien;
       owned.at = Date.now();
       return m;
     }
@@ -10418,6 +10466,12 @@
      * partiel — une page manquante ne doit pas déprotéger une carte.
      */
     for (const c of etiquetees) owned.tagged.add(c);
+    /*
+     * Le compte des exemplaires ne se fusionne PAS : sur un relevé partiel il
+     * serait trop bas, et un compte trop bas se lit « exemplaire unique »,
+     * c'est-à-dire le cas où l'on refuse de vendre. On garde l'ancien, qui
+     * vient d'un balayage complet.
+     */
     return new Map([...owned.map, ...m]);
   }
 
@@ -10840,15 +10894,28 @@
    *   prix pendant qu'une annonce court encore à l'ancien, et la clôture de
    *   celle-ci le remettait.
    */
-  function enrolWatch(card, title, price, minutes, invendus, observe) {
+  function enrolWatch(card, title, price, minutes, invendus, observe, voulu) {
     if (!card || !price) return false;
     /*
      * Une carte étiquetée ne s'inscrit pas. C'est la première des deux barrières
      * — la seconde est au moment de publier — parce qu'une carte peut être
      * étiquetée après son inscription, et qu'on ne veut pas non plus la voir
      * traîner dans la liste de surveillance en donnant à croire qu'elle partira.
+     *
+     * UNE SEULE EXCEPTION, ET ELLE SE DEMANDE.
+     *
+     * `voulu` ne s'obtient qu'en confirmant, carte par carte, le bouton
+     * « Vendre un double » — jamais par un geste en masse, jamais par la
+     * réinscription automatique d'un invendu. Il dit une chose que l'étiquette
+     * ne sait pas dire : vous en avez PLUSIEURS, et vous voulez en vendre une.
+     *
+     * L'étiquette veut dire « je garde cette carte ». Elle ne veut pas dire
+     * « je garde les trois exemplaires que j'en ai » — et c'est pourtant ce
+     * qu'elle imposait. Le nombre d'exemplaires est vérifié une seconde fois
+     * au moment de publier : d'ici là vous pouvez en avoir vendu un à la main.
      */
-    if (isTagged(card)) {
+    const dejaVoulu = !!(state.watch[card] && state.watch[card].voulu);
+    if (isTagged(card) && !voulu && !dejaVoulu) {
       if (state.watch[card]) dropWatch(card, 'étiquetée');
       return false;
     }
@@ -10874,6 +10941,12 @@
        * carte réinscrite pendant que son annonce courait repartait en vente.
        * Les deux repères expirent d'eux-mêmes quand l'enchère se termine.
        */
+      /*
+       * Ce que vous avez demandé pour CETTE carte survit à la réinscription :
+       * un invendu qui revient ne doit pas redemander la confirmation qu'on
+       * vient de donner.
+       */
+      voulu: !!(voulu || dejaVoulu),
       auction: dejaLa ? dejaLa.auction || null : null,
       listedAt: dejaLa ? dejaLa.listedAt || 0 : 0,
       endsAt: dejaLa ? dejaLa.endsAt || 0 : 0,
@@ -11028,8 +11101,20 @@
          * étiquetée entre-temps sort du suivi ici, et l'écart est visible au
          * journal plutôt que silencieux.
          */
-        if (isTagged(card)) {
-          dropWatch(card, 'étiquetée');
+        /*
+         * Le geste explicite passe — à une condition qui se revérifie ICI.
+         *
+         * `voulu` a été donné devant un tableau qui annonçait plusieurs
+         * exemplaires. Entre-temps vous avez pu en vendre un à la main : il
+         * n'en reste qu'un, et publier reviendrait à vendre la carte que vous
+         * gardez. L'index vient d'être relu, il sait compter — on lui demande.
+         *
+         * Un index tronqué compte trop bas ; « trop bas » se lit « exemplaire
+         * unique », donc on s'abstient. C'est le bon sens de l'erreur.
+         */
+        const exemplaires = owned.copies.get(card) || 0;
+        if (isTagged(card) && !(w.voulu && exemplaires > 1)) {
+          dropWatch(card, w.voulu ? 'gardée, et plus qu’un exemplaire' : 'étiquetée');
           bouge = true;
           continue;
         }
@@ -11047,10 +11132,10 @@
          * l'index ne le SAIT pas : son drapeau `complet` ne compte que les
          * requêtes en échec, pas la troncature. Une carte suivie au-delà de
          * cette borne récoltait donc une absence par créneau, atteignait les
-         * vingt absences, et se mettait en pause définitivement. Relevé sur un
-         * compte réel : trois cartes bloquées, vingt absences chacune, zéro
-         * refus du serveur, jamais publiées — et N pages de collection que
-         * le balayage n'avait jamais lues.
+         * vingt absences, et se mettait en pause définitivement. Vu à l'usage :
+         * des cartes en pause définitive, vingt absences chacune, zéro refus du
+         * serveur, jamais publiées — et une collection dont le balayage n'avait
+         * jamais atteint la fin.
          *
          * Le même défaut avait été corrigé côté cote : `fetchCollectionRaw`
          * lit jusqu'à la première page incomplète et signale sa troncature.
@@ -11068,7 +11153,24 @@
         if (!copie) {
           try {
             const d = await api(`/api/my-collection?page=0&q=${encodeURIComponent(w.title)}`);
-            const ligne = ((d.data && d.data.collection) || []).find((c) => c.card_id === card);
+            const miennes = ((d.data && d.data.collection) || []).filter((c) => c.card_id === card);
+            /*
+             * Un exemplaire LIBRE d'abord, comme l'index.
+             *
+             * Le serveur rend toutes vos copies, et prendre la première venue
+             * referait ici l'erreur qu'on vient de corriger là-bas : sur une
+             * carte en double dont une seule est gardée, on mettrait en vente
+             * celle qu'on garde. Le repli suit donc la même règle que l'index —
+             * et s'il n'y a que des exemplaires protégés, on n'en prend aucun.
+             */
+            const ligne = miennes.find((c) => !(c.tags || []).length && !c.starred)
+              /*
+               * Toutes gardées, mais vous avez demandé d'en vendre une et le
+               * serveur vient de confirmer qu'il y en a plusieurs : on prend la
+               * première. C'est le seul endroit où une copie étiquetée part en
+               * vente, et il a fallu un clic de confirmation pour y arriver.
+               */
+              || (w.voulu && miennes.length > 1 ? miennes[0] : null);
             if (ligne && ligne.id) {
               copie = ligne.id;
               // Elle existe : l'index était court, pas la collection.
@@ -11389,6 +11491,15 @@
     return counts;
   }
 
+  /*
+   * Le bouton « Vendre un double » armé, s'il y en a un : l'identifiant de la
+   * carte, et l'instant du premier clic. Un seul à la fois — deux boutons armés
+   * en même temps, c'est un clic confirmé sur la mauvaise carte.
+   */
+  let doubleArme = '';
+  let doubleArmeA = 0;
+  let doubleArmeTimer = null;
+
   const sell = { open: false, scanning: false, done: 0, total: 0, read: 0, rows: [], at: 0, tags: [],
                  checked: new Set(), themes: {}, comp: new Map(), compAt: 0, compTronque: false,
                  prunedAt: 0,   // dernière vérification de ce qui est encore possédé
@@ -11655,6 +11766,43 @@
     return out;
   }
 
+  /**
+   * Une ligne par EXEMPLAIRE en entrée, une carte par ligne de tableau en
+   * sortie.
+   *
+   * Ça, c'était déjà juste. Ce qui ne l'était pas : la carte gardait les
+   * étiquettes du PREMIER exemplaire rencontré et les présentait comme les
+   * siennes. Sur un double dont une seule copie est gardée, l'affichage
+   * dépendait donc de l'ordre des pages rendues par le serveur — « protégée »
+   * ou « à vendre » selon le sens du vent.
+   *
+   * On agrège : les étiquettes de toutes les copies, pour que le filtre les
+   * retrouve toutes, et surtout COMBIEN il reste d'exemplaires LIBRES. C'est
+   * ce nombre-là qui décide si la carte est vendable, et c'est lui qui
+   * manquait.
+   */
+  const copieLibre = (c) => !(c.tags || []).length && !c.starred;
+
+  function cartesDistinctes(cards) {
+    const out = [];
+    const vus = new Map();
+    for (const c of cards) {
+      if (!c.id) continue;
+      const vu = vus.get(c.id);
+      if (!vu) {
+        const neuf = { ...c, tags: (c.tags || []).slice(),
+                       exemplaires: 1, libres: copieLibre(c) ? 1 : 0 };
+        vus.set(c.id, neuf);
+        out.push(neuf);
+        continue;
+      }
+      vu.exemplaires += 1;
+      if (copieLibre(c)) vu.libres += 1;
+      for (const t of c.tags || []) if (!vu.tags.includes(t)) vu.tags.push(t);
+    }
+    return out;
+  }
+
   /** La même collection, réduite à ce dont la cote a besoin. */
   async function fetchCollection(onProgress) {
     const brut = await fetchCollectionRaw(onProgress);
@@ -11665,6 +11813,13 @@
       cat: e.card?.category || '',
       vues: e.card?.pageviews || 0,
       tags: (e.tags || []).map((x) => (typeof x === 'string' ? x : x.name)).filter(Boolean),
+      /*
+       * L'étoile appartient à l'EXEMPLAIRE, comme les étiquettes. Le tableau ne
+       * la lisait pas : une carte mise en favori s'y affichait « libre », avec
+       * son bouton « Vendre », et la file la refusait ensuite en silence. Deux
+       * avis contraires sur le même fait, et le faux était celui qu'on voyait.
+       */
+      starred: !!e.starred,
     }));
   }
 
@@ -11744,15 +11899,7 @@
      *
      * Au passage, l'historique n'est plus demandé deux fois pour la même carte.
      */
-    const distinctes = [];
-    {
-      const vus = new Set();
-      for (const c of cards) {
-        if (!c.id || vus.has(c.id)) continue;
-        vus.add(c.id);
-        distinctes.push(c);
-      }
-    }
+    const distinctes = cartesDistinctes(cards);
 
     // La cotation avance carte par carte, pas exemplaire par exemplaire : c'est
     // ce que le compteur doit annoncer.
@@ -12079,6 +12226,8 @@
     const med = medianeDe(sorted);
     return {
       id: c.id, t: c.t || c.title, r: c.r || c.rarity, tags: c.tags || [], n: px.length,
+      exemplaires: c.exemplaires || 1,
+      libres: c.libres != null ? c.libres : ((c.tags || []).length || c.starred ? 0 : 1),
       theme: themeOf(c.cat || ''), vues: c.vues || 0,
       moy: Math.round(px.reduce((a, b) => a + b, 0) / px.length),
       med,
@@ -12175,6 +12324,8 @@
    */
   const coteSeule = (c, moy) => ({
     id: c.id, t: c.t || c.title, r: c.r || c.rarity, tags: c.tags || [], n: 0, seule: true,
+    exemplaires: c.exemplaires || 1,
+    libres: c.libres != null ? c.libres : ((c.tags || []).length || c.starred ? 0 : 1),
     theme: themeOf(c.cat || ''), vues: c.vues || 0,
     moy, med: moy, q3: moy, min: moy, max: moy,
   });
@@ -13038,6 +13189,39 @@
         render();
         return;
       }
+      /*
+       * « Vendre un double » : le seul geste qui passe outre une étiquette.
+       *
+       * Deux clics, comme les trois autres boutons du panneau qui engagent
+       * quelque chose, et pour la même raison : le premier ARME et le libellé
+       * change, le second exécute. La demi-seconde de `WISH_ARME_MIN_MS`
+       * empêche un double-clic d'armer et de confirmer dans le même geste —
+       * sans elle, l'armement ne serait qu'un décor.
+       *
+       * Ce que le second clic fait exactement : il inscrit la carte en file. Il
+       * ne vend rien tout de suite, et `reconcileWatch` revérifiera qu'il vous
+       * reste bien plusieurs exemplaires avant de publier quoi que ce soit.
+       */
+      const dbl = e.target.closest('[data-double]');
+      if (dbl) {
+        const id = dbl.dataset.double;
+        if (doubleArme !== id) {
+          doubleArme = id;
+          doubleArmeA = Date.now();
+          clearTimeout(doubleArmeTimer);
+          doubleArmeTimer = setTimeout(() => { doubleArme = ''; renderSell(); }, ARME_MS);
+          renderSell();
+          return;
+        }
+        if (Date.now() - doubleArmeA < WISH_ARME_MIN_MS) return;
+        clearTimeout(doubleArmeTimer);
+        doubleArme = '';
+        enrolWatch(id, dbl.dataset.titre, Number(dbl.dataset.prix), FILE_MINUTES, 0, false, true);
+        saveStore({ watch: state.watch });
+        renderSell();
+        render();
+        return;
+      }
       const b = e.target.closest('[data-sell]');
       if (!b) return;
       // L'étiquette a pu être posée depuis le dernier rendu du tableau.
@@ -13123,7 +13307,21 @@
    * @param {number} restants      emplacements encore libres à cet instant
    */
   function etatLigne(x, enVente, restants) {
-    const protegee = x.tags.length > 0;
+    /*
+     * « Protégée » se décide sur les EXEMPLAIRES, pas sur la carte.
+     *
+     * `x.tags.length > 0` réunissait les étiquettes de toutes vos copies et
+     * concluait sur la carte : deux exemplaires dont un seul est gardé
+     * donnaient « protégée », et le second — libre, vendable, celui qu'on garde
+     * justement pour le vendre — n'avait aucun bouton.
+     *
+     * Un relevé d'avant cette version ne porte pas le compte. On retombe alors
+     * sur l'ancienne lecture, plutôt que de déclarer libre ce qu'on n'a pas su
+     * compter.
+     */
+    const copies = x.exemplaires || 1;
+    const libresDeLaCarte = x.libres != null ? x.libres : (x.tags.length ? 0 : 1);
+    const protegee = libresDeLaCarte === 0;
     const dejaEnVente = enVente.has(x.id);
     /*
      * Déjà dans la file. C'est `state.watch`, la même que celle du volet
@@ -13133,7 +13331,18 @@
      */
     const enFile = !!(state.watch && state.watch[x.id]);
     const listable = !dejaEnVente && !protegee;
-    return { protegee, dejaEnVente, enFile, listable, aLister: listable && restants > 0 };
+    /*
+     * Le seul cas où une carte gardée peut quand même partir : vous en avez
+     * PLUSIEURS et toutes sont gardées. En vendre une ne vous en prive pas —
+     * c'est le geste qu'on est venu nous demander. Sur un exemplaire unique,
+     * l'étiquette garde son dernier mot, et il n'y a pas de bouton.
+     *
+     * Le geste reste à VOUS : ce drapeau n'autorise qu'un bouton de plus, et
+     * ce bouton demande une confirmation.
+     */
+    const doubleGarde = protegee && copies > 1 && !dejaEnVente && !enFile;
+    return { protegee, dejaEnVente, enFile, listable, doubleGarde, copies,
+             libresDeLaCarte, aLister: listable && restants > 0 };
   }
 
   /**
@@ -13409,7 +13618,8 @@
       (() => { let restants = libres || 0; return rows
         .map(
           (x) => {
-            const { protegee, dejaEnVente, enFile, aLister } = etatLigne(x, mesVentes, restants);
+            const { protegee, dejaEnVente, enFile, aLister, doubleGarde, copies } =
+              etatLigne(x, mesVentes, restants);
             if (aLister) restants -= 1;
             return `<tr class="${aLister ? 'next' : ''}">
             <td class="r"><i style="--c:${RARITY_COLOR[x.r] || '#949DAD'}">${x.r}</i></td>
@@ -13431,7 +13641,23 @@
             <td class="num">${x.med.toLocaleString('fr-FR')}</td>
             <td class="amp">${x.min.toLocaleString('fr-FR')} – ${x.max.toLocaleString('fr-FR')}</td>
             <td>${protegee
-              ? `<span class="protege" title="Carte étiquetée : hors de portée de la revente. Retire l’étiquette sur le site pour pouvoir la vendre.">protégée</span>`
+              ? `<span class="protege" title="${doubleGarde
+                  ? `Vos ${copies} exemplaires sont gardés. En vendre un ne vous prive de rien : le bouton à côté met UNE copie en file, et vous gardez les autres.`
+                  : 'Carte étiquetée : hors de portée de la revente. Retire l’étiquette sur le site pour pouvoir la vendre.'}">protégée</span>`
+                /*
+                 * Le seul chemin par lequel une carte gardée part en vente, et
+                 * il demande deux clics. Il n'apparaît que si vous en avez
+                 * plusieurs — jamais sur le dernier exemplaire — et que si les
+                 * relances sont cochées, sans quoi rien ne publierait.
+                 */
+                + (doubleGarde && prefs.relistUnsold
+                  ? ` <button class="go" data-double="${esc(x.id)}" data-titre="${esc(x.t)}"`
+                    + ` data-prix="${x.q3 || x.med}"`
+                    + ` title="Met UNE de vos ${copies} copies en file, au prix visé.`
+                    + ' Les autres restent gardées. Deux clics : le premier demande confirmation.">'
+                    + (doubleArme === x.id ? 'Confirmer ?' : `Vendre un double (${copies})`)
+                    + '</button>'
+                  : '')
               : dejaEnVente
                 ? `<span class="encours" title="Votre enchère court déjà sur cette carte. Elle occupe un de vos emplacements de vente ; son échéance est dans l’onglet Marché, volet Ventes.">en vente</span>`
                 : enFile
@@ -13962,6 +14188,12 @@
     // `__wmAuto.ownedIndex(true)` reconstruit l'index, `__wmAuto.owned.tagged`
     // liste les cartes hors de portée, `__wmAuto.isTagged(id)` tranche.
     ownedIndex, owned, isTagged,
+    /*
+     * Et de quoi éprouver le COMPTE des exemplaires, qui décide seul si une
+     * carte gardée peut quand même laisser partir une copie :
+     * `__wmAuto.cartesDistinctes(await __wmAuto.fetchCollection())`.
+     */
+    cartesDistinctes, fetchCollection,
     // Pour éprouver que des conditions LUES n'écrasent pas celles que vous choisissez.
     enrolWatch,
     // Et que la pause se lève quand plus rien n'attend : `__wmAuto.reveillerAuRepos(ids)`.
