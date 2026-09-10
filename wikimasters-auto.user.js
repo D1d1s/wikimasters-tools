@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WikiMasters Tools
 // @namespace    https://www.wiki-masters.com/
-// @version      3.4.3
+// @version      3.5.0
 // @description  Boîte à outils WikiMasters : ouverture automatique des paquets, suivi des tirages, cote des cartes et revente.
 // @match        https://www.wiki-masters.com/*
 // @match        https://wiki-masters.com/*
@@ -41,7 +41,7 @@
    *
    * Il est lu par le garde juste en dessous, d'où sa place en tête.
    */
-  const VERSION = '3.4.3';
+  const VERSION = '3.5.0';
 
   /*
    * Une seule instance par page — et savoir laquelle
@@ -4165,6 +4165,18 @@
   let notifDirect = 0;
   /* Les dernières trames vues sur le canal — `__wmAuto.notifTrames`, mémoire seule. */
   const notifTrames = [];
+  /*
+   * Le nombre d'avis non lus QUI COMPTENT — invendus exclus. `null` tant
+   * qu'aucune liste n'a été lue : on ne corrige pas une pastille sur une
+   * supposition. Voir `corrigerPastille`.
+   */
+  let notifNonLues = null;
+
+  /** Les non-lus d'une liste brute, les invendus mis de côté. */
+  function compterNonLues(liste) {
+    if (!Array.isArray(liste)) return null;
+    return liste.filter((n) => n && n.read === false && n.type !== NOTIF_INVENDU).length;
+  }
 
   function installNotifProxy() {
     if (notifProxyOn) return;
@@ -4183,6 +4195,8 @@
         if (!Array.isArray(liste)) return res;
 
         const garde = liste.filter((n) => !n || n.type !== NOTIF_INVENDU);
+        // La liste complète est sous la main : c'est le moment de compter juste.
+        notifNonLues = compterNonLues(liste);
         const avant = notifFiltre;
         notifFiltre = { masques: liste.length - garde.length, total: liste.length };
         /*
@@ -4405,8 +4419,76 @@
         el.hidden = false;
         delete el.dataset.wmMasque;
       }
+      const p = pastilleCloche();
+      if (p && p.dataset.wmPastille != null) {
+        p.textContent = p.dataset.wmPastille;
+        p.hidden = false;
+        delete p.dataset.wmPastille;
+      }
     } catch (_) {
       /* rien à rendre */
+    }
+  }
+
+  /*
+   * Les deux gestes du masquage, ensemble. Ils ne se séparent pas : replier
+   * les lignes en laissant la pastille les compter, c'est promettre des
+   * nouvelles qui n'existent pas — et corriger la pastille sans replier les
+   * lignes ne masquerait rien du tout.
+   */
+  function appliquerMasquage() {
+    corrigerPastille();
+    return masquerLignesInvendues();
+  }
+
+  /** Le compteur rouge posé sur la cloche, ou `null` s'il n'est pas affiché. */
+  function pastilleCloche() {
+    try {
+      for (const b of document.querySelectorAll('button')) {
+        if (!/notification/i.test(b.getAttribute('aria-label') || '')) continue;
+        const s = b.querySelector('span');
+        if (s) return s;
+      }
+    } catch (_) {
+      /* page inattendue */
+    }
+    return null;
+  }
+
+  /*
+   * La pastille disait le contraire de la liste.
+   *
+   * Elle compte ce que le SITE croit avoir reçu — invendus compris, puisqu'il
+   * les reçoit et que nous ne faisons que les replier. Relevé sur un compte
+   * réel : « 7 » sur la cloche, trois lignes utiles en dessous. Un compteur qui
+   * annonce des nouvelles qui n'existent pas fait ouvrir pour rien, et c'est
+   * exactement ce que cette option prétend supprimer.
+   *
+   * `/api/notifications` porte un booléen `read` par avis : le vrai nombre est
+   * donc calculable — les non-lus, invendus exclus. Il est tenu à jour par les
+   * deux lectures qui existent déjà, celle du site et notre relevé de quinze
+   * secondes, pour rester juste même si l'une des deux est désactivée.
+   *
+   * On n'écrit que si la valeur diffère : réécrire le même texte crée une
+   * mutation, qui rappelle l'observateur, qui réécrit — une boucle à chaque
+   * image, pour rien.
+   */
+  function corrigerPastille() {
+    if (notifNonLues == null) return;
+    const p = pastilleCloche();
+    if (!p) return;
+    try {
+      // La valeur du site, gardée une fois pour toutes : c'est elle qu'on rendra.
+      if (p.dataset.wmPastille == null) p.dataset.wmPastille = p.textContent || '';
+      const veut = notifNonLues > 0 ? String(notifNonLues) : '';
+      if (!notifNonLues) {
+        if (!p.hidden) p.hidden = true;
+        return;
+      }
+      if (p.hidden) p.hidden = false;
+      if (p.textContent !== veut) p.textContent = veut;
+    } catch (_) {
+      /* le DOM du site n'est pas à nous */
     }
   }
 
@@ -4414,16 +4496,49 @@
     if (domObs || typeof MutationObserver !== 'function') return;
     /*
      * La liste se remplit à l'ouverture de la cloche et à chaque avis reçu :
-     * un seul passage ne verrait rien. On repasse à chaque mutation, et le
-     * travail est borné — un `querySelectorAll('button')` sur une page de jeu.
+     * un seul passage ne verrait rien, il faut donc suivre les mutations.
+     *
+     * Mais pas une par une. La première version relançait un
+     * `querySelectorAll('button')` sur toute la page à CHAQUE mutation — or
+     * cette page fait tourner des comptes à rebours à la seconde, et chaque
+     * chiffre qui change est une mutation. Des centaines de balayages complets
+     * par minute, pour une liste qui ne bouge que quand un avis tombe.
+     *
+     * Deux garde-fous, et ils se complètent :
+     *
+     * - **un seul passage par image.** Les mutations arrivent en rafales — un
+     *   rendu React en produit des dizaines — et une rafale ne mérite qu'un
+     *   balayage. `requestAnimationFrame` les regroupe naturellement, et
+     *   s'endort tout seul quand l'onglet passe à l'arrière-plan.
+     * - **rien à faire si le texte n'est pas là.** Un test sur le corps de la
+     *   page coûte une comparaison de chaîne, contre un parcours de tous les
+     *   boutons. Tant qu'aucune ligne ne dit « sans aucune mise », on ne
+     *   cherche pas où elle serait.
      */
-    domObs = new MutationObserver(() => {
-      if (prefs.masquerInvendus) masquerLignesInvendues();
-    });
+    let prevu = false;
+    const planifier = () => {
+      if (prevu || !prefs.masquerInvendus) return;
+      prevu = true;
+      const passer = () => {
+        prevu = false;
+        // La pastille d'abord : elle est là même quand la liste ne l'est pas.
+        corrigerPastille();
+        try {
+          if (!INVENDU_TEXTE.test(document.body.textContent || '')) return;
+        } catch (_) {
+          return;
+        }
+        masquerLignesInvendues();
+      };
+      if (typeof requestAnimationFrame === 'function') requestAnimationFrame(passer);
+      else setTimeout(passer, 100);
+    };
+
+    domObs = new MutationObserver(planifier);
     quandLeDomEstPret(() => {
       try {
         domObs.observe(document.body, { childList: true, subtree: true });
-        if (prefs.masquerInvendus) masquerLignesInvendues();
+        planifier();
       } catch (_) {
         /* pas de corps de page : rien à observer */
       }
@@ -7177,7 +7292,7 @@
       saveStore({ masquerInvendus: prefs.masquerInvendus });
       notifFiltre = { masques: 0, total: 0 };
       // Les lignes déjà repliées, elles, sont à l'écran : elles répondent au clic.
-      if (prefs.masquerInvendus) masquerLignesInvendues();
+      if (prefs.masquerInvendus) appliquerMasquage();
       else rendreLignesInvendues();
       render();
     });
@@ -9671,6 +9786,33 @@
    */
   let fileEdit = null;
 
+  /**
+   * Réveiller les cartes en pause parce que plus rien n'attend.
+   *
+   * Appelé seulement quand il n'y a rien à replacer ET des emplacements
+   * libres — voir `IDLE_WAKE_MS` pour le pourquoi et les deux freins.
+   *
+   * @returns {number} cartes réveillées, 0 si le frein a joué.
+   */
+  function reveillerAuRepos(ids) {
+    if (Date.now() - (state.idleWokeAt || 0) < IDLE_WAKE_MS) return 0;
+    let n = 0;
+    for (const c of ids) {
+      const w = state.watch[c];
+      if (!w || !w.paused) continue;
+      if ((w.reveils || 0) >= IDLE_WAKE_MAX) continue;
+      w.paused = false;
+      w.fails = 0;
+      w.reveils = (w.reveils || 0) + 1;
+      n += 1;
+    }
+    if (n) {
+      state.idleWokeAt = Date.now();
+      saveStore({ watch: state.watch });
+    }
+    return n;
+  }
+
   /** Les conditions d'une carte de la file : prix, durée, invendus. */
   function editFile(card, w) {
     const dur = DUREES.map((d) => `<button data-fdur="${esc(card)}" data-min="${d.minutes}"`
@@ -9720,6 +9862,29 @@
    */
   const WATCH_PAUSE_TTL = 604800000;   // 7 jours
   const WATCH_PAUSE_RETRY = 1800000;   // 30 min : la pause se desserre seule, voir reconcileWatch
+
+  /*
+   * Et la pause se lève PLUS TÔT quand il n'y a rien d'autre à faire.
+   *
+   * Signalé après usage : « quand la liste d'attente est vide, les ventes avec
+   * le compteur à 20 doivent être remises à 0 pour ne pas laisser le système à
+   * rien faire ». C'est juste : la cause la plus fréquente des vingt échecs est
+   * une lenteur du serveur à rendre la carte après une clôture — quelques
+   * dizaines de secondes — et attendre trente minutes pour la retenter alors
+   * que des emplacements sont libres et que plus rien n'attend, c'est laisser
+   * la place vide pour rien.
+   *
+   * Deux freins, parce que réveiller sans fin une carte réellement partie
+   * reviendrait à marteler l'API :
+   *
+   * - une minute entre deux réveils au repos, tous suivis confondus ;
+   * - trois réveils par carte, après quoi elle retombe sur les trente minutes.
+   *
+   * Le compte de réveils repart à zéro dès que la carte est revue en vente :
+   * elle a prouvé qu'elle existait, l'ardoise est effacée.
+   */
+  const IDLE_WAKE_MS = 60000;   // entre deux réveils au repos
+  const IDLE_WAKE_MAX = 3;      // réveils au repos par carte avant de laisser faire le temps
 
   /*
    * Les sept durées que le site propose, relevées sur son propre formulaire de
@@ -9901,7 +10066,24 @@
     return Math.max(plancher, Math.round(prix * RELIST_BAISSE));
   }
 
-  function enrolWatch(card, title, price, minutes, invendus) {
+  /**
+   * @param {boolean} [observe] Les conditions viennent d'une enchère LUE, et
+   *   non d'un choix. Elles ne remplacent alors jamais celles déjà inscrites.
+   *
+   *   Signalé après usage : « j'ai cliqué et validé 30 minutes et pourtant les
+   *   relances se font en 10 minutes ». `enrolWatch` prenait la durée qu'on lui
+   *   passait pour parole d'évangile, et deux appelants sur quatre lui passaient
+   *   celle de l'annonce en cours — le relevé du Marché à chaque tour, et la
+   *   clôture d'un invendu. Une carte qui portait déjà une mise n'était pas
+   *   annulée par « Tout repasser en » : son annonce de dix minutes continuait,
+   *   le relevé suivant la relisait, et réécrivait dix par-dessus les trente
+   *   choisies. Le réglage tenait quelques secondes.
+   *
+   *   Le prix suit la même règle, et pour la même raison : le crayon change le
+   *   prix pendant qu'une annonce court encore à l'ancien, et la clôture de
+   *   celle-ci le remettait.
+   */
+  function enrolWatch(card, title, price, minutes, invendus, observe) {
     if (!card || !price) return false;
     /*
      * Une carte étiquetée ne s'inscrit pas. C'est la première des deux barrières
@@ -9914,10 +10096,15 @@
       return false;
     }
     const dejaLa = state.watch[card];
+    /*
+     * Ce que VOUS avez choisi l'emporte sur ce qui est lu. Une inscription
+     * neuve prend les conditions qu'on lui donne — il n'y a rien d'autre.
+     */
+    const garde = observe && dejaLa;
     state.watch[card] = {
       title: title || (dejaLa && dejaLa.title) || '',
-      price,
-      minutes: minutes || 10,
+      price: (garde && dejaLa.price) || price,
+      minutes: (garde && dejaLa.minutes) || minutes || (dejaLa && dejaLa.minutes) || FILE_MINUTES,
       since: dejaLa ? dejaLa.since : Date.now(),
       fails: 0,
       paused: false,
@@ -9988,6 +10175,8 @@
         if (!enVente.has(c)) continue;
         // Une carte de retour en vente repart d'un compteur d'échecs vierge.
         if (state.watch[c].fails) state.watch[c].fails = 0;
+        // Et d'une ardoise de réveils vierge : elle vient de prouver qu'elle existe.
+        if (state.watch[c].reveils) state.watch[c].reveils = 0;
         /*
          * On note qu'on vient de la voir en ligne. C'est ce repère qui empêche
          * de la replacer dans la minute qui suit la clôture : à cet instant elle
@@ -10020,6 +10209,12 @@
         if (w.paused && Date.now() - (w.pausedAt || 0) > WATCH_PAUSE_RETRY) {
           w.paused = false;
           w.fails = 0;
+          /*
+           * Le temps a fait son office : l'ardoise des réveils au repos est
+           * effacée aussi. Sans ça, une carte ayant épuisé ses trois réveils
+           * n'en aurait plus jamais, même des heures plus tard.
+           */
+          w.reveils = 0;
           reveillees += 1;
         }
       }
@@ -10027,9 +10222,25 @@
       // avant lui — quand il n'y a rien à replacer — et le réveil serait perdu.
       if (reveillees) saveStore({ watch: state.watch });
 
-      const manquantes = ids.filter(
+      const aReplacer = () => ids.filter(
         (c) => !dejaEnLigne(c, enVente) && !state.watch[c].paused
       );
+      let manquantes = aReplacer();
+
+      /*
+       * Plus rien à replacer, et des emplacements libres : c'est le moment de
+       * réveiller ce qui dort, plutôt que de laisser la place vide en attendant
+       * les trente minutes. Voir `IDLE_WAKE_MS` pour les deux freins.
+       *
+       * La condition sur `libres` compte autant que le reste : réveiller des
+       * cartes alors que les dix emplacements sont pris ne ferait qu'aligner
+       * des candidates qui ne peuvent pas partir, et remettre à zéro des
+       * compteurs qui disent quelque chose.
+       */
+      if (!manquantes.length && libres > 0) {
+        if (reveillerAuRepos(ids)) manquantes = aReplacer();
+      }
+
       /*
        * Rien à replacer : on repousse le créneau, sinon ce tour repasserait à
        * la seconde suivante — et rappellerait l'API — jusqu'à ce qu'une vente
@@ -10162,7 +10373,7 @@
   function watchCurrentSales() {
     let n = 0;
     for (const v of state.sales.list || []) {
-      if (v.card && v.price && enrolWatch(v.card, v.title, v.price, v.minutes)) n += 1;
+      if (v.card && v.price && enrolWatch(v.card, v.title, v.price, v.minutes, null, true)) n += 1;
     }
     render();
     return n;
@@ -10189,6 +10400,13 @@
       // La réponse brute : c'est ici qu'on lit les invendus que le site ne voit plus.
       const d = await api('/api/notifications', 'GET', null, fetchAvantFiltre);
       notifs = (d.data && d.data.notifications) || [];
+      /*
+       * Et le compte de la pastille, tenu à jour ici aussi. Le filtre HTTP le
+       * calcule déjà, mais il ne le fait que si le SITE relit sa liste — ce
+       * qu'il ne fait pas à chaque avis reçu. Ce relevé-ci passe toutes les
+       * quinze secondes et voit tout, y compris ce qui est arrivé en direct.
+       */
+      notifNonLues = compterNonLues(notifs);
     } catch (_) {
       return;
     }
@@ -10242,7 +10460,7 @@
            * l'affichage — elle n'entre nulle part dans ce qui est publié.
            */
           const tours = ((state.watch[id] && state.watch[id].invendus) || 0) + 1;
-          enrolWatch(id, titre, t.price, t.minutes, tours);
+          enrolWatch(id, titre, t.price, t.minutes, tours, true);
         }
       }
     }
@@ -12689,9 +12907,13 @@
     // `__wmAuto.ownedIndex(true)` reconstruit l'index, `__wmAuto.owned.tagged`
     // liste les cartes hors de portée, `__wmAuto.isTagged(id)` tranche.
     ownedIndex, owned, isTagged,
+    // Pour éprouver que des conditions LUES n'écrasent pas celles que vous choisissez.
+    enrolWatch,
+    // Et que la pause se lève quand plus rien n'attend : `__wmAuto.reveillerAuRepos(ids)`.
+    reveillerAuRepos,
     // Ce que le canal des notifications a fait passer, pour voir sa vraie forme.
     notifTrames,
-    // Le filet du DOM, atteignable pour l'éprouver : `__wmAuto.masquerLignesInvendues()`.
-    masquerLignesInvendues, rendreLignesInvendues,
+    // Le filet du DOM, atteignable pour l’éprouver : `__wmAuto.appliquerMasquage()`.
+    appliquerMasquage, masquerLignesInvendues, rendreLignesInvendues,
   };
 })();
