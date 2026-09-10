@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WikiMasters Tools
 // @namespace    https://www.wiki-masters.com/
-// @version      3.5.0
+// @version      3.6.0
 // @description  Boîte à outils WikiMasters : ouverture automatique des paquets, suivi des tirages, cote des cartes et revente.
 // @match        https://www.wiki-masters.com/*
 // @match        https://wiki-masters.com/*
@@ -41,7 +41,7 @@
    *
    * Il est lu par le garde juste en dessous, d'où sa place en tête.
    */
-  const VERSION = '3.5.0';
+  const VERSION = '3.6.0';
 
   /*
    * Une seule instance par page — et savoir laquelle
@@ -177,6 +177,54 @@
   }
 
   /*
+   * Un appel réseau qui n'aboutit pas doit finir par renoncer
+   * ---------------------------------------------------------
+   * Il n'y avait AUCUN délai de garde dans ce fichier : pas un
+   * `AbortController`. Or `fetch` ne renonce jamais de lui-même. Un serveur
+   * qui accepte la connexion et ne répond plus — la panne la plus banale d'un
+   * jeu en ligne, plus fréquente qu'un refus franc — laissait l'`await` en
+   * suspens indéfiniment. Le panneau restait sur « Ouverture… » : pas
+   * d'erreur, pas d'expiration, pas de message. Rien ne distinguait « ça
+   * travaille » de « c'est mort ».
+   *
+   * Vingt secondes. Le site répond en dessous de la seconde en régime normal,
+   * et la plus lourde de nos lectures — une page de collection de 50 cartes —
+   * n'a jamais dépassé trois secondes au banc. Vingt laisse donc largement la
+   * place à un hoquet sans laisser la place à une pendaison.
+   *
+   * L'abandon est signalé comme tel : `expiration` sur l'erreur, pour que la
+   * boucle dise « le serveur n'a pas répondu » plutôt que « injoignable » —
+   * les deux pannes ne se cherchent pas au même endroit.
+   */
+  const RESEAU_TIMEOUT_MS = 20000;
+
+  /**
+   * @param {Function} [via] l'émetteur à employer, quand l'appelant tient à
+   *   court-circuiter nos propres filtres de réponse — voir `api()`. Le délai
+   *   de garde vaut pour lui aussi : c'est le serveur qui pend, pas le filtre.
+   */
+  function fetchBorne(url, opts = {}, via) {
+    const emettre = via || fetch;
+    // Un navigateur sans `AbortController` garde le comportement d'avant :
+    // mieux vaut un appel sans garde qu'un appel qui ne part pas.
+    if (typeof AbortController !== 'function') return emettre(url, opts);
+    const ctrl = new AbortController();
+    const minuteur = setTimeout(() => ctrl.abort(), RESEAU_TIMEOUT_MS);
+    return emettre(url, { ...opts, signal: ctrl.signal })
+      .catch((err) => {
+        if (err && err.name === 'AbortError') {
+          const e = new Error(
+            `Le serveur n’a pas répondu en ${Math.round(RESEAU_TIMEOUT_MS / 1000)} s.`
+          );
+          e.expiration = true;
+          throw e;
+        }
+        throw err;
+      })
+      .finally(() => clearTimeout(minuteur));
+  }
+
+  /*
    * Savoir qu'on est en retard
    * --------------------------
    * Tampermonkey décide seul quand vérifier — jamais plus d'une fois par heure,
@@ -216,7 +264,7 @@
     state.majAt = Date.now();
     saveStore({ majAt: state.majAt });
     try {
-      const r = await fetch(MAJ_URL, {
+      const r = await fetchBorne(MAJ_URL, {
         headers: { Range: `bytes=0-${MAJ_OCTETS}` },
         cache: 'no-store',
       });
@@ -346,6 +394,21 @@
 
   const STORE_KEY = 'wm-auto-panel';
 
+  /*
+   * Le numéro de schéma du stockage local.
+   *
+   *   0  avant tout marqueur
+   *   1  `debitRecalibre`  — recalibrage du débit, 1.77
+   *   2  `debitVerrou`     — après le correctif du verrou inter-onglets
+   *   3  `debitCliquet`    — après le cliquet du plancher appris
+   *   4  ce numéro lui-même : les migrations se comparent au lieu de se deviner
+   *
+   * À incrémenter quand une migration s'ajoute, et à traiter dans `restore()`.
+   * Les trois marqueurs booléens restent lus une dernière fois, pour déduire
+   * le numéro d'un stockage écrit avant lui — voir `restore()`.
+   */
+  const SCHEMA = 4;
+
   const state = {
     running: false,
     abort: null,
@@ -381,6 +444,7 @@
     pityMax: 0,            // plus haute valeur jamais vue — révèle le palier
     balance: null,         // wikibidous disponibles
     guild: { at: 0 },      // relevé de guilde, voir refreshGuild
+    guildTenteA: 0,        // dernière TENTATIVE, réussie ou non — voir refreshGuild
     karmaVu: {},           // karma réellement observé par rareté, mesuré
     maCollection: null,    // { at, cartes } — lecture complète, gardée une heure
     aSouhaiter: null,      // lot en cours, mémorisé — voir saveLot
@@ -415,6 +479,15 @@
     troc: { at: 0, lignes: [], amis: 0, enAttente: 0 },
     message: 'Prêt.',
     warn: false,
+    /*
+     * Ce que chaque sous-système a fait de son dernier tour. Voir `noterEchec`.
+     * nom -> { echecs, depuis, dernier, arret, ok }
+     */
+    sains: {},
+    // Anneau des derniers événements de sous-système, pour le diagnostic.
+    faits: [],
+    // Ce que chaque sélecteur du site trouve, ou ne trouve plus. Voir `vu`.
+    selecteurs: {},
   };
 
   /**
@@ -424,6 +497,243 @@
   function floorMs() {
     return Math.max(CFG.floorDelayMs, state.probeFloorMs);
   }
+
+  // ------------------------------------------------ filet des tours secondaires
+
+  /*
+   * Pourquoi ce filet, alors que la boucle principale a déjà le sien.
+   *
+   * La boucle d'ouverture compte ses refus, plafonne son recul, abandonne au
+   * bout de quatre et le DIT dans le panneau. Les tours secondaires — relance
+   * des invendus, guetteur d'enchères, guetteur de souhaits — n'avaient qu'un
+   * `catch` vide, commenté « le tour suivant rattrapera ». Tant que le tour
+   * suivant rattrape, c'est vrai.
+   *
+   * Le jour où le site change la forme de sa mise en vente, le tour suivant
+   * échoue lui aussi, et le suivant, et celui d'après. Quelqu'un qui a coché
+   * « relances automatiques » croit ses invendus remis en vente alors qu'ils
+   * ne le sont plus, et RIEN ne le lui dit — ni le panneau, ni la console. Il
+   * peut le découvrir des jours plus tard. C'est le défaut le plus grave du
+   * fichier, parce qu'il touche une fonction qui agit sur le compte et qu'il
+   * est parfaitement muet.
+   *
+   * Le filet est celui de la boucle principale, transposé : on compte les
+   * échecs d'affilée, on remet à zéro au premier succès, et au-delà du seuil
+   * on arrête CE tour-là — pas l'outil — avec une note dans le panneau et un
+   * bouton pour réessayer. Le seuil vaut quatre, comme `maxThrottleRetries` :
+   * la même question, la même réponse.
+   */
+  const MAX_ECHECS = 4;
+
+  /*
+   * Trente événements retenus. C'est ce qui manque au diagnostic pour répondre
+   * à « depuis quand ? » : un instantané dit où on est, pas comment on y est
+   * arrivé. Trente couvre plusieurs heures de tours secondaires sans peser.
+   */
+  const FAITS_GARDES = 30;
+
+  /*
+   * Le nom que porte chaque tour à l'écran. Il est écrit ici et pas à l'appel
+   * pour qu'une note du panneau et une ligne de diagnostic disent la MÊME
+   * chose du même sous-système.
+   */
+  const SOUS_SYSTEMES = {
+    relances: 'Les relances automatiques',
+    marche: 'La surveillance du Marché',
+    souhaits: 'La veille des souhaits',
+    stockage: 'La mémoire du navigateur',
+  };
+
+  /*
+   * Ce que la panne coûte, dit dans les mots du jeu. Une note qui annonce
+   * « relances arrêtées » sans dire ce que ça change laisse chercher ; c'est
+   * la deuxième phrase qui fait décider de réessayer ou d'aller voir ailleurs.
+   */
+  const PLAINTES = {
+    relances: 'ne repartent plus : vos invendus restent hors du Marché tant que rien ne les relance',
+    marche: 'est arrêtée : ni relevé des enchères, ni journal des ventes',
+    souhaits: 'est arrêtée : les cartes souhaitées mises en vente ne seront plus signalées',
+    stockage: 'refuse d’écrire — le navigateur est plein. Réglages, cote et cartes suivies '
+      + 'ne survivront pas au rechargement de la page',
+  };
+
+  const suivi = (nom) => (state.sains[nom]
+    || (state.sains[nom] = { echecs: 0, depuis: 0, dernier: '', arret: false, ok: 0 }));
+
+  /** Le message d'une exception, borné : la ligne va au panneau et au diagnostic. */
+  const raison = (err) => String((err && err.message) || err || 'sans détail').slice(0, 120);
+
+  function noterFait(nom, verdict, detail) {
+    state.faits.push({ at: Date.now(), nom, verdict, detail: detail || '' });
+    if (state.faits.length > FAITS_GARDES) state.faits.splice(0, state.faits.length - FAITS_GARDES);
+  }
+
+  /** Un tour a abouti : le compteur repart, et un rétablissement se dit. */
+  function noterSucces(nom) {
+    const s = suivi(nom);
+    const relevait = s.arret;
+    if (s.echecs || s.arret) noterFait(nom, 'rétabli', `après ${s.echecs} échec(s)`);
+    s.echecs = 0;
+    s.depuis = 0;
+    s.dernier = '';
+    s.arret = false;
+    s.ok = Date.now();
+    /*
+     * Et l'écran suit tout de suite. Le panneau ne se redessine sur aucune
+     * horloge : il attend un événement. Sans cet appel, la note d'un tour
+     * rétabli restait affichée jusqu'à ce que tout autre chose provoque un
+     * rendu — c'est-à-dire indéfiniment sur un panneau qu'on ne touche pas.
+     * Une note qui ment dans ce sens-là est pire que pas de note : elle est
+     * écrite, donc on la croit.
+     */
+    if (relevait) renderPannes();
+  }
+
+  /**
+   * Un tour a échoué. Rend `true` quand le seuil est franchi, c'est-à-dire
+   * quand l'appelant doit cesser de réessayer.
+   *
+   * @param {number} [seuil] pour les pannes qui n'ont pas de tour suivant —
+   *   le stockage refuse tout de suite ou jamais, il ne se compte pas.
+   */
+  function noterEchec(nom, err, seuil = MAX_ECHECS) {
+    const s = suivi(nom);
+    s.echecs += 1;
+    if (!s.depuis) s.depuis = Date.now();
+    s.dernier = raison(err);
+    noterFait(nom, 'échec', s.dernier);
+    console.warn(
+      `[WikiMasters Tools] ${SOUS_SYSTEMES[nom] || nom} — échec ${s.echecs}/${seuil} :`,
+      err
+    );
+    if (s.echecs >= seuil && !s.arret) {
+      s.arret = true;
+      noterFait(nom, 'arrêté', `${s.echecs} échec(s) d’affilée`);
+      console.error(
+        `[WikiMasters Tools] ${SOUS_SYSTEMES[nom] || nom} — arrêté après `
+        + `${s.echecs} échec(s) d’affilée. Dernier : ${s.dernier}`
+      );
+      renderPannes();
+    }
+    return s.arret;
+  }
+
+  const enPanne = (nom) => !!(state.sains[nom] && state.sains[nom].arret);
+
+  /*
+   * Ce que « le tour a réussi » veut dire — et pourquoi un `catch` ne suffit
+   * pas. C'est le piège de ce fichier, et il a failli faire poser un filet
+   * qui n'attrape rien.
+   *
+   * Le code est très défensif, chaque étage rattrape le sien : `scanSales()`
+   * avale son échec réseau, `fetchMySales()` rend `null` plutôt que de lever,
+   * et `reconcileWatch()` se retire poliment quand le relevé des ventes est
+   * périmé — « le tour suivant rattrapera ». Trois `try` bien élevés, zéro
+   * exception, et une relance qui ne relance plus rien. Éprouvé au banc : en
+   * coupant tout le réseau sauf l'ouverture des paquets, la relance échouait
+   * soixante fois par minute et le compteur d'échecs restait à ZÉRO.
+   *
+   * Le verdict porte donc sur le RÉSULTAT, pas sur l'absence d'exception : le
+   * relevé des ventes est-il frais ? C'est la donnée dont dépendent la relance
+   * et la surveillance du Marché ; si elle cesse de se rafraîchir, les deux
+   * tournent à vide, qu'il y ait eu exception ou non.
+   *
+   * La même borne sert à `reconcileWatch`, qui refuse d'agir en dessous : deux
+   * chiffres séparés dériveraient, et le tour serait alors jugé bon pendant
+   * que la fonction qu'il appelle refuse de travailler.
+   */
+  const VENTES_POUR_AGIR_MS = 60000;
+  const ventesSuresPourAgir = () => Date.now() - state.sales.at < VENTES_POUR_AGIR_MS;
+
+  /** Le bouton « Réessayer » de la note : on repart, sans rien effacer du journal. */
+  function relancerSousSysteme(nom) {
+    const s = suivi(nom);
+    s.echecs = 0;
+    s.depuis = 0;
+    s.arret = false;
+    noterFait(nom, 'relancé', 'à la main');
+    renderPannes();
+  }
+
+  // -------------------------------------------- les sélecteurs du site, surveillés
+
+  /*
+   * La dépendance la plus fragile du fichier, et ce n'est pas celle qu'on
+   * croit.
+   *
+   * `FILTER_ROW` (« .flex.flex-wrap.gap-2 ») et `CARD_ITEM`
+   * (« .relative.isolate.group ») ne sont faits que de classes utilitaires
+   * Tailwind. Une recompilation du site avec une purge différente, ou un autre
+   * bloc qui porte les mêmes trois classes, et le script vise le mauvais
+   * élément — ou plus rien. Dans ce cas la fonction ne fait SIMPLEMENT RIEN :
+   * pas d'exception, pas de trace, pas de message. Le filtre « Nouveaux » ne
+   * paraît plus, la recherche ne s'applique plus, et rien ne dit pourquoi.
+   *
+   * (La lecture directe des jetons Supabase, qui a l'air bien plus risquée,
+   * est en comparaison la mieux défendue du fichier : trois formats tolérés,
+   * tout sous `try/catch`, et un repli documenté pour chaque appelant.)
+   *
+   * On ne peut pas rendre ces sélecteurs robustes — ils décrivent un balisage
+   * qui ne nous appartient pas. On peut rendre leur perte RACONTABLE : un
+   * compteur d'échecs d'affilée, et une ligne au diagnostic. Ce qui arrivera
+   * un jour cesse alors d'être « le panneau ne fait plus rien » pour devenir
+   * « le sélecteur de la barre de filtres n'a rien trouvé 40 fois ».
+   *
+   * Le seuil est haut à dessein : ces sélecteurs manquent LÉGITIMEMENT tant
+   * que React n'a pas rendu la page, ou juste après une navigation. Dix
+   * passages à vide d'affilée, en revanche, ne s'expliquent plus par un
+   * retard de rendu.
+   */
+  const SELECTEUR_ALERTE = 10;
+
+  /*
+   * Les noms sont ceux qu'on lirait à voix haute, pas ceux des constantes :
+   * le compteur finit dans un diagnostic collé sur le Discord, où « la barre
+   * de filtres » se comprend et « FILTER_ROW » ne se comprend pas.
+   */
+  const NOM_FILTRES = 'la barre de filtres';
+  const NOM_TUILE = 'la tuile d’une carte';
+  const NOM_RECHERCHE = 'le champ de recherche';
+
+  /**
+   * Retient ce qu'un sélecteur du site vient de donner, et rend l'élément tel
+   * quel — pour s'insérer dans une expression sans rien changer à son sens.
+   */
+  function marquerSelecteur(nom, sel, el) {
+    const s = state.selecteurs[nom]
+      || (state.selecteurs[nom] = { sel, vus: 0, manques: 0, depuis: 0, perdu: false });
+    if (el) {
+      if (s.perdu) {
+        noterFait('sélecteur', 'rétabli', nom);
+        console.info(`[WikiMasters Tools] le sélecteur « ${nom} » retrouve son élément.`);
+      }
+      s.vus += 1;
+      s.manques = 0;
+      s.depuis = 0;
+      s.perdu = false;
+      return el;
+    }
+    s.manques += 1;
+    if (!s.depuis) s.depuis = Date.now();
+    if (s.manques >= SELECTEUR_ALERTE && !s.perdu) {
+      s.perdu = true;
+      noterFait('sélecteur', 'perdu', `${nom} (${sel})`);
+      console.warn(
+        `[WikiMasters Tools] le sélecteur « ${nom} » (${sel}) n’a rien trouvé `
+        + `${s.manques} fois de suite. Le site a probablement changé son balisage : `
+        + 'c’est à signaler, la fonction qui en dépend ne fait plus rien.'
+      );
+    }
+    return null;
+  }
+
+  /** `document.querySelector`, mais qui se souvient de ses échecs. */
+  const vu = (nom, sel, racine) =>
+    marquerSelecteur(nom, sel, (racine || document).querySelector(sel));
+
+  /** `Element.closest`, même mémoire. */
+  const vuAutour = (nom, sel, depuis) =>
+    marquerSelecteur(nom, sel, (depuis && depuis.closest(sel)) || null);
 
   /*
    * Ce que le panneau fait SANS qu'on lui demande.
@@ -485,8 +795,21 @@
   function saveStore(patch) {
     try {
       localStorage.setItem(STORE_KEY, JSON.stringify({ ...loadStore(), ...patch }));
-    } catch (_) {
-      /* stockage indisponible : on tourne sans mémoriser */
+      noterSucces('stockage');
+    } catch (err) {
+      /*
+       * « on tourne sans mémoriser » : c'est vrai, et c'était muet.
+       *
+       * Sur les gros comptes — N cartes, ~N lignes de cote — le quota
+       * du navigateur se remplit, et ce qui cesse d'être écrit ne se voit pas :
+       * on constate juste que « ça rescanne à chaque fois », ou qu'un réglage
+       * ne tient pas au rechargement, sans jamais savoir pourquoi. La cause est
+       * ici, et elle tient en une ligne à l'écran.
+       *
+       * Seuil de 1 : le stockage ne se compte pas en tours. Il refuse tout de
+       * suite ou jamais, et un deuxième essai ne dirait rien de plus.
+       */
+      noterEchec('stockage', err, 1);
     }
   }
 
@@ -553,7 +876,31 @@
      * Marqueur neuf, encore : `debitVerrou` est déjà posé partout où la 2.13.0
      * est passée, et une condition qui le relit ne s'exécuterait jamais.
      */
-    if (!s.debitCliquet) {
+    /*
+     * ET C'EST LA DERNIÈRE MIGRATION QUI SE DEVINE.
+     *
+     * Les trois commentaires ci-dessus racontent la même mésaventure trois
+     * fois : un marqueur booléen posé pour une migration, puis inutilisable
+     * pour la suivante parce qu'il est DÉJÀ posé là où la précédente est
+     * passée. D'où `debitRecalibre`, puis `debitVerrou`, puis `debitCliquet` —
+     * trois clés dans le même blob, dont deux ne servent plus à rien et que
+     * personne n'osera jamais retirer, faute de savoir qui les lit encore.
+     * Chaque migration coûtait plus cher que la précédente.
+     *
+     * Un numéro règle ça une bonne fois : une migration se compare, elle ne se
+     * devine plus. La quatrième s'écrira `if (schema < 4)`, et le marqueur de
+     * la troisième n'aura pas à être inventé.
+     *
+     * Le numéro est DÉDUIT des anciens marqueurs quand il manque, et c'est le
+     * point délicat : traiter « pas de numéro » comme « schéma 0 » rejouerait
+     * les trois recalibrages chez tout le monde, c'est-à-dire effacerait un
+     * plancher légitimement appris. On ne migre que ce qui n'a pas migré.
+     */
+    const schemaLu = Number.isFinite(s.schema)
+      ? s.schema
+      : (s.debitCliquet ? 3 : s.debitVerrou ? 2 : s.debitRecalibre ? 1 : 0);
+
+    if (schemaLu < 3) {
       saveStore({ debitCliquet: true, probeFloorMs: 0, delayMs: CFG.startDelayMs });
     } else {
       if (Number.isFinite(s.probeFloorMs)) {
@@ -676,6 +1023,14 @@
       state.history = Array.isArray(st.history) ? st.history.slice(0, CFG.historyLength) : [];
       state.since = st.since || Date.now();
     }
+
+    /*
+     * Et on inscrit le numéro, une fois la relecture faite. Écrit en dernier,
+     * pas en premier : si quoi que ce soit au-dessus lève, le stockage garde
+     * son ancien numéro et la migration se rejouera au prochain démarrage —
+     * ce qui est le bon sens de l'erreur.
+     */
+    if (schemaLu !== SCHEMA) saveStore({ schema: SCHEMA });
   }
 
   function persistStats() {
@@ -749,7 +1104,40 @@
 
   // Les deux pages filtrent en mémoire, via un champ au placeholder « Rechercher ».
   const SEARCHABLE = ['/collection', '/marketplace'];
+  /*
+   * UN seul sélecteur pour le champ de recherche du site.
+   *
+   * Il en existait deux : celui-ci, et un « Recherch » écrit en dur dans la
+   * navigation vers les échanges — préfixe plus court, sans explication.
+   * Personne ne savait plus lequel disait vrai, et une page du site qui
+   * renomme son champ en aurait cassé un sans toucher l'autre. Deux vérités
+   * pour un même fait, c'est une de trop.
+   */
   const SEARCH_SELECTOR = 'input[placeholder*="Rechercher"]';
+
+  /*
+   * La marque que le site pose sur un filtre actif. Le prédicat était écrit
+   * deux fois, dans deux fonctions sans lien — la sélection d'une rareté dans
+   * la collection, et la lecture de la barre des souhaits — et il n'y a
+   * pourtant qu'un seul fait à connaître.
+   */
+  const chipActive = (btn) => /ring-2/.test((btn && btn.className) || '');
+
+  /*
+   * Combien de temps un bouton reste ARMÉ entre le premier clic et sa
+   * confirmation.
+   *
+   * Trois boutons du panneau demandent deux clics — la remise à zéro des
+   * compteurs, « Tout repasser en X minutes », « Tout souhaiter » — et ils
+   * portaient trois valeurs : 4 000, 6 000, 6 000. Rien n'expliquait le
+   * 4 000, et dans un fichier où chaque constante est justifiée, une valeur
+   * sans raison est le signe d'une accrétion, pas d'un choix.
+   *
+   * On tranche pour 6 000, la seule des trois qui portait une raison : le
+   * compte annoncé doit avoir le temps d'être LU. Ce délai ne dépend pas du
+   * bouton, il dépend de l'œil qui lit — et c'est le même œil.
+   */
+  const ARME_MS = 6000;
 
   // --------------------------------------------- repérage dans la collection
 
@@ -816,7 +1204,7 @@
 
   function injectNewFilter() {
     if (!location.pathname.startsWith('/collection')) return;
-    const row = document.querySelector(FILTER_ROW);
+    const row = vu(NOM_FILTRES, FILTER_ROW);
     if (!row) return;
 
     // Venu par le menu : on n'ajoute rien, et on retire un bouton résiduel.
@@ -857,10 +1245,18 @@
     const fresh = freshTitles();
 
     const items = [];
-    for (const h of document.querySelectorAll('h3')) {
+    const titres = document.querySelectorAll('h3');
+    for (const h of titres) {
       const item = h.closest(CARD_ITEM);
       if (item) items.push({ item, isNew: fresh.has(h.textContent.trim()) });
     }
+    /*
+     * Une marque par PASSAGE, pas une par carte : la collection en porte des
+     * milliers, et le compteur ne mesurerait plus que leur nombre. Et rien
+     * n'est marqué tant que la page n'a pas rendu ses titres — sans eux, il
+     * n'y a pas de tuile à trouver, c'est un fait sur le rendu, pas sur nous.
+     */
+    if (titres.length) marquerSelecteur(NOM_TUILE, CARD_ITEM, items.length ? items[0].item : null);
     const visible = items.filter((x) => x.isNew).length;
 
     /*
@@ -1144,7 +1540,7 @@
 
   function injectValueSort() {
     if (!location.pathname.startsWith('/collection')) return;
-    const row = document.querySelector(FILTER_ROW);
+    const row = vu(NOM_FILTRES, FILTER_ROW);
     if (!row) return;
     /*
      * L'avertissement doit être là AVANT qu'on se fie au tri, pas après l'avoir
@@ -2407,7 +2803,7 @@
     const token = sbToken();
     if (!token) return null;
     try {
-      const res = await fetch(`${sbUrl()}/${path}`, {
+      const res = await fetchBorne(`${sbUrl()}/${path}`, {
         credentials: 'omit',
         headers: { apikey: SB_ANON, Authorization: `Bearer ${token}`, Accept: 'application/json' },
       });
@@ -2424,7 +2820,7 @@
     const token = sbToken();
     if (!token) return null;
     try {
-      const res = await fetch(`${sbUrl()}/rpc/${nom}`, {
+      const res = await fetchBorne(`${sbUrl()}/rpc/${nom}`, {
         method: 'POST',
         credentials: 'omit',
         headers: {
@@ -2465,7 +2861,7 @@
     const token = sbToken();
     if (!token) return { ok: false, status: 0, raison: 'jeton' };
     try {
-      const res = await fetch(`${sbUrl()}/${path}`, {
+      const res = await fetchBorne(`${sbUrl()}/${path}`, {
         method,
         credentials: 'omit',
         headers: {
@@ -2493,7 +2889,7 @@
   window.wmSchema = async function (filtre) {
     const token = sbToken();
     if (!token) return 'Aucun jeton lisible — êtes-vous connecté au site ?';
-    const res = await fetch(`${sbUrl()}/`, {
+    const res = await fetchBorne(`${sbUrl()}/`, {
       credentials: 'omit',
       headers: { apikey: SB_ANON, Authorization: `Bearer ${token}`, Accept: 'application/openapi+json' },
     });
@@ -2607,10 +3003,11 @@
    *
    * Décidé, mesures à l'appui, puis clos : au-dessus on ne donne pas, en
    * dessous ça ne rapporte pas assez par rencontre. Ce qui est rare n'est pas
-   * la place — plusieurs milliers de créneaux par semaine, moins de 0,5 % utilisés — mais
-   * qu'un souhait tombe sur une carte détenue. Chaque rencontre doit donc
-   * rapporter le plus possible, et la SR est le point d'équilibre : 500 karma
-   * pour une carte qui vaut 21 wikibidous à la revente.
+   * la place — une grande guilde en ouvre des milliers par semaine, dont
+   * moins de 0,5 % sont utilisés — mais qu'un souhait tombe sur une carte
+   * détenue. Chaque rencontre doit donc rapporter le plus possible, et la SR
+   * est le point d'équilibre : 500 karma pour une carte qui vaut 21
+   * wikibidous à la revente.
    *
    * Le panneau ne réargumente pas ce choix à chaque affichage : il s'y tient.
    */
@@ -2996,7 +3393,22 @@
   }
 
   async function refreshGuild(force) {
-    if (!force && Date.now() - (state.guild.at || 0) < GUILD_FRESH_MS) return;
+    /*
+     * La fraîcheur se compte sur la dernière TENTATIVE, pas sur le dernier
+     * succès.
+     *
+     * `state.guild.at` n'est écrit qu'en cas de réussite : un serveur qui
+     * cesse de répondre comme attendu laissait donc l'horodatage à zéro, et ce
+     * relevé — appelé par un tour d'une minute — repartait toutes les soixante
+     * secondes au lieu de toutes les cinq minutes. Mesuré au banc : 59 appels
+     * par heure au lieu de 12, sur un onglet qui ne fait rien d'autre.
+     *
+     * C'est la même famille que les tours secondaires du lot 1 : ce qui échoue
+     * en silence finit par coûter plus cher que ce qui marche.
+     */
+    const derniereTentative = Math.max(state.guild.at || 0, state.guildTenteA || 0);
+    if (!force && Date.now() - derniereTentative < GUILD_FRESH_MS) return;
+    state.guildTenteA = Date.now();
 
     /*
      * Un seul appel. Le classement des guildes partait aussi, toutes les cinq
@@ -3062,6 +3474,7 @@
     // tableau de bord ressorti périmé au rechargement induit en erreur.
     apprendKarma(avant, apres, dernier && { rarete: dernier.card && dernier.card.rarity });
     state.guild = apres;
+    noterSucces('guilde');
 
     /*
      * Une seule requête, à chaque relevé : lesquelles de ces cartes sont
@@ -3815,8 +4228,44 @@
   // Un tour de guetteur encore en vol : le suivant passe son chemin.
   let tickBusy = false;
 
+  /*
+   * Le guetteur ralentit quand il n'a rien à garder.
+   *
+   * Mesuré au banc, onglet laissé ouvert et boucle ARRÊTÉE : 749 appels par
+   * heure, dont **720 d'ici** — trois relevés toutes les quinze secondes, que
+   * vous ayez une vente en cours ou aucune. Un onglet oublié une nuit, c'est
+   * neuf mille requêtes pour rien.
+   *
+   * Le remède n'est PAS de dormir quand l'onglet est caché, et c'est le piège
+   * de ce réglage : cet outil travaille exprès en arrière-plan. Le guetteur ne
+   * recharge le Marché que lorsque vous êtes ailleurs, et la boucle ouvre des
+   * paquets dans un onglet de fond. Se taire quand on ne nous regarde pas
+   * reviendrait à se taire pendant qu'on travaille.
+   *
+   * Ce qui décide, c'est donc s'il y a quelque chose à garder : une vente qui
+   * court, une enchère menée, une carte en file de relance. Tant qu'il y en a
+   * une, le rythme reste à quinze secondes — c'est là que la latence compte,
+   * puisque c'est là qu'une surenchère peut tomber. Sinon on passe à la
+   * minute, et le premier tour qui trouve quelque chose remet le rythme
+   * aussitôt.
+   *
+   * Le coût à vide est divisé par quatre ; la latence, quand elle sert, ne
+   * bouge pas d'une seconde.
+   */
+  const BIDS_REPOS_MS = 60000;
+  let dernierTourMarche = 0;
+
+  const rienAGarder = () =>
+    !stillRunning(state.bids.list).length
+    && !stillRunning(state.sales.list).length
+    && !Object.keys(state.watch).length;
+
   function bidTick() {
     if (!prefs.watchBids) return;
+    // Le tout premier tour passe toujours : sans lui, on ne saurait pas encore
+    // s'il y a quelque chose à garder.
+    if (rienAGarder() && Date.now() - dernierTourMarche < BIDS_REPOS_MS) return;
+    dernierTourMarche = Date.now();
 
     /*
      * Tant que l'onglet est sous tes yeux, le guetteur ne touche à RIEN : il
@@ -3830,13 +4279,27 @@
      * n'empêchait le tour SUIVANT de démarrer sur un tour encore en vol, et
      * d'empiler des chaînes qui se marchent dessus.
      */
-    if (!tickBusy) {
+    /*
+     * Le `finally` sans `catch` était un piège : une erreur non réseau dans
+     * cette chaîne devenait un rejet de promesse non intercepté, répété toutes
+     * les 15 s et SANS le préfixe « [WikiMasters Tools] » — donc noyé dans les
+     * erreurs propres du site, exactement là où personne ne saura le
+     * distinguer. Le filet le nomme, le compte, et finit par arrêter ce
+     * tour-ci plutôt que de le laisser saigner en silence.
+     */
+    if (!tickBusy && !enPanne('marche')) {
       tickBusy = true;
       (async () => {
         try {
           await scanSales();
           await syncJournal();
           await reconcileWatch();
+          // Le verdict porte sur ce que le tour RAPPORTE, pas sur son silence :
+          // les trois appels ci-dessus rattrapent chacun leur échec réseau.
+          if (!ventesSuresPourAgir()) throw new Error('le relevé des ventes ne se rafraîchit plus');
+          noterSucces('marche');
+        } catch (err) {
+          noterEchec('marche', err);
         } finally {
           tickBusy = false;
         }
@@ -3888,12 +4351,24 @@
      */
     let wishBusy = false;
     setInterval(async () => {
-      if (!prefs.watchWish || wishBusy) return;
+      if (!prefs.watchWish || wishBusy || enPanne('souhaits')) return;
       wishBusy = true;
       try {
+        const avant = state.wishHits.at;
         await scanWishMarket();
-      } catch (_) {
-        /* le tour suivant rattrapera */
+        /*
+         * Rien à surveiller — aucune carte souhaitée — est un tour RÉUSSI, pas
+         * un échec : il n'y avait rien à relever. On ne juge donc que les tours
+         * qui avaient du travail, et on les juge sur leur relevé.
+         */
+        if (Object.keys(state.wish.cards || {}).length && state.wishHits.at === avant) {
+          throw new Error('le balayage du marché n’a rien pu relever');
+        }
+        noterSucces('souhaits');
+      } catch (err) {
+        // « le tour suivant rattrapera » — vrai jusqu'au jour où il ne
+        // rattrape plus. Le compteur tranche entre les deux.
+        noterEchec('souhaits', err);
       } finally {
         wishBusy = false;
       }
@@ -3942,6 +4417,21 @@
     }
   }
 
+  // ------------------------------------------------ navigation dans le site
+
+  /*
+   * Ce qui suit n'a rien à voir avec le verrou : ce sont les gestes de
+   * navigation dans les pages du jeu — poser une recherche en attente, ouvrir
+   * une carte, suivre un lien sans recharger le SPA.
+   *
+   * Le titre est là pour une raison précise. `npm run couverture` découpe le
+   * fichier sur ces titres, et cette section-ci en portait ONZE fonctions dont
+   * trois seulement concernaient le verrou. Le tableau annonçait « verrou :
+   * 54 % mort » et on en a tiré la conclusion qu'il fallait éprouver le
+   * verrou — ce qui était vrai, mais pas pour cette raison : les 54 % étaient
+   * ceux de la navigation, que le banc ne touche pas. Un tableau qui range
+   * deux choses sous un seul nom fait chercher au mauvais endroit.
+   */
   function openFilteredOn(title, target, rarity) {
     try {
       localStorage.setItem(
@@ -3979,8 +4469,7 @@
     for (const label of RARITIES) {
       const btn = rarityButtons().find((b) => b.textContent.trim() === label);
       if (!btn) continue;
-      const active = /ring-2/.test(btn.className);
-      if (active !== (label === target)) {
+      if (chipActive(btn) !== (label === target)) {
         btn.click();
         await new Promise((r) => setTimeout(r, 120));
       }
@@ -4029,9 +4518,17 @@
       const input = document.querySelector(SEARCH_SELECTOR);
       if (input) {
         clearInterval(id);
+        marquerSelecteur(NOM_RECHERCHE, SEARCH_SELECTOR, input);
         setReactInput(input, q);
       } else if (++tries > 40) {
         clearInterval(id);
+        /*
+         * Dix secondes d'attente sans champ de recherche : ce n'est plus un
+         * retard de rendu. C'est le seul des trois sélecteurs dont l'attente a
+         * une fin franche, donc le seul qu'on marque à l'abandon plutôt qu'à
+         * chaque coup d’œil.
+         */
+        marquerSelecteur(NOM_RECHERCHE, SEARCH_SELECTOR, null);
       }
     }, 250);
   }
@@ -4554,12 +5051,12 @@
    *   cesserait de monter le jour où l'on coche la case.
    */
   async function api(url, method = 'GET', body, viaFetch) {
-    const res = await (viaFetch || fetch)(url, {
+    const res = await fetchBorne(url, {
       method,
       credentials: 'same-origin',
       headers: { 'Content-Type': 'application/json' },
       ...(body ? { body: JSON.stringify(body) } : {}),
-    });
+    }, viaFetch);
     let data = null;
     try {
       data = await res.json();
@@ -5192,6 +5689,220 @@
    */
   let loopEpoch = 0;
 
+  /*
+   * LES CINQ ISSUES D'UNE OUVERTURE, une fonction chacune.
+   *
+   * `loop` faisait 314 lignes, dont l'essentiel était ces cinq branches —
+   * autonomes depuis toujours : elles ne partagent que `state`, `mine()` et
+   * la réponse. Leur densité, elle, est réelle : c'est l'apprentissage du
+   * débit, et leurs commentaires documentent des régressions vues sur un
+   * compte. Chaque commentaire est donc parti AVEC sa branche ; aucun n'est
+   * resté orphelin en tête de fonction.
+   *
+   * La convention est la même pour les cinq : rendre `SUITE` quand le tour
+   * suivant peut partir, `FIN` quand la boucle s'arrête ici. C'est ce que
+   * disaient `continue` et `return` avant le découpage.
+   */
+  const SUITE = true;
+  const FIN = false;
+
+  /** Un paquet ouvert. */
+  async function surPaquetOuvert(data, mine, tour) {
+    state.throttles = 0;
+    // Le dernier succès réseau de la boucle, daté. C'est la première ligne
+    // que cherche quelqu'un qui demande « depuis quand ça ne marche plus ».
+    noterSucces('boucle');
+    if (state.reserve != null) state.reserve = Math.max(0, state.reserve - 1);
+    /*
+     * Succès : on grignote le délai pour retrouver le rythme réel, sans
+     * repasser sous le plancher appris — inutile de retourner buter dans
+     * un mur déjà rencontré.
+     *
+     * Ce mur bouge, lui : le jeu a déjà assoupli son débit une fois. Après
+     * une longue série sans refus on rabote donc le plancher appris, ce qui
+     * fait redescendre le délai d'un cran. Si c'était trop tôt, le 429
+     * suivant le remonte — au pire un aller-retour tous les quarante paquets.
+     *
+     * Le pas est ADDITIF, et de la même famille que la marge qui pose le
+     * plancher — un peu plus petit qu'elle. Deux règles proportionnelles se
+     * sont succédé ici, et toutes deux ont fini par dériver : la détente
+     * traversait ce que la marge défendait, et le plancher montait par
+     * cliquet. Voir `probeMarginMs` pour le détail et les mesures.
+     */
+    state.delayMs = Math.max(floorMs(), state.delayMs - CFG.decayMs);
+    if (state.probeFloorMs && ++state.cleanHits >= CFG.probeAfterHits) {
+      state.cleanHits = 0;
+      const relaxed = state.probeFloorMs - CFG.probeRelaxMs;
+      state.probeFloorMs = relaxed <= CFG.floorDelayMs ? 0 : relaxed;
+    }
+    saveStore({ delayMs: state.delayMs, probeFloorMs: state.probeFloorMs });
+
+    /*
+     * Relecture du profil collée à l'ouverture : elle donne le compteur de
+     * pitié de CE tirage, et par la même occasion la réserve exacte qui
+     * vient d'être décrémentée. Une requête par paquet — on en a supprimé
+     * cinq en passant la cote en base, le solde reste largement positif.
+     */
+    const prof = await refreshPacks(true);
+    // Journalisé avant tout retrait : ces cartes sont créditées, même si
+    // une relance de boucle a eu lieu pendant la lecture.
+    record(data.cards, undefined, prof && prof.pity_counter);
+    if (!mine()) return FIN;
+    refreshOwned();
+    // Cote des nouvelles cartes, en tâche de fond : la liste de revente
+    // reste à jour sans relevé complet.
+    priceCards(data.cards.map((c) => ({ id: c.id, t: c.wikipedia_title, r: c.rarity, tags: [] })));
+    setStatus('Paquet ouvert');
+    tour.refusPerimes = 0;   // la série de refus périmés est close
+    await sleep(jittered(state.delayMs));
+    return SUITE;
+  }
+
+  /** Réserve vide : le serveur dit quand il en aura un autre — ou ne le dit pas. */
+  async function surReserveVide(data, mine, tour) {
+    state.reserve = 0;
+    const target = data.next_regen_at ? Date.parse(data.next_regen_at) : NaN;
+    if (Number.isFinite(target)) {
+      learnCadence(target);
+      state.nextRegenAt = target;
+    }
+    /*
+     * Sans échéance annoncée, on attend une cadence mesurée plutôt qu'un
+     * délai fixe : 90 s de repli feraient sept sondages inutiles par cycle
+     * sur un compte sans PRO, où la régénération prend dix minutes.
+     *
+     * Une échéance DÉJÀ PASSÉE compte pour non annoncée, et c'est le point.
+     *
+     * `waitUntil` sort aussitôt d'une échéance dans le passé — sa boucle
+     * ne s'exécute pas une fois — et la boucle repostait donc sur-le-champ,
+     * sans le moindre délai. Plus rien ne la freinait que le refus du
+     * serveur : 403, retente immédiate, 429, léger recul, 403 encore.
+     * Relevé dans la console d'un vrai compte, en alternance serrée, là où
+     * un refus doit produire un silence de plusieurs minutes.
+     *
+     * On ne peut pas savoir d'ici POURQUOI le serveur rend un horodatage
+     * périmé — réserve épuisée qu'il n'a pas recréditée, compte bridé,
+     * horloges décalées. Mais aucune de ces raisons ne justifie de le
+     * marteler : on retombe sur la cadence mesurée, exactement comme
+     * lorsqu'il n'annonce rien du tout.
+     */
+    const annoncee = Number.isFinite(target) && target > Date.now();
+    const deadline = annoncee ? target : Date.now() + state.cadenceMs;
+
+    /*
+     * Échéance périmée : avant d'attendre une cadence en aveugle, on
+     * DEMANDE. Le profil porte `packs_remaining` et se lit par une requête
+     * ordinaire — pas par l'ouverture, qui est l'endpoint que le serveur
+     * limite. Si le profil dit qu'il en reste, le refus était en retard sur
+     * lui-même : on repart sans attendre trois minutes pour rien.
+     *
+     * Une seule relecture par série, et jamais plus vite que le délai
+     * mesuré. Si l'ouverture et le profil se contredisent durablement,
+     * insister ne ferait que remplacer un martèlement par un autre : au
+     * second refus périmé d'affilée, on attend pour de bon.
+     */
+    if (!annoncee && tour.refusPerimes === 0) {
+      tour.refusPerimes += 1;
+      const prof = await refreshPacks(true);
+      if (!mine()) return FIN;
+      if (prof && state.reserve > 0) {
+        await sleep(jittered(state.delayMs));
+        return SUITE;
+      }
+    }
+    await waitUntil(deadline, 'Prochain paquet dans', mine);
+    return SUITE;
+  }
+
+  /** Session expirée. */
+  function surSessionExpiree() {
+    stop('Session expirée — reconnectez-vous puis relancez.', true);
+    return FIN;
+  }
+
+  /*
+   * Le serveur throttle les appels rapprochés. On ralentit durablement au
+   * lieu d'insister — et surtout on RETIENT le délai qui vient d'être
+   * refusé : c'est la seule mesure fiable du débit autorisé, et le jeu
+   * l'a déjà changé une fois. Le plancher se pose une marge au-dessus de ce
+   * délai, le délai courant recule plus largement puis redescend jusqu'à
+   * ce plancher au fil des succès.
+   *
+   * La marge est ADDITIVE, et les deux gardes qui suivent tiennent à ça :
+   * seul le premier refus d'une série compte, et seulement s'il a testé le
+   * plancher. Voir `probeMarginMs` pour ce qu'a coûté chacune.
+   */
+  /** Débit limité. */
+  async function surDebitLimite(retryMs, mine) {
+    state.throttles += 1;
+    state.cleanHits = 0;
+    /*
+     * Seul le PREMIER refus d'une série renseigne sur le débit soutenable.
+     * Les suivants tombent alors qu'on recule déjà : ce n'est pas une
+     * mesure nouvelle, c'est le même incident qui se prolonge. Les compter
+     * faisait enfler le plancher en composé — sept refus d'affilée le
+     * portaient à 40 s, soit près du plafond, d'où l'on ne redescendait
+     * qu'en 1 520 paquets sans le moindre refus.
+     *
+     * Le délai courant, lui, continue de doubler : c'est le recul, et il
+     * doit bien répondre à chaque refus.
+     */
+    /*
+     * Et il ne renseigne que s'il a TESTÉ le plancher.
+     *
+     * Le délai courant peut être très au-dessus : il grandit de 60 % par
+     * refus et ne redescend que de 250 ms par succès. Un refus qui tombe
+     * pendant cette redescente ouvre bien une série neuve — les compteurs
+     * ont été remis à zéro par le succès qui précède — mais il ne dit rien
+     * de notre rythme : à ce délai-là, on ne testait plus rien.
+     *
+     * Le poser quand même sur ce délai gonflé était le dernier cliquet, et
+     * il suffisait à lui seul. Reproduit sur le banc : trois succès, une
+     * série de quatre refus, un succès, un refus — plancher de 1 550 à
+     * 8 242 ms d'un coup. Deux cycles de plus et c'est le plafond. C'est
+     * l'état trouvé sur un compte réel en 2.13.0, migration passée : les
+     * deux à 60 000 ms moins d'une heure après une remise à zéro.
+     *
+     * La marge additive bornait le PAS, pas la BASE. On exige donc que le
+     * délai refusé soit à portée du plancher — sinon le refus vient
+     * d'ailleurs (une rafale, un autre appel, un hoquet du serveur) et
+     * n'apprend rien sur l'espacement des ouvertures. Le premier refus,
+     * lui, compte toujours : sans plancher, c'est notre seule mesure.
+     */
+    if (state.throttles === 1) {
+      const aTeste = !state.probeFloorMs
+        || state.delayMs <= floorMs() + CFG.probeMarginMs;
+      if (aTeste) {
+        state.probeFloorMs = Math.min(CFG.ceilDelayMs, state.delayMs + CFG.probeMarginMs);
+      }
+    }
+    state.delayMs = Math.min(CFG.ceilDelayMs, Math.round(state.delayMs * CFG.growth));
+    saveStore({ delayMs: state.delayMs, probeFloorMs: state.probeFloorMs });
+    if (state.throttles > CFG.maxThrottleRetries) {
+      stop(`Toujours limité après ${CFG.maxThrottleRetries} tentatives.`, true);
+      return FIN;
+    }
+    // Le recul deviné double à chaque refus consécutif ; une consigne
+    // explicite du serveur, elle, se suit telle quelle.
+    const wait = retryMs || CFG.throttleBackoffMs * 2 ** (state.throttles - 1);
+    await waitUntil(Date.now() + wait, 'Débit limité — reprise dans', mine);
+    return SUITE;
+  }
+
+  /** Tout le reste : on ne devine pas, on s'arrête. */
+  function surReponseInattendue(status, data) {
+  /*
+   * La charge utile allait à l'écran — 120 caractères de réponse serveur
+   * bruts, dans la ligne d'état, celle qu'on voit depuis tous les onglets.
+   * On ne sait pas ce que le serveur y met, et l'utilisateur n'en fait
+   * rien : le panneau dit que la boucle s'arrête et sur quel statut, la
+   * réponse va en console pour qui saura la lire.
+   */
+  console.info(`[WikiMasters Tools] réponse inattendue (${status}) :`, data);
+  stop('Le site a répondu autre chose que prévu — arrêt par précaution.', true);
+  return FIN;
+  }
+
   async function loop(epoch) {
     // Vrai tant que cette boucle-ci est la boucle courante.
     const mine = () => state.running && epoch === loopEpoch;
@@ -5202,7 +5913,14 @@
      * contredisent durablement, insister remplacerait un martèlement par un
      * autre. Remis à zéro dès qu'un paquet s'ouvre.
      */
-    let refusPerimes = 0;
+    /*
+     * Le seul état que deux branches se partagent : les refus dont
+     * l'échéance était déjà passée. Il vit ICI, le temps d'une boucle, et
+     * voyage explicitement — le hisser au niveau du fichier le ferait
+     * survivre à un `stop()` puis à un `start()`, et une série close
+     * repartirait avec le compte de la précédente.
+     */
+    const tour = { refusPerimes: 0 };
 
     while (mine()) {
       /*
@@ -5272,7 +5990,18 @@
          * reste du panneau. Il va en console, où il sert.
          */
         console.warn('[WikiMasters Tools] appel réseau échoué :', err);
-        return stop('Le site est injoignable — vérifiez votre connexion, puis relancez.', true);
+        /*
+         * Un serveur qui pend et un réseau coupé ne se cherchent pas au même
+         * endroit : le premier n'a rien à voir avec la connexion de qui lit,
+         * et l'envoyer vérifier sa box, c'est l'envoyer au mauvais endroit.
+         */
+        return stop(
+          err && err.expiration
+            ? 'Le site a accepté la connexion sans jamais répondre — arrêt au bout de '
+              + `${Math.round(RESEAU_TIMEOUT_MS / 1000)} s. Réessayez plus tard.`
+            : 'Le site est injoignable — vérifiez votre connexion, puis relancez.',
+          true
+        );
       }
 
       const { status, data, retryMs } = res;
@@ -5293,189 +6022,28 @@
 
       if (needsHuman(status, data)) return handOver();
 
-      if (status === 200 && data && Array.isArray(data.cards)) {
-        state.throttles = 0;
-        if (state.reserve != null) state.reserve = Math.max(0, state.reserve - 1);
-        /*
-         * Succès : on grignote le délai pour retrouver le rythme réel, sans
-         * repasser sous le plancher appris — inutile de retourner buter dans
-         * un mur déjà rencontré.
-         *
-         * Ce mur bouge, lui : le jeu a déjà assoupli son débit une fois. Après
-         * une longue série sans refus on rabote donc le plancher appris, ce qui
-         * fait redescendre le délai d'un cran. Si c'était trop tôt, le 429
-         * suivant le remonte — au pire un aller-retour tous les quarante paquets.
-         *
-         * Le pas est ADDITIF, et de la même famille que la marge qui pose le
-         * plancher — un peu plus petit qu'elle. Deux règles proportionnelles se
-         * sont succédé ici, et toutes deux ont fini par dériver : la détente
-         * traversait ce que la marge défendait, et le plancher montait par
-         * cliquet. Voir `probeMarginMs` pour le détail et les mesures.
-         */
-        state.delayMs = Math.max(floorMs(), state.delayMs - CFG.decayMs);
-        if (state.probeFloorMs && ++state.cleanHits >= CFG.probeAfterHits) {
-          state.cleanHits = 0;
-          const relaxed = state.probeFloorMs - CFG.probeRelaxMs;
-          state.probeFloorMs = relaxed <= CFG.floorDelayMs ? 0 : relaxed;
-        }
-        saveStore({ delayMs: state.delayMs, probeFloorMs: state.probeFloorMs });
-
-        /*
-         * Relecture du profil collée à l'ouverture : elle donne le compteur de
-         * pitié de CE tirage, et par la même occasion la réserve exacte qui
-         * vient d'être décrémentée. Une requête par paquet — on en a supprimé
-         * cinq en passant la cote en base, le solde reste largement positif.
-         */
-        const prof = await refreshPacks(true);
-        // Journalisé avant tout retrait : ces cartes sont créditées, même si
-        // une relance de boucle a eu lieu pendant la lecture.
-        record(data.cards, undefined, prof && prof.pity_counter);
-        if (!mine()) return;
-        refreshOwned();
-        // Cote des nouvelles cartes, en tâche de fond : la liste de revente
-        // reste à jour sans relevé complet.
-        priceCards(data.cards.map((c) => ({ id: c.id, t: c.wikipedia_title, r: c.rarity, tags: [] })));
-        setStatus('Paquet ouvert');
-        refusPerimes = 0;   // la série de refus périmés est close
-        await sleep(jittered(state.delayMs));
-        continue;
-      }
-
-      if (status === 403 && data && data.packs_remaining === 0) {
-        state.reserve = 0;
-        const target = data.next_regen_at ? Date.parse(data.next_regen_at) : NaN;
-        if (Number.isFinite(target)) {
-          learnCadence(target);
-          state.nextRegenAt = target;
-        }
-        /*
-         * Sans échéance annoncée, on attend une cadence mesurée plutôt qu'un
-         * délai fixe : 90 s de repli feraient sept sondages inutiles par cycle
-         * sur un compte sans PRO, où la régénération prend dix minutes.
-         *
-         * Une échéance DÉJÀ PASSÉE compte pour non annoncée, et c'est le point.
-         *
-         * `waitUntil` sort aussitôt d'une échéance dans le passé — sa boucle
-         * ne s'exécute pas une fois — et la boucle repostait donc sur-le-champ,
-         * sans le moindre délai. Plus rien ne la freinait que le refus du
-         * serveur : 403, retente immédiate, 429, léger recul, 403 encore.
-         * Relevé dans la console d'un vrai compte, en alternance serrée, là où
-         * un refus doit produire un silence de plusieurs minutes.
-         *
-         * On ne peut pas savoir d'ici POURQUOI le serveur rend un horodatage
-         * périmé — réserve épuisée qu'il n'a pas recréditée, compte bridé,
-         * horloges décalées. Mais aucune de ces raisons ne justifie de le
-         * marteler : on retombe sur la cadence mesurée, exactement comme
-         * lorsqu'il n'annonce rien du tout.
-         */
-        const annoncee = Number.isFinite(target) && target > Date.now();
-        const deadline = annoncee ? target : Date.now() + state.cadenceMs;
-
-        /*
-         * Échéance périmée : avant d'attendre une cadence en aveugle, on
-         * DEMANDE. Le profil porte `packs_remaining` et se lit par une requête
-         * ordinaire — pas par l'ouverture, qui est l'endpoint que le serveur
-         * limite. Si le profil dit qu'il en reste, le refus était en retard sur
-         * lui-même : on repart sans attendre trois minutes pour rien.
-         *
-         * Une seule relecture par série, et jamais plus vite que le délai
-         * mesuré. Si l'ouverture et le profil se contredisent durablement,
-         * insister ne ferait que remplacer un martèlement par un autre : au
-         * second refus périmé d'affilée, on attend pour de bon.
-         */
-        if (!annoncee && refusPerimes === 0) {
-          refusPerimes += 1;
-          const prof = await refreshPacks(true);
-          if (!mine()) return;
-          if (prof && state.reserve > 0) {
-            await sleep(jittered(state.delayMs));
-            continue;
-          }
-        }
-        await waitUntil(deadline, 'Prochain paquet dans', mine);
-        continue;
-      }
-
-      if (status === 401) {
-        return stop('Session expirée — reconnectez-vous puis relancez.', true);
-      }
-
       /*
-       * Le serveur throttle les appels rapprochés. On ralentit durablement au
-       * lieu d'insister — et surtout on RETIENT le délai qui vient d'être
-       * refusé : c'est la seule mesure fiable du débit autorisé, et le jeu
-       * l'a déjà changé une fois. Le plancher se pose une marge au-dessus de ce
-       * délai, le délai courant recule plus largement puis redescend jusqu'à
-       * ce plancher au fil des succès.
-       *
-       * La marge est ADDITIVE, et les deux gardes qui suivent tiennent à ça :
-       * seul le premier refus d'une série compte, et seulement s'il a testé le
-       * plancher. Voir `probeMarginMs` pour ce qu'a coûté chacune.
+       * L'aiguillage. Les conditions sont celles d'avant, dans le même ordre :
+       * un 200 sans tableau de cartes, ou un 403 avec des paquets restants,
+       * tombent volontairement dans « réponse inattendue ».
        */
-      if (status === 429) {
-        state.throttles += 1;
-        state.cleanHits = 0;
-        /*
-         * Seul le PREMIER refus d'une série renseigne sur le débit soutenable.
-         * Les suivants tombent alors qu'on recule déjà : ce n'est pas une
-         * mesure nouvelle, c'est le même incident qui se prolonge. Les compter
-         * faisait enfler le plancher en composé — sept refus d'affilée le
-         * portaient à 40 s, soit près du plafond, d'où l'on ne redescendait
-         * qu'en 1 520 paquets sans le moindre refus.
-         *
-         * Le délai courant, lui, continue de doubler : c'est le recul, et il
-         * doit bien répondre à chaque refus.
-         */
-        /*
-         * Et il ne renseigne que s'il a TESTÉ le plancher.
-         *
-         * Le délai courant peut être très au-dessus : il grandit de 60 % par
-         * refus et ne redescend que de 250 ms par succès. Un refus qui tombe
-         * pendant cette redescente ouvre bien une série neuve — les compteurs
-         * ont été remis à zéro par le succès qui précède — mais il ne dit rien
-         * de notre rythme : à ce délai-là, on ne testait plus rien.
-         *
-         * Le poser quand même sur ce délai gonflé était le dernier cliquet, et
-         * il suffisait à lui seul. Reproduit sur le banc : trois succès, une
-         * série de quatre refus, un succès, un refus — plancher de 1 550 à
-         * 8 242 ms d'un coup. Deux cycles de plus et c'est le plafond. C'est
-         * l'état trouvé sur un compte réel en 2.13.0, migration passée : les
-         * deux à 60 000 ms moins d'une heure après une remise à zéro.
-         *
-         * La marge additive bornait le PAS, pas la BASE. On exige donc que le
-         * délai refusé soit à portée du plancher — sinon le refus vient
-         * d'ailleurs (une rafale, un autre appel, un hoquet du serveur) et
-         * n'apprend rien sur l'espacement des ouvertures. Le premier refus,
-         * lui, compte toujours : sans plancher, c'est notre seule mesure.
-         */
-        if (state.throttles === 1) {
-          const aTeste = !state.probeFloorMs
-            || state.delayMs <= floorMs() + CFG.probeMarginMs;
-          if (aTeste) {
-            state.probeFloorMs = Math.min(CFG.ceilDelayMs, state.delayMs + CFG.probeMarginMs);
-          }
-        }
-        state.delayMs = Math.min(CFG.ceilDelayMs, Math.round(state.delayMs * CFG.growth));
-        saveStore({ delayMs: state.delayMs, probeFloorMs: state.probeFloorMs });
-        if (state.throttles > CFG.maxThrottleRetries) {
-          return stop(`Toujours limité après ${CFG.maxThrottleRetries} tentatives.`, true);
-        }
-        // Le recul deviné double à chaque refus consécutif ; une consigne
-        // explicite du serveur, elle, se suit telle quelle.
-        const wait = retryMs || CFG.throttleBackoffMs * 2 ** (state.throttles - 1);
-        await waitUntil(Date.now() + wait, 'Débit limité — reprise dans', mine);
-        continue;
-      }
-
+      const suite = status === 200 && data && Array.isArray(data.cards)
+        ? await surPaquetOuvert(data, mine, tour)
+        : status === 403 && data && data.packs_remaining === 0
+          ? await surReserveVide(data, mine, tour)
+          : status === 401
+            ? surSessionExpiree()
+            : status === 429
+              ? await surDebitLimite(retryMs, mine)
+              : surReponseInattendue(status, data);
       /*
-       * La charge utile allait à l'écran — 120 caractères de réponse serveur
-       * bruts, dans la ligne d'état, celle qu'on voit depuis tous les onglets.
-       * On ne sait pas ce que le serveur y met, et l'utilisateur n'en fait
-       * rien : le panneau dit que la boucle s'arrête et sur quel statut, la
-       * réponse va en console pour qui saura la lire.
+       * `!== SUITE`, et non `=== FIN`. Une branche qui oublierait de rendre
+       * son verdict rendrait `undefined` : comparé à FIN, ça vaut « continue »,
+       * et la boucle repartirait sur une réponse qu'elle n'a pas su traiter.
+       * Comparé à SUITE, elle s'arrête. Des deux erreurs possibles, s'arrêter
+       * est celle qui n'ouvre pas de paquets.
        */
-      console.info(`[WikiMasters Tools] réponse inattendue (${status}) :`, data);
-      return stop('Le site a répondu autre chose que prévu — arrêt par précaution.', true);
+      if (suite !== SUITE) return;
     }
   }
 
@@ -5649,27 +6217,25 @@
    * l'échelle du panneau, et c'est un choix, pas un oubli. Si un jour une règle
    * redescend sous 10 px, c'est ce commentaire qu'il faut contredire.
    */
-  const PANEL_CSS = `
-    :host { all: initial; }
-    * { box-sizing: border-box; margin: 0; }
-
-    /*
-     * « hidden » cache pour de bon.
-     *
-     * L'attribut ne doit son effet qu'à une règle de la feuille par défaut du
-     * navigateur, et TOUTE règle d'auteur qui pose un « display » la bat —
-     * « .opt { display: flex } » suffit. Un élément marqué caché restait donc
-     * à l'écran, et c'est silencieux : le code croit l'avoir retiré.
-     *
-     * Le fichier le rattrapait jusqu'ici classe par classe — « .maj[hidden] »,
-     * « .openrar[hidden] », « .revente[hidden] », « .relist[hidden] »… Autant
-     * de correctifs identiques, et un de plus à écrire à chaque fois qu'on
-     * cache quelque chose. La règle est posée une fois, elle vaut pour tout ce
-     * qui viendra.
-     */
-    [hidden] { display: none !important; }
-
-    .panel {
+  /*
+   * La palette, une seule fois pour les deux surfaces.
+   *
+   * Le panneau déclarait douze variables ; la Revente, écrite après, en
+   * déclarait UNE et écrivait ses couleurs en dur — 105 littéraux pour 34
+   * tons distincts. Rien ne reliait les deux : une retouche de la palette du
+   * panneau laissait la Revente dériver, en silence, et le contrôle de
+   * contraste du vérificateur ne regardait que « --text » et « --muted ».
+   *
+   * Relevé avant de toucher à quoi que ce soit : sur ces 34 tons, 25 étaient
+   * DÉJÀ identiques au caractère près à une variable du panneau. Il n'y avait
+   * donc rien à harmoniser — seulement à cesser de les recopier. Les trois
+   * fonds plus sombres de la Revente, eux, sont un choix documenté et gardent
+   * leurs propres noms ; le reste est du voile noir et une couleur de rareté.
+   *
+   * Les deux feuilles interpolent ce bloc : il n'y a plus qu'un endroit où
+   * changer un ton, et les deux surfaces suivent.
+   */
+  const PALETTE = `
       --bg: rgba(13,15,19,.94);
       --raise: rgba(255,255,255,.045);
       --line: rgba(255,255,255,.07);
@@ -5712,6 +6278,29 @@
       --r-sm: 7px;
       --r-md: 10px;
       --r-lg: 14px;
+  `;
+  const PANEL_CSS = `
+    :host { all: initial; }
+    * { box-sizing: border-box; margin: 0; }
+
+    /*
+     * « hidden » cache pour de bon.
+     *
+     * L'attribut ne doit son effet qu'à une règle de la feuille par défaut du
+     * navigateur, et TOUTE règle d'auteur qui pose un « display » la bat —
+     * « .opt { display: flex } » suffit. Un élément marqué caché restait donc
+     * à l'écran, et c'est silencieux : le code croit l'avoir retiré.
+     *
+     * Le fichier le rattrapait jusqu'ici classe par classe — « .maj[hidden] »,
+     * « .openrar[hidden] », « .revente[hidden] », « .relist[hidden] »… Autant
+     * de correctifs identiques, et un de plus à écrire à chaque fois qu'on
+     * cache quelque chose. La règle est posée une fois, elle vaut pour tout ce
+     * qui viendra.
+     */
+    [hidden] { display: none !important; }
+
+    .panel {
+      ${PALETTE}
 
       background: var(--bg);
       backdrop-filter: blur(18px) saturate(1.3);
@@ -5735,7 +6324,7 @@
     }
     /* Chasse tabulaire partout où un chiffre change en place : sans elle,
        le décompte fait danser tout ce qui l'entoure à chaque seconde. */
-    .status b, .legend b, .fig b, .goal .cnt, .bids { font-variant-numeric: tabular-nums; }
+    .status b, .fig b, .goal .cnt { font-variant-numeric: tabular-nums; }
 
     /* « touch-action: none » : sans lui, le navigateur préempte le geste pour
        faire défiler la page et le panneau ne suit jamais le doigt. */
@@ -5971,11 +6560,6 @@
       .row .go { opacity: .55; }
     }
 
-    .bids { display: flex; gap: 10px; align-items: baseline; font-size: 12px; text-decoration: none; cursor: pointer; }
-    .bids .lead { color: var(--text); }
-    .bids .out { color: var(--warn); }
-    .bids .end { margin-left: auto; color: var(--dim); }
-    .bids .free { color: var(--live); }
     .note { margin-top: 4px; color: var(--warn); font-size: 11px; }
 
     /* ------------------------------------------------------------ Marché
@@ -6350,8 +6934,6 @@
       border: 0; border-radius: var(--r-sm); cursor: pointer;
     }
     .relist .x:hover { color: var(--text); background: var(--raise); }
-    .relist .rh.sub { margin: 9px 0 4px; padding-top: 8px; border-top: 1px solid var(--line); }
-    .relist .rh.sub b { font-size: 11px; color: var(--muted); font-weight: 600; }
     .relist .ra { display: flex; gap: 6px; margin-bottom: 7px; }
     .relist .ra button {
       flex: 1; padding: 5px 6px; font: 500 10.5px/1.3 var(--sans); color: var(--muted);
@@ -6505,6 +7087,32 @@
     }
     .tabs .badge[hidden] { display: none; }
 
+    /*
+     * La note de panne. Elle vit entre les onglets et le corps, donc visible
+     * quel que soit l'onglet ouvert, et elle emprunte le registre de
+     * l'avertissement — pas celui de l'erreur : l'outil, lui, tourne toujours.
+     *
+     * Elle disparaît quand le panneau est replié : replié, l'en-tête ne montre
+     * que le décompte, et une bannière sous une barre d'onglets masquée
+     * flotterait sans rien à quoi se rattacher.
+     */
+    .panne {
+      flex: none; margin: 8px 14px -4px; padding: 8px 10px;
+      border-radius: var(--r-md);
+      border: 1px solid color-mix(in srgb, var(--warn) 34%, transparent);
+      background: color-mix(in srgb, var(--warn) 12%, transparent);
+      color: var(--warn); font-size: 11px; line-height: 1.5;
+    }
+    .panne b { font-weight: 600; }
+    .panne .quoi { display: block; color: var(--text); }
+    .panne .reprendre {
+      margin-top: 5px; padding: 3px 9px; border-radius: 999px;
+      border: 1px solid color-mix(in srgb, var(--warn) 40%, transparent);
+      background: none; color: var(--warn); font: 600 10px var(--sans); cursor: pointer;
+    }
+    .panne .reprendre:hover { background: color-mix(in srgb, var(--warn) 18%, transparent); }
+    .panel.folded .panne { display: none; }
+
     .tab { display: none; }
     .tab.on { display: flex; flex-direction: column; gap: 14px; }
     /* Le Marché empile plus de blocs que les autres onglets : ils se serrent. */
@@ -6602,12 +7210,6 @@
     }
     .revente:hover { background: color-mix(in srgb, var(--live) 22%, transparent); }
     .revente[hidden] { display: none; }
-    .acts { display: flex; gap: 7px; margin-top: 7px; }
-    .acts button {
-      flex: 1; padding: 8px 0; border: 0; border-radius: var(--r-md); background: var(--raise);
-      color: var(--muted); cursor: pointer; font: 500 11px var(--sans); transition: .16s;
-    }
-    .acts button:hover { background: rgba(255,255,255,.09); color: var(--text); }
 
     .panel { position: relative; }
     /* Poignée de redimensionnement : largeur du panneau et hauteur du journal. */
@@ -6675,6 +7277,18 @@
           <button data-tab-btn="succes">Succès</button>
           <button data-tab-btn="reglages">Réglages</button>
         </nav>
+
+        <!--
+          La note de panne, hors des onglets et au-dessus d'eux.
+
+          Un tour secondaire qui abandonne concerne la personne quel que soit
+          l'onglet qu'elle regarde : le mettre dans « Marché » l'aurait caché à
+          qui consulte ses paquets, c'est-à-dire à peu près tout le monde. Elle
+          n'apparaît que quand il y a quelque chose à dire, et emporte son
+          propre bouton, parce qu'une note qui annonce un arrêt sans offrir de
+          reprise oblige à recharger la page.
+        -->
+        <div class="panne" data-panne hidden></div>
 
         <div class="body" data-body>
           <section class="tab" data-tab="paquets">
@@ -6810,6 +7424,7 @@
       fold: q('[data-fold]'),
       toggle: q('[data-toggle]'),
       body: q('[data-body]'),
+      panne: q('[data-panne]'),
       status: q('[data-status]'),
       bar: q('[data-bar]'),
       barFill: q('[data-bar] i'),
@@ -6885,10 +7500,60 @@
     ui.optRelist.checked = prefs.relistUnsold;
     ui.optMasqInv.checked = prefs.masquerInvendus;
 
+    /*
+     * Le câblage, une fonction par surface.
+     *
+     * Il tenait ici même : 480 lignes d'écouteurs couvrant quinze domaines
+     * sans rapport — prix de relance, pause, baisse, édition, remise à zéro,
+     * journal replié, navigation du Marché, diagnostic — dont onze
+     * gestionnaires `change` quasi identiques, avec la génération du lot de
+     * guilde coincée au milieu. Chaque préférence ajoutée depuis plusieurs
+     * versions était un écouteur de plus dans le même corps.
+     *
+     * Le découpage suit une structure DÉJÀ PRÉSENTE dans le balisage
+     * ci-dessus : `data-tab="paquets|marche|guilde|reglages"`. Rien n'a été
+     * réécrit, tout a été déplacé — chaque bloc avec le commentaire qui le
+     * justifie.
+     */
+    wireHeader();
+    wirePaquetsTab();
+    wireMarcheTab();
+    wireGuildeTab();
+    wireReglagesTab();
+
+    makeDraggable();
+    makeResizable();
+    applySize(loadStore().size);
+
+    /*
+     * Le panneau change de hauteur tout seul : un volet plus long, une liste
+     * qui s'allonge, un relevé qui arrive. Ancré en bas à droite, il grandit
+     * vers le haut — et passait au-dessus du bord de l'écran, en-tête compris.
+     * On le rappelle dans le cadre à chaque changement de taille ; le
+     * repositionnement ne modifie pas les dimensions, donc pas de boucle.
+     */
+    if ('ResizeObserver' in window) {
+      // La référence est conservée : un observateur qu'on n'accroche à rien
+      // peut être ramassé, et cesse alors de prévenir sans le dire.
+      ui.watcher = new ResizeObserver(() => clampPanel());
+      ui.watcher.observe(ui.box);
+    }
+  }
+
+  /*
+   * L'en-tête et le cadre : ce qui ne dépend d'aucun onglet.
+   *
+   * Start/Stop, le repli, la barre des onglets, la note de panne — qui vit
+   * au-dessus d'eux — et les raccourcis de navigation posés sur le panneau
+   * entier.
+   */
+  function wireHeader() {
     ui.toggle.addEventListener('click', () =>
       state.running ? stop('Arrêté manuellement.') : start()
     );
+
     ui.fold.addEventListener('click', () => setFolded(!ui.panel.classList.contains('folded')));
+
     /*
      * Le prix, sur « change » et non « input » : on écrit pendant la frappe,
      * et chaque touche déclencherait un rendu qui remplacerait le champ sous
@@ -6897,6 +7562,101 @@
      * Zéro ou négatif n'est pas un prix : on refuse et on rend la valeur
      * précédente, plutôt que d'inscrire une annonce que le site rejettera.
      */
+    /*
+     * Réessayer un tour arrêté. Le geste ne fait que remettre le compteur à
+     * zéro : le tour suivant repart de lui-même, et s'il échoue encore la note
+     * revient au bout de quatre. Rien n'est effacé du journal des faits — un
+     * diagnostic collé ensuite doit encore porter la panne.
+     */
+    ui.panne.addEventListener('click', (e) => {
+      const b = e.target.closest('[data-reprendre]');
+      if (b) relancerSousSysteme(b.dataset.reprendre);
+    });
+
+    ui.tabs.addEventListener('click', (e) => {
+      const b = e.target.closest('[data-tab-btn]');
+      if (b) setTab(b.dataset.tabBtn);
+    });
+
+    // Les raccourcis du panneau restent des navigations internes, sans onglet.
+    ui.box.addEventListener('click', (e) => {
+      const go = e.target.closest('[data-goto]');
+      if (!go) return;
+      e.preventDefault();
+      goFilteredTo(go.dataset.goto, '');
+    });
+  }
+
+  /*
+   * L'onglet Paquets : le journal des tirages, les pastilles de rareté et la
+   * remise à zéro des compteurs.
+   */
+  function wirePaquetsTab() {
+    let resetArme = 0;
+
+    ui.reset.addEventListener('click', () => {
+      if (Date.now() < resetArme) {
+        resetArme = 0;
+        ui.reset.classList.remove('arme');
+        ui.reset.textContent = 'Réinitialiser';
+        resetStats();
+        return;
+      }
+      resetArme = Date.now() + ARME_MS;
+      ui.reset.classList.add('arme');
+      ui.reset.textContent = state.history.length
+        ? `Effacer ${state.history.length} tirages ?`
+        : 'Confirmer ?';
+      setTimeout(() => {
+        if (!resetArme) return;
+        resetArme = 0;
+        ui.reset.classList.remove('arme');
+        ui.reset.textContent = 'Réinitialiser';
+      }, ARME_MS);
+    });
+
+    /*
+     * Les deux boutons d'export ont quitté les réglages. Personne n'ouvre un
+     * CSV de ses tirages, et ils occupaient une ligne entière au milieu des
+     * options qui, elles, changent le comportement de l'outil. Ils restent
+     * atteignables où ils ont leur place : `__wmAuto.exportCsv()` en console.
+     */
+
+    // Le titre d'un tirage ouvre la collection filtrée sur cette carte.
+    // L'écriture est synchrone, donc faite avant que l'onglet ne s'ouvre.
+    ui.log.addEventListener('click', (e) => {
+      const link = e.target.closest('[data-card]');
+      if (!link) return;
+      e.preventDefault(); // on navigue via le routeur du site, pas via le href
+      if (link.dataset.cote) openCardMarket(link.dataset.card);
+      else goFilteredTo(link.dataset.target, link.dataset.card);
+    });
+
+    /*
+     * Une pastille ne fait que trier le journal, sur place. Ouvrir la
+     * collection est un geste distinct, offert juste en dessous : trier ne
+     * devrait pas obliger à quitter la page où l'on est.
+     */
+    ui.rar.addEventListener('click', (e) => {
+      const chip = e.target.closest('[data-rarity]');
+      if (!chip) return;
+      const r = chip.dataset.rarity;
+      prefs.logRarity = prefs.logRarity === r ? null : r;
+      saveStore({ logRarity: prefs.logRarity });
+      render();
+    });
+
+    ui.openRar.addEventListener('click', () => {
+      if (prefs.logRarity) goFilteredTo('/collection', '', prefs.logRarity);
+    });
+  }
+
+  /*
+   * L'onglet Marché, de loin le plus chargé : les quatre volets, le journal
+   * des relances avec son édition carte par carte, la Revente, et les trois
+   * interrupteurs qui commandent ces volets.
+   */
+  function wireMarcheTab() {
     ui.relist.addEventListener('change', (e) => {
       const p = e.target.closest('[data-fprix]');
       if (!p) return;
@@ -6930,6 +7690,10 @@
         if (w) {
           w.paused = false;
           w.fails = 0;
+          // Le geste dit « réessaie » : les refus du serveur s'effacent avec
+          // les absences, sinon le premier non de l'API remettrait aussitôt
+          // en pause ce qu'on vient de relancer à la main.
+          w.refus = 0;
           saveStore({ watch: state.watch });
         }
         return render();
@@ -7008,7 +7772,7 @@
         if (repasseArme !== minutes) {
           repasseArme = minutes;
           clearTimeout(repasseTimer);
-          repasseTimer = setTimeout(() => { repasseArme = 0; render(); }, 6000);
+          repasseTimer = setTimeout(() => { repasseArme = 0; render(); }, ARME_MS);
           return render();
         }
         repasseArme = 0;
@@ -7072,98 +7836,7 @@
       if (e.target.closest('[data-mk-refresh]')) refreshMarket();
     });
 
-    ui.tabs.addEventListener('click', (e) => {
-      const b = e.target.closest('[data-tab-btn]');
-      if (b) setTab(b.dataset.tabBtn);
-    });
-    /*
-     * Confirmation en deux temps, sans boîte de dialogue : `confirm()` bloque
-     * la page entière, et le panneau vit dans l'onglet du jeu. Le premier clic
-     * arme le bouton en annonçant ce qui va disparaître ; le second, dans les
-     * quatre secondes, exécute. Passé ce délai il se désarme tout seul — un
-     * bouton laissé armé finirait par être cliqué sans qu'on sache pourquoi.
-     */
-    ui.diag.addEventListener('click', async () => {
-      const texte = construireDiagnostic();
-      let pose = false;
-      try {
-        await navigator.clipboard.writeText(texte);
-        pose = true;
-      } catch (_) {
-        /*
-         * Le presse-papiers demande un contexte sûr et parfois une permission.
-         * Refusé, on ne laisse pas l'utilisateur sans rien : le relevé part en
-         * console, où il reste sélectionnable.
-         */
-        console.info('[WikiMasters Tools] diagnostic\n' + texte);
-      }
-      ui.diag.classList.toggle('ok', pose);
-      ui.diag.textContent = pose ? 'Copié — collez-le dans #aide' : 'Voir dans la console (F12)';
-      setTimeout(() => {
-        ui.diag.classList.remove('ok');
-        ui.diag.textContent = 'Copier le diagnostic';
-      }, 4000);
-    });
-
-    let resetArme = 0;
-    ui.reset.addEventListener('click', () => {
-      if (Date.now() < resetArme) {
-        resetArme = 0;
-        ui.reset.classList.remove('arme');
-        ui.reset.textContent = 'Réinitialiser';
-        resetStats();
-        return;
-      }
-      resetArme = Date.now() + 4000;
-      ui.reset.classList.add('arme');
-      ui.reset.textContent = state.history.length
-        ? `Effacer ${state.history.length} tirages ?`
-        : 'Confirmer ?';
-      setTimeout(() => {
-        if (!resetArme) return;
-        resetArme = 0;
-        ui.reset.classList.remove('arme');
-        ui.reset.textContent = 'Réinitialiser';
-      }, 4000);
-    });
     ui.revente.addEventListener('click', openSell);
-    /*
-     * Les deux boutons d'export ont quitté les réglages. Personne n'ouvre un
-     * CSV de ses tirages, et ils occupaient une ligne entière au milieu des
-     * options qui, elles, changent le comportement de l'outil. Ils restent
-     * atteignables où ils ont leur place : `__wmAuto.exportCsv()` en console.
-     */
-
-    // Le titre d'un tirage ouvre la collection filtrée sur cette carte.
-    // L'écriture est synchrone, donc faite avant que l'onglet ne s'ouvre.
-    ui.log.addEventListener('click', (e) => {
-      const link = e.target.closest('[data-card]');
-      if (!link) return;
-      e.preventDefault(); // on navigue via le routeur du site, pas via le href
-      if (link.dataset.cote) openCardMarket(link.dataset.card);
-      else goFilteredTo(link.dataset.target, link.dataset.card);
-    });
-
-    ui.optAutostart.addEventListener('change', (e) => {
-      prefs.autostart = e.target.checked;
-      saveStore({ autostart: prefs.autostart });
-    });
-
-    // La permission navigateur ne peut être demandée que sur un geste de l'utilisateur.
-    ui.optNotify.addEventListener('change', async (e) => {
-      if (e.target.checked && !(await askNotifyPermission())) {
-        e.target.checked = false;
-        state.bonusNote = 'Notifications refusées par le navigateur.';
-        render();
-      }
-      prefs.notify = e.target.checked;
-      saveStore({ notify: prefs.notify });
-    });
-
-    ui.optBonus.addEventListener('change', (e) => {
-      prefs.bonus = e.target.checked;
-      saveStore({ bonus: prefs.bonus });
-    });
 
     ui.optWish.addEventListener('change', (e) => {
       prefs.watchWish = e.target.checked;
@@ -7172,17 +7845,23 @@
       if (prefs.watchWish) scanWishMarket();
     });
 
-    ui.optAutoresume.addEventListener('change', (e) => {
-      prefs.autoResume = e.target.checked;
-      saveStore({ autoResume: prefs.autoResume });
+    ui.optRelist.addEventListener('change', (e) => {
+      prefs.relistUnsold = e.target.checked;
+      saveStore({ relistUnsold: prefs.relistUnsold });
     });
 
-    ui.optAutoclaim.addEventListener('change', (e) => {
-      prefs.autoclaim = e.target.checked;
-      saveStore({ autoclaim: prefs.autoclaim });
-      if (prefs.autoclaim) claimAll();
+    ui.optBids.addEventListener('change', (e) => {
+      prefs.watchBids = e.target.checked;
+      saveStore({ watchBids: prefs.watchBids });
+      if (prefs.watchBids && onMarket()) scanBids();
     });
+  }
 
+  /*
+   * L'onglet Guilde : le lot à publier, les échanges, et l'alerte sur les
+   * souhaits que vous pouvez servir.
+   */
+  function wireGuildeTab() {
     ui.optGwatch.addEventListener('change', (e) => {
       prefs.watchGuild = e.target.checked;
       saveStore({ watchGuild: prefs.watchGuild });
@@ -7280,6 +7959,78 @@
         setTimeout(() => { bouton.disabled = false; renderGuild(); }, 2500);
       }
     });
+  }
+
+  /*
+   * L'onglet Réglages : les cases à cocher et le bouton de diagnostic.
+   *
+   * C'est ici qu'atterrit chaque préférence ajoutée — et c'est pour ça que
+   * ce découpage existe. Elles arrivaient toutes dans le même corps de 725
+   * lignes, à côté du câblage de la Revente et de la génération du lot de
+   * guilde, sans rapport les unes avec les autres. Une de plus, c'est
+   * maintenant une de plus ICI.
+   */
+  function wireReglagesTab() {
+    /*
+     * Confirmation en deux temps, sans boîte de dialogue : `confirm()` bloque
+     * la page entière, et le panneau vit dans l'onglet du jeu. Le premier clic
+     * arme le bouton en annonçant ce qui va disparaître ; le second, dans les
+     * quatre secondes, exécute. Passé ce délai il se désarme tout seul — un
+     * bouton laissé armé finirait par être cliqué sans qu'on sache pourquoi.
+     */
+    ui.diag.addEventListener('click', async () => {
+      const texte = construireDiagnostic();
+      let pose = false;
+      try {
+        await navigator.clipboard.writeText(texte);
+        pose = true;
+      } catch (_) {
+        /*
+         * Le presse-papiers demande un contexte sûr et parfois une permission.
+         * Refusé, on ne laisse pas l'utilisateur sans rien : le relevé part en
+         * console, où il reste sélectionnable.
+         */
+        console.info('[WikiMasters Tools] diagnostic\n' + texte);
+      }
+      ui.diag.classList.toggle('ok', pose);
+      ui.diag.textContent = pose ? 'Copié — collez-le dans #aide' : 'Voir dans la console (F12)';
+      setTimeout(() => {
+        ui.diag.classList.remove('ok');
+        ui.diag.textContent = 'Copier le diagnostic';
+      }, 4000);
+    });
+
+    ui.optAutostart.addEventListener('change', (e) => {
+      prefs.autostart = e.target.checked;
+      saveStore({ autostart: prefs.autostart });
+    });
+
+    // La permission navigateur ne peut être demandée que sur un geste de l'utilisateur.
+    ui.optNotify.addEventListener('change', async (e) => {
+      if (e.target.checked && !(await askNotifyPermission())) {
+        e.target.checked = false;
+        state.bonusNote = 'Notifications refusées par le navigateur.';
+        render();
+      }
+      prefs.notify = e.target.checked;
+      saveStore({ notify: prefs.notify });
+    });
+
+    ui.optBonus.addEventListener('change', (e) => {
+      prefs.bonus = e.target.checked;
+      saveStore({ bonus: prefs.bonus });
+    });
+
+    ui.optAutoresume.addEventListener('change', (e) => {
+      prefs.autoResume = e.target.checked;
+      saveStore({ autoResume: prefs.autoResume });
+    });
+
+    ui.optAutoclaim.addEventListener('change', (e) => {
+      prefs.autoclaim = e.target.checked;
+      saveStore({ autoclaim: prefs.autoclaim });
+      if (prefs.autoclaim) claimAll();
+    });
 
     /*
      * Le masquage prend effet à la lecture suivante, pas au clic : c'est le
@@ -7313,61 +8064,6 @@
       }
       render();
     });
-
-    // Les raccourcis du panneau restent des navigations internes, sans onglet.
-    ui.box.addEventListener('click', (e) => {
-      const go = e.target.closest('[data-goto]');
-      if (!go) return;
-      e.preventDefault();
-      goFilteredTo(go.dataset.goto, '');
-    });
-
-    /*
-     * Une pastille ne fait que trier le journal, sur place. Ouvrir la
-     * collection est un geste distinct, offert juste en dessous : trier ne
-     * devrait pas obliger à quitter la page où l'on est.
-     */
-    ui.rar.addEventListener('click', (e) => {
-      const chip = e.target.closest('[data-rarity]');
-      if (!chip) return;
-      const r = chip.dataset.rarity;
-      prefs.logRarity = prefs.logRarity === r ? null : r;
-      saveStore({ logRarity: prefs.logRarity });
-      render();
-    });
-
-    ui.openRar.addEventListener('click', () => {
-      if (prefs.logRarity) goFilteredTo('/collection', '', prefs.logRarity);
-    });
-
-    ui.optRelist.addEventListener('change', (e) => {
-      prefs.relistUnsold = e.target.checked;
-      saveStore({ relistUnsold: prefs.relistUnsold });
-    });
-
-    ui.optBids.addEventListener('change', (e) => {
-      prefs.watchBids = e.target.checked;
-      saveStore({ watchBids: prefs.watchBids });
-      if (prefs.watchBids && onMarket()) scanBids();
-    });
-
-    makeDraggable();
-    makeResizable();
-    applySize(loadStore().size);
-
-    /*
-     * Le panneau change de hauteur tout seul : un volet plus long, une liste
-     * qui s'allonge, un relevé qui arrive. Ancré en bas à droite, il grandit
-     * vers le haut — et passait au-dessus du bord de l'écran, en-tête compris.
-     * On le rappelle dans le cadre à chaque changement de taille ; le
-     * repositionnement ne modifie pas les dimensions, donc pas de boucle.
-     */
-    if ('ResizeObserver' in window) {
-      // La référence est conservée : un observateur qu'on n'accroche à rien
-      // peut être ramassé, et cesse alors de prévenir sans le dire.
-      ui.watcher = new ResizeObserver(() => clampPanel());
-      ui.watcher.observe(ui.box);
-    }
   }
 
   /*
@@ -7561,6 +8257,37 @@
     }
   }
 
+  /**
+   * La note des tours arrêtés. Rien à l'écran tant que tout va bien, ce qui
+   * est le cas quasiment tout le temps — d'où le retrait complet du bloc
+   * plutôt qu'une ligne « tout va bien » qui ne serait jamais lue.
+   *
+   * Appelée depuis `render()` comme le reste, mais aussi directement par
+   * `noterEchec` : un tour secondaire peut abandonner sans qu'aucun message
+   * d'état ne passe derrière, et la note attendrait alors le prochain
+   * rafraîchissement pour paraître.
+   */
+  function renderPannes() {
+    if (!ui.panne) return;
+    const morts = Object.keys(state.sains).filter((n) => state.sains[n].arret);
+    ui.panne.hidden = morts.length === 0;
+    if (!morts.length) {
+      paint(ui.panne, '');
+      return;
+    }
+    paint(ui.panne, morts
+      .map((nom) => {
+        const s = state.sains[nom];
+        const depuis = s.depuis ? ` Depuis ${fmtSpan(Date.now() - s.depuis)}.` : '';
+        const echecs = s.echecs > 1 ? ` ${s.echecs} échecs d’affilée.` : '';
+        return `<span class="quoi"><b>${esc(SOUS_SYSTEMES[nom] || nom)}</b> `
+          + `${esc(PLAINTES[nom] || 'ne répond plus')}.</span>`
+          + `<span title="${esc(s.dernier)}">${depuis}${echecs} Le reste du panneau continue.</span>`
+          + `<button class="reprendre" data-reprendre="${esc(nom)}">Réessayer</button>`;
+      })
+      .join(''));
+  }
+
   function render() {
     if (!ui.box) return;
 
@@ -7568,6 +8295,7 @@
     ui.panel.classList.toggle('warn', !state.running && state.warn);
     ui.toggle.textContent = state.running ? 'Stop' : 'Start';
 
+    renderPannes();
     renderStatus();
     renderRibbon();
 
@@ -8327,7 +9055,7 @@
       (bouton) => {
         bouton.click();
         attendre(
-          () => document.querySelector('input[placeholder*="Recherch"]'),
+          () => document.querySelector(SEARCH_SELECTOR),
           (champ) => setReactInput(champ, qui),
         );
       },
@@ -8372,7 +9100,7 @@
   const WISH_Q_PAGES = 60;      // 3 000 cartes lues au plus — au-delà ce n'est plus une recherche
   const WISH_LOT_ADD = 200;     // lignes par écriture : un corps qui reste petit
   const WISH_LOT_DEL = 100;     // identifiants par suppression : l'URL a une longueur
-  const WISH_ARME_MS = 6000;    // le compte annoncé doit avoir le temps d'être lu
+  const WISH_ARME_MS = ARME_MS;   // même fenêtre que les deux autres boutons à double clic
   const WISH_PAGE_GAP = 120;    // souffle entre deux pages : 60 pages ne partent pas en rafale
 
   /*
@@ -8474,7 +9202,7 @@
     if (row) {
       for (const b of row.children) {
         const t = (b.textContent || '').trim();
-        const actif = /ring-2/.test(b.className || '');
+        const actif = chipActive(b);
         if (RARETES.includes(t)) { if (actif) actifs.add(t); continue; }
         if (/liste de souhaits/i.test(t) && actif) surSouhaits = true;
       }
@@ -8779,7 +9507,7 @@
   function injectWishAll() {
     if (!onGlobal()) return;
     installWishProxy();
-    const row = document.querySelector(FILTER_ROW);
+    const row = vu(NOM_FILTRES, FILTER_ROW);
     if (!row) return;
 
     let btn = row.querySelector('[data-wm-wish-all]');
@@ -9612,7 +10340,7 @@
    * portées par l'exemplaire en collection, à côté de son identifiant. Aucune
    * requête de plus, et la protection est aussi fraîche que l'index lui-même.
    */
-  const owned = { map: new Map(), tagged: new Set(), at: 0, tried: 0 };
+  const owned = { map: new Map(), tagged: new Set(), at: 0, tried: 0, tronque: false };
 
   /*
    * Une carte étiquetée ne se vend pas. L'étiquette est posée sur l'exemplaire,
@@ -9641,7 +10369,7 @@
     for (let base = 0; base < 80 && !fini; base += 8) {
       const lot = await Promise.all(
         Array.from({ length: 8 }, (_, k) =>
-          fetch(`/api/my-collection?page=${base + k}`, { credentials: 'same-origin' })
+          fetchBorne(`/api/my-collection?page=${base + k}`, { credentials: 'same-origin' })
             .then((r) => (r.ok ? r.json() : null))
             .catch(() => null)
         )
@@ -9662,6 +10390,22 @@
         if (col.length < 50) fini = true;
       }
     }
+    /*
+     * La TRONCATURE, dite pour ce qu'elle est.
+     *
+     * `complet` ne comptait que les requêtes en échec. Un balayage qui s'arrête
+     * parce qu'il a atteint la borne des quatre-vingts pages — toutes pleines,
+     * aucune en erreur — se déclarait donc complet, et l'index tronqué
+     * s'installait comme faisant autorité. C'est ce qui faisait passer une
+     * carte au-delà de la 4 000ᵉ pour une carte disparue.
+     *
+     * On ne relève pas la borne — cinq cents requêtes toutes les cinq minutes
+     * ne se justifient pas quand le serveur sait filtrer par titre. On retient
+     * le fait, et `reconcileWatch` demande la carte au serveur plutôt que de
+     * conclure de son absence ici.
+     */
+    owned.tronque = !fini;
+
     if (complet && m.size) {
       owned.map = m;
       owned.tagged = etiquetees;
@@ -9803,6 +10547,7 @@
       if ((w.reveils || 0) >= IDLE_WAKE_MAX) continue;
       w.paused = false;
       w.fails = 0;
+      w.refus = 0;
       w.reveils = (w.reveils || 0) + 1;
       n += 1;
     }
@@ -9850,7 +10595,19 @@
    * perdue pour toujours. Ici rien ne dépend d'avoir vu passer l'événement — un
    * tour manqué est rattrapé au suivant.
    */
-  const WATCH_FAILS = 20;   // échecs consécutifs avant mise en pause d'une carte
+  const WATCH_FAILS = 20;   // absences de la collection avant mise en pause d'une carte
+  /*
+   * Refus du serveur avant mise en pause. Quatre, et pas vingt comme les
+   * absences : une absence est une lenteur — le serveur rend la carte quelques
+   * secondes après avoir clos l'enchère — alors qu'un refus est une RÉPONSE. Un
+   * serveur qui dit non quatre fois d'affilée à la même demande ne dira pas oui
+   * à la cinquième, et vingt tentatives espacées de dix secondes, c'est trois
+   * minutes et demie à marteler une API qui a déjà tranché.
+   *
+   * Les refus passagers — 429, 5xx — ne comptent pas ici : ils disent que le
+   * serveur ne peut pas, pas que la demande est mauvaise.
+   */
+  const WATCH_REFUS = 4;
   const SLOTS_FRESH_MS = 20000;  // durée de validité du compte d'emplacements
   const SETTLE_MS = 60000;       // délai laissé au serveur pour trancher une enchère close
   const IDLE_RELIST_MS = 15000;  // repos quand un tour n'a rien à replacer
@@ -10168,7 +10925,7 @@
        * mettre en pause des cartes parfaitement en vente. Mieux vaut ne rien
        * faire ce tour-ci — le suivant rattrapera.
        */
-      if (Date.now() - state.sales.at > 60000) return;
+      if (!ventesSuresPourAgir()) return;
       const enVente = new Set((state.sales.list || []).map((v) => v.card).filter(Boolean));
 
       for (const c of ids) {
@@ -10177,6 +10934,9 @@
         if (state.watch[c].fails) state.watch[c].fails = 0;
         // Et d'une ardoise de réveils vierge : elle vient de prouver qu'elle existe.
         if (state.watch[c].reveils) state.watch[c].reveils = 0;
+        // Les refus du serveur aussi : elle vient d'être acceptée en vente,
+        // c'est la meilleure preuve possible que la demande était bonne.
+        if (state.watch[c].refus) state.watch[c].refus = 0;
         /*
          * On note qu'on vient de la voir en ligne. C'est ce repère qui empêche
          * de la replacer dans la minute qui suit la clôture : à cet instant elle
@@ -10209,6 +10969,7 @@
         if (w.paused && Date.now() - (w.pausedAt || 0) > WATCH_PAUSE_RETRY) {
           w.paused = false;
           w.fails = 0;
+          w.refus = 0;
           /*
            * Le temps a fait son office : l'ardoise des réveils au repos est
            * effacée aussi. Sans ça, une carte ayant épuisé ses trois réveils
@@ -10278,6 +11039,45 @@
           index = await ownedIndex(true);
           copie = index.get(card);
         }
+        /*
+         * TOUJOURS PAS TROUVÉE : ON DEMANDE AU SERVEUR, AU LIEU DE CONCLURE.
+         *
+         * `ownedIndex` s'arrête à quatre-vingts pages, soit 4 000 cartes.
+         * Au-delà, la collection existe mais le balayage ne la voit pas — et
+         * l'index ne le SAIT pas : son drapeau `complet` ne compte que les
+         * requêtes en échec, pas la troncature. Une carte suivie au-delà de
+         * cette borne récoltait donc une absence par créneau, atteignait les
+         * vingt absences, et se mettait en pause définitivement. Relevé sur un
+         * compte réel : trois cartes bloquées, vingt absences chacune, zéro
+         * refus du serveur, jamais publiées — et N pages de collection que
+         * le balayage n'avait jamais lues.
+         *
+         * Le même défaut avait été corrigé côté cote : `fetchCollectionRaw`
+         * lit jusqu'à la première page incomplète et signale sa troncature.
+         * Il ne l'avait jamais été ici, dans la fonction qui décide si une
+         * carte existe encore.
+         *
+         * Relever la borne coûterait cinq cents requêtes toutes les cinq
+         * minutes. Le serveur sait filtrer par titre — vérifié sur le vrai
+         * site : `?q=` rend UNE ligne. On lui demande donc la carte, une
+         * requête, plutôt que de relire la collection entière pour la trouver.
+         *
+         * Ce qu'on ne fait toujours pas : conclure. Une carte qu'on n'a pas su
+         * chercher n'est pas une carte absente.
+         */
+        if (!copie) {
+          try {
+            const d = await api(`/api/my-collection?page=0&q=${encodeURIComponent(w.title)}`);
+            const ligne = ((d.data && d.data.collection) || []).find((c) => c.card_id === card);
+            if (ligne && ligne.id) {
+              copie = ligne.id;
+              // Elle existe : l'index était court, pas la collection.
+              index.set(card, ligne.id);
+            }
+          } catch (_) {
+            /* réseau : le créneau suivant retentera, comme pour le reste */
+          }
+        }
         if (!copie) {
           /*
            * Le serveur rend la carte quelques secondes après avoir clos
@@ -10330,6 +11130,7 @@
           libres -= 1;
           state.slots.used += 1;
           w.fails = 0;
+          w.refus = 0;
           state.asks[w.title] = { prix: w.price, at: Date.now() };
           /*
            * On note l'instant de publication : c'est lui qui interdit une
@@ -10343,12 +11144,56 @@
           w.endsAt = nee.end || w.listedAt + (w.minutes || 10) * 60000;
           logRelist(w.title, 'ok', w.price, w.minutes + ' min');
         } else {
-          w.fails = (w.fails || 0) + 1;
-          if (w.fails >= WATCH_FAILS) {
-            w.paused = true;
-            w.pausedAt = Date.now();
-            logRelist(w.title, 'refus', w.price,
-              String((res.data && res.data.error) || res.status) + ' — suivi en pause');
+          /*
+           * UN REFUS DU SERVEUR N'EST PAS UN « INTROUVABLE EN COLLECTION ».
+           *
+           * Les deux se comptaient sur le même `w.fails`. Or la ligne
+           * « Retrouvée : le compte d'échecs repart de zéro », vingt lignes
+           * plus haut, le remet à zéro à CHAQUE passage — puisque la carte est
+           * bien dans l'index, c'est le serveur qui refuse. Le compteur
+           * montait donc à 1, retombait à 0, remontait à 1 : il ne pouvait
+           * jamais atteindre `WATCH_FAILS`, et tout ce bloc — la pause, la
+           * ligne de journal — était du code MORT.
+           *
+           * Ce que ça donnait : le site change la forme de sa mise en vente,
+           * chaque POST est refusé, et le script réessaie toutes les dix
+           * secondes indéfiniment, sans une ligne au journal. Éprouvé au banc :
+           * 91 refus en quinze minutes de temps virtuel, `fails` à 1, aucune
+           * pause, volet Relances vide. C'est le scénario 20 de `preuves.js`,
+           * et il n'existait pas quand ce code a été écrit.
+           *
+           * Deux compteurs, donc, parce que ce sont deux faits différents :
+           * `fails` compte les absences de la collection, `refus` compte les
+           * non du serveur. Seule une publication réussie remet le second à
+           * zéro — ou le retour de la carte en vente, qui prouve la même chose.
+           */
+          const passager = res.status === 429 || res.status >= 500;
+          const pourquoi = String((res.data && res.data.error) || res.status);
+          if (passager) {
+            /*
+             * Le serveur freine ou hoquette : la demande, elle, était bonne.
+             * On réessaie au créneau suivant sans rien compter contre la carte
+             * — la punir pour un 429 reviendrait à mettre en pause ce qui n'a
+             * pas eu tort, exactement le défaut que la 3.2.0 a corrigé
+             * ailleurs.
+             */
+            logRelist(w.title, 'refus', w.price, `${pourquoi} — nouvel essai au prochain créneau`);
+          } else {
+            w.refus = (w.refus || 0) + 1;
+            if (w.refus >= WATCH_REFUS) {
+              w.paused = true;
+              w.pausedAt = Date.now();
+              logRelist(w.title, 'refus', w.price,
+                `${pourquoi} — suivi en pause après ${w.refus} refus`);
+            } else {
+              /*
+               * Et on le dit dès le PREMIER refus. Le seuil décide quand on
+               * arrête d'essayer, pas quand on en parle : entre les deux, le
+               * volet Relances affichait une carte « en attente » qui n'avait
+               * aucune chance de partir.
+               */
+              logRelist(w.title, 'refus', w.price, `${pourquoi} — nouvel essai`);
+            }
           }
         }
         bouge = true;
@@ -10525,7 +11370,7 @@
     for (let base = 0; base < 400; base += 8) {
       const lot = await Promise.all(
         Array.from({ length: 8 }, (_, k) =>
-          fetch(`/api/marketplace?page=${base + k}&limit=50`, { credentials: 'same-origin' })
+          fetchBorne(`/api/marketplace?page=${base + k}&limit=50`, { credentials: 'same-origin' })
             .then((r) => (r.ok ? r.json() : null))
             .catch(() => null)
         )
@@ -10651,8 +11496,14 @@
         JSON.stringify({ rows: sell.rows, at: sell.at, tags: sell.tags, themes: sell.themes,
                          scanAt: sell.scanAt, scanTotal: sell.scanTotal })
       );
-    } catch (_) {
-      /* trop volumineux ou stockage plein : le scan reste en mémoire */
+      noterSucces('stockage');
+    } catch (err) {
+      /*
+       * Trop volumineux ou stockage plein : le scan reste en mémoire, et
+       * disparaît au rechargement. C'est ici que ça se voit en premier sur une
+       * grosse collection — la cote est de loin la plus lourde des quatre clés.
+       */
+      noterEchec('stockage', err, 1);
     }
   }
 
@@ -10696,7 +11547,7 @@
   /** Le marché d'une carte, tel que ce compte a le droit de le voir. */
   async function probeSales(cardId) {
     try {
-      const r = await fetch(`/api/marketplace/cards/${cardId}/sales`, { credentials: 'same-origin' });
+      const r = await fetchBorne(`/api/marketplace/cards/${cardId}/sales`, { credentials: 'same-origin' });
       let data = null;
       try { data = await r.json(); } catch (_) { /* réponse non-JSON */ }
       return { status: r.status, data };
@@ -10724,7 +11575,7 @@
   async function fetchCollectionPage(page) {
     for (let essai = 0; essai < SELL_TRIES; essai++) {
       try {
-        const r = await fetch(`/api/my-collection?page=${page}`, { credentials: 'same-origin' });
+        const r = await fetchBorne(`/api/my-collection?page=${page}`, { credentials: 'same-origin' });
         if (r.ok) return await r.json();
         sell.refus = r.status;
         if (r.status === 429) sell.freinages += 1;
@@ -10971,7 +11822,7 @@
       while (queue.length) {
         const c = queue.pop();
         try {
-          const r = await fetch(`/api/marketplace/cards/${c.id}/sales`, { credentials: 'same-origin' });
+          const r = await fetchBorne(`/api/marketplace/cards/${c.id}/sales`, { credentials: 'same-origin' });
           if (r.status === 429) {
             queue.push(c);
             await delay(3000);
@@ -11417,7 +12268,7 @@
       for (const c of todo) {
         sell.checked.add(c.id);
         try {
-          const r = await fetch(`/api/marketplace/cards/${c.id}/sales`, { credentials: 'same-origin' });
+          const r = await fetchBorne(`/api/marketplace/cards/${c.id}/sales`, { credentials: 'same-origin' });
           if (r.status === 429) {
             sell.checked.delete(c.id); // on retentera plus tard
             continue;
@@ -11599,8 +12450,13 @@
    */
   /*
    * Au-delà, le relevé des ventes ne sert plus à marquer une ligne « en
-   * vente » : il dit ce qui ÉTAIT vrai. Même fenêtre que le volet Relances,
-   * qui s'en sert pour décider s'il agit.
+   * vente » : il dit ce qui ÉTAIT vrai.
+   *
+   * DEUX FOIS la fenêtre du volet Relances (`VENTES_POUR_AGIR_MS`, 60 s), et
+   * c'est voulu — le commentaire annonçait « la même » alors que les deux
+   * chiffres ont toujours différé. AFFICHER une ligne « en vente » sur un
+   * relevé de deux minutes ne coûte qu'une pastille en retard ; AGIR dessus
+   * remettrait une carte en vente alors qu'elle y est déjà.
    */
   const VENTES_FRAICHES_MS = 120000;
 
@@ -11665,390 +12521,417 @@
     closeSell();
   });
 
+  /*
+   * La feuille de la Revente, sortie de la fonction qui la posait.
+   *
+   * `buildSellUI` faisait 498 lignes, dont 379 de CSS : la lire pour trouver
+   * ce qu'elle CONSTRUIT demandait de traverser une feuille de style entière,
+   * et le tableau des grosses fonctions du dépôt la comptait parmi les pires
+   * alors qu'il n'y avait rien à découper — juste à sortir. Le panneau suivait
+   * déjà cette convention avec `PANEL_CSS` ; la Revente ne la suivait pas, sans
+   * raison. La fonction retombe à ~118 lignes, et ce qu'elle fait se lit.
+   *
+   * Rien d'autre n'a bougé : le CSS est celui d'avant, désindenté de quatre
+   * espaces pour tenir au niveau d'une constante.
+   */
+  const SELL_CSS = `
+    :host { all: initial; }
+
+    /*
+     * La même palette que le panneau, sur l'hôte de CETTE racine.
+     *
+     * Une variable CSS ne traverse pas un Shadow DOM : celles du panneau
+     * sont déclarées sur son propre « .panel », dans sa propre
+     * racine, et ne valent rien ici. Elles sont donc redéclarées — mais
+     * depuis la MÊME source, pas recopiées.
+     */
+    :host {
+      ${PALETTE}
+    }
+    * { box-sizing: border-box; margin: 0; }
+    /*
+     * Le fond de la page passe de 86 % à 94 % d'opacité, et le flou de 10 à
+     * 20 px.
+     *
+     * L'élévation ne peut PAS venir d'une boîte plus claire : « --dim »
+     * (#717C8D) est calé à 4,54:1 sur #0D0F13, soit quatre centièmes
+     * au-dessus du plancher AA. Éclaircir le fond de la modale, ne
+     * serait-ce que vers #101319, le fait retomber à 4,43:1 — et c'est le
+     * ton de l'amplitude et des en-têtes de colonnes, les plus petits
+     * textes du tableau. On gagne donc le relief en ENFONÇANT ce qu'il y a
+     * derrière, jamais en remontant ce qu'il y a devant.
+     */
+    .wrap {
+      position: absolute; inset: 0; background: rgba(6,8,11,.94);
+      backdrop-filter: blur(20px) saturate(.9);
+      display: flex; align-items: center; justify-content: center;
+      padding: 28px; font: 13px/1.5 ui-sans-serif, system-ui, -apple-system,
+        "Segoe UI Variable", "Segoe UI", sans-serif; color: var(--text);
+    }
+    /*
+     * 1 180 px et non 980 : à neuf colonnes, la largeur d'avant laissait le
+     * titre des cartes se faire couper sur un écran qui avait la place. La
+     * boîte reste bornée — au-delà, l'œil ne fait plus le lien entre le nom
+     * à gauche et le prix à droite.
+     *
+     * L'arête claire du haut, elle, est ce qui remplace le fond éclairci :
+     * un filet blanc à 7 % là où la lumière frapperait la tranche. C'est
+     * tout ce qui sépare visuellement la boîte du fond, et ça suffit.
+     */
+    .box {
+      width: min(1180px, 100%); max-height: 100%; display: flex; flex-direction: column;
+      background: #0D0F13; border: 1px solid rgba(255,255,255,.09); border-radius: 18px;
+      box-shadow: 0 40px 100px rgba(0,0,0,.7), 0 2px 10px rgba(0,0,0,.5),
+                  inset 0 1px 0 var(--line);
+      overflow: hidden;
+    }
+    /*
+     * L'en-tête portait le titre et, à sa suite, quatre faits distincts
+     * cousus par des points médians : « 15 cartes · ~1 234 wb · cote il y a
+     * 41 min · concurrence il y a 6 min ». C'est une phrase qu'on relit
+     * deux fois pour y trouver un nombre.
+     *
+     * Ils deviennent des relevés étiquetés, valeur au-dessus, intitulé
+     * en-dessous — la disposition que le panneau emploie déjà pour ses
+     * compteurs (« .fig »). Les deux surfaces de l'outil disent donc leurs
+     * chiffres de la même façon, et le point médian disparaît.
+     */
+    .top { display: flex; align-items: flex-start; gap: 28px; padding: 18px 20px 16px;
+           border-bottom: 1px solid var(--line); }
+    .top h2 { font-size: 17px; font-weight: 650; letter-spacing: -.015em; padding-top: 2px; }
+    .sum { display: flex; align-items: flex-start; gap: 26px; flex-wrap: wrap; }
+    /* Le relevé chiffré : valeur au-dessus, intitulé en-dessous. Défini une
+       fois — l'en-tête et le journal s'en servent tous les deux, et les
+       deux blocs de la page disent donc leurs chiffres à l'identique. */
+    .f { display: flex; flex-direction: column; gap: 3px; }
+    .f b { font-size: 15px; font-weight: 650; letter-spacing: -.01em; line-height: 1.1;
+           font-variant-numeric: tabular-nums; }
+    .f span { color: var(--dim); font-size: 11px; line-height: 1.1; }
+    /* Un relevé qui alerte — cote distancée, concurrence incomplète —
+       prend l'ambre, la même que ⚠ ailleurs dans l'outil. */
+    .f.due b { color: var(--warn); }
+    .x { margin-left: auto; flex: none; width: 30px; height: 30px; border: 0; border-radius: 9px;
+         background: rgba(255,255,255,.05); color: var(--muted); cursor: pointer; font-size: 14px;
+         transition: background .14s, color .14s; }
+    .x:hover { color: var(--text); background: rgba(255,255,255,.1); }
+    /*
+     * La bande des mises en garde. Ambre, comme ⚠ et comme le tri par
+     * prix : c'est la couleur du « ce chiffre est plus mince qu'il n'en a
+     * l'air » dans tout l'outil. Elle n'existe que lorsqu'il y a quelque
+     * chose à dire — « [hidden] » la retire du flux, elle ne réserve pas
+     * de hauteur vide au-dessus des filtres.
+     */
+    .caveat {
+      display: flex; flex-direction: column; gap: 3px;
+      padding: 10px 20px; border-bottom: 1px solid var(--line);
+      background: color-mix(in srgb, var(--warn) 7%, transparent); color: var(--warn);
+      font-size: 11.5px; line-height: 1.5;
+    }
+    .caveat[hidden] { display: none; }
+
+    /*
+     * La barre de filtres. C'est ici que la page trahissait son âge : la
+     * case à cocher, la liste déroulante et le compteur étaient les
+     * widgets du système. Trois objets dessinés par Windows au milieu
+     * d'une interface dessinée à la main — coche bleue, chevron gris,
+     * flèches de compteur — chacun avec ses propres angles, sa propre
+     * graisse et sa propre idée de la hauteur de ligne.
+     *
+     * Tout est redessiné ci-dessous. Aucune règle ne change ce que les
+     * contrôles FONT : ce sont les mêmes éléments, avec les mêmes
+     * écouteurs et le même clavier — une case reste cochable à la barre
+     * d'espace, la liste garde le menu natif à l'ouverture.
+     *
+     * Les commandes se regroupent aussi : « ventes mini » et « rareté »
+     * restreignent la liste, « sans concurrence » et « masquer » la
+     * filtrent. Un séparateur les sépare, au lieu d'un rang unique où
+     * huit contrôles se suivaient sans hiérarchie.
+     */
+    .bar { display: flex; flex-wrap: wrap; gap: 8px 14px; align-items: center;
+           padding: 11px 20px; border-bottom: 1px solid var(--line);
+           color: var(--muted); font-size: 12px; }
+    .bar label { display: flex; align-items: center; gap: 7px; white-space: nowrap; }
+    /* Le temps du relevé : la barre entière se retire, en bloc. */
+    .bar.inerte { opacity: .45; }
+    .bar.inerte label { cursor: default; }
+    .bar .sep { flex: none; width: 1px; height: 18px; background: rgba(255,255,255,.16); }
+
+    /* Le compteur : les flèches natives sont retirées, la valeur se tape
+       ou se corrige au clavier — elles n'ajoutaient qu'un ornement gris. */
+    .bar input[type=number] {
+      width: 52px; -moz-appearance: textfield; appearance: textfield;
+      background: rgba(255,255,255,.05); border: 1px solid rgba(255,255,255,.09);
+      border-radius: 8px; color: var(--text); padding: 5px 8px;
+      font: 500 12px ui-sans-serif, system-ui, sans-serif; font-variant-numeric: tabular-nums;
+      transition: border-color .14s, background .14s;
+    }
+    .bar input[type=number]::-webkit-outer-spin-button,
+    .bar input[type=number]::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
+    .bar input[type=number]:hover { background: rgba(255,255,255,.08); }
+    .bar input[type=number]:focus { outline: 0; border-color: var(--live); background: rgba(255,255,255,.08); }
+
+    /*
+     * La case à cocher. « appearance: none » la vide de son rendu système,
+     * et la coche est tracée en propre : deux côtés d'un carré, tourné de
+     * 45°. Pas de glyphe ✓ — il change de dessin selon la police
+     * installée, et la case doit avoir le même trait partout.
+     */
+    .bar input[type=checkbox] {
+      flex: none; appearance: none; -webkit-appearance: none;
+      width: 16px; height: 16px; margin: 0; border-radius: 5px;
+      background: rgba(255,255,255,.05); box-shadow: inset 0 0 0 1px rgba(255,255,255,.14);
+      cursor: pointer; transition: background .14s, box-shadow .14s;
+    }
+    .bar input[type=checkbox]:hover { background: rgba(255,255,255,.1); }
+    .bar input[type=checkbox]:checked { background: var(--live); box-shadow: none; }
+    .bar input[type=checkbox]:checked::after {
+      content: ''; display: block; width: 4px; height: 8px; margin: 2px auto 0;
+      border: solid #06130C; border-width: 0 2px 2px 0; transform: rotate(45deg);
+    }
+    /* Le filtre neutralisé le temps du relevé : il ne doit pas avoir l'air
+       d'agir. Le curseur le dit autant que l'opacité, portée par le label. */
+    .bar input[type=checkbox]:disabled { cursor: default; }
+    .tags { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+    .tags > [data-tag] { display: flex; gap: 6px; flex-wrap: wrap; }
+    .tagchip {
+      padding: 3px 9px; border-radius: 999px; border: 1px solid rgba(255,255,255,.12);
+      background: none; color: var(--muted); cursor: pointer;
+      font: 500 11px ui-sans-serif, system-ui, sans-serif; transition: .16s;
+    }
+    .tagchip:hover { color: var(--text); }
+    .tagchip.on { background: color-mix(in srgb, var(--live) 18%, transparent); border-color: var(--live); color: var(--live); }
+    /*
+     * La liste déroulante. Le chevron du système est remplacé par un tracé
+     * en SVG, posé en image de fond — il suit la couleur du texte et garde
+     * la même épaisseur de trait que le reste de l'interface. Le menu qui
+     * s'ouvre au clic reste celui du navigateur : c'est la seule partie
+     * qu'une page ne peut pas dessiner sans réécrire le contrôle entier,
+     * et le réécrire lui coûterait son clavier.
+     */
+    .bar select {
+      appearance: none; -webkit-appearance: none;
+      background: rgba(255,255,255,.05)
+        url("data:image/svg+xml;charset=utf8,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'%3E%3Cpath d='M1 1l4 4 4-4' fill='none' stroke='%23949DAD' stroke-width='1.6' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E")
+        no-repeat right 9px center;
+      border: 1px solid rgba(255,255,255,.09); border-radius: 8px;
+      color: var(--text); padding: 5px 28px 5px 9px;
+      font: 500 12px ui-sans-serif, system-ui, sans-serif; cursor: pointer;
+      transition: border-color .14s, background-color .14s;
+    }
+    .bar select:hover { background-color: rgba(255,255,255,.09); }
+    .bar select:focus { outline: 0; border-color: var(--live); }
+    /* Le menu déroulant, lui, est peint par le navigateur : sans couleur
+       explicite ses options tombaient en noir sur blanc. */
+    .bar select option { background: #14171C; color: var(--text); }
+
+    .bar button { margin-left: auto; flex: none; padding: 6px 13px; border: 0; border-radius: 8px;
+          background: rgba(255,255,255,.06); color: var(--muted); cursor: pointer;
+          font: 500 12px ui-sans-serif, system-ui, sans-serif; transition: background .14s, color .14s; }
+    .bar button:hover { color: var(--text); background: rgba(255,255,255,.1); }
+    /*
+     * Cote distancée. La même ambre que ⚠ et que le tri par prix — c'est
+     * la couleur du « ce chiffre est plus mince qu'il n'en a l'air » dans
+     * tout le panneau. Pas de clignotement : l'écart se comble quand on
+     * veut, il n'urge pas.
+     */
+    .bar button.due { background: color-mix(in srgb, var(--warn) 16%, transparent); color: var(--warn); }
+    .bar button.due:hover { background: color-mix(in srgb, var(--warn) 24%, transparent); color: var(--warn); }
+    .scroll { overflow: auto; }
+    /*
+     * « min-width » : le conteneur était prêt à défiler, mais une table en
+     * « width: 100% » sans plancher se comprime au lieu de le déclencher.
+     * Neuf colonnes — rareté, carte, thème, ventes, en vente, prix visé,
+     * médiane, amplitude, action — s'écrasaient donc en silence sur une
+     * fenêtre étroite. Elles défilent maintenant.
+     */
+    table { width: 100%; min-width: 720px; border-collapse: collapse; }
+    th { position: sticky; top: 0; z-index: 1; background: #0D0F13; text-align: left; color: var(--dim);
+         font-size: 11px; font-weight: 500; padding: 10px 14px;
+         border-bottom: 1px solid var(--line); }
+    td { padding: 9px 14px; border-bottom: 1px solid rgba(255,255,255,.04);
+         font-variant-numeric: tabular-nums; }
+    tr:hover td { background: rgba(255,255,255,.035); }
+    /*
+     * La rareté était deux lettres colorées, seules dans leur colonne.
+     * C'était l'unique endroit du tableau où la palette du jeu servait à
+     * quelque chose, et à cette taille les six teintes — dont quatre
+     * pastels très proches — ne se distinguaient plus.
+     *
+     * Elles deviennent des pastilles teintées, exactement celles que le
+     * panneau emploie pour ses raretés (« .chip »). Le fond porte la
+     * couleur autant que le texte : la teinte se lit sur une surface, plus
+     * sur deux glyphes de onze pixels. Les valeurs, elles, restent celles
+     * relevées sur le site — elles ne s'inventent pas.
+     */
+    .r { width: 1%; white-space: nowrap; }
+    .r i {
+      display: inline-block; min-width: 28px; padding: 2px 7px; border-radius: 999px;
+      background: color-mix(in srgb, var(--c) 22%, transparent); color: var(--c);
+      font: 700 10px ui-sans-serif, system-ui, sans-serif; font-style: normal;
+      text-align: center; letter-spacing: .01em;
+    }
+    /* L'action est en bout de ligne : elle s'aligne sur ce bord, comme les
+       nombres s'alignent sur le leur. Sans quoi les boutons flottaient au
+       milieu d'une colonne large, à distance variable de la ligne suivante. */
+    th:last-child, td:last-child { text-align: right; }
+    .t { max-width: 340px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+         font-weight: 500; }
+    .num { text-align: right; }
+    /*
+     * Le prix visé est la réponse à la question que pose la page. Il portait
+     * la même taille que les six autres nombres de sa ligne, à une graisse
+     * près. Il passe à 14 px : c'est le seul écart de taille du tableau, et
+     * il désigne la colonne qu'on est venu lire.
+     */
+    .med { font-size: 14px; font-weight: 650; letter-spacing: -.01em; }
+    .amp { color: var(--dim); font-size: 11px; white-space: nowrap; }
+    .th { color: var(--muted); font-size: 11px; white-space: nowrap; }
+    .free { color: var(--live); }
+    .busy { color: var(--warn); }
+    /* Peu de ventes : le prix visé n'est pas un prix de marché. */
+    .thin { color: var(--warn); cursor: help; }
+    .th .liq { color: var(--dim); margin-left: 6px; }
+    .tag { padding: 1px 7px; border-radius: 999px; background: color-mix(in srgb, var(--live) 15%, transparent); color: var(--live); font-size: 10px; }
+    /*
+     * « Vendre », répété sur chaque ligne, faisait une colonne d'une
+     * quinzaine de cadres identiques — le motif le plus lourd de l'écran,
+     * pour une action qui ne concerne qu'une ligne à la fois.
+     *
+     * Le bouton perd donc son contour au repos et ne le reprend qu'au
+     * survol de SA ligne. Il reste lisible et cliquable en permanence — ce
+     * n'est pas une action cachée, seulement une action qui cesse de
+     * dessiner un cadre autour d'elle-même quinze fois de suite.
+     */
+    .go { padding: 5px 12px; border: 1px solid rgba(255,255,255,.12); border-radius: 8px;
+          background: none; color: var(--text); cursor: pointer;
+          font: 500 11px ui-sans-serif, system-ui, sans-serif;
+          transition: background .14s, border-color .14s, color .14s; }
+    /*
+     * Le contour ne s'efface QUE dans le tableau — « td .go », pas « .go ».
+     * La même classe habille « Relâcher les filtres », qui vit seul au
+     * milieu d'un tableau vide : sans ligne à survoler, il n'aurait jamais
+     * repris son cadre et se lisait comme du texte mort. C'est le seul
+     * bouton de cet écran-là, il doit rester un bouton.
+     */
+    td .go { border-color: transparent; color: var(--muted); }
+    tr:hover td .go { border-color: rgba(255,255,255,.12); color: var(--text); }
+    .go:hover, .go:focus-visible { background: color-mix(in srgb, var(--live) 15%, transparent); border-color: var(--live); color: var(--live); }
+    /* Un écran tactile n'a pas de survol : le contour y est permanent. */
+    @media (hover: none) { td .go { border-color: rgba(255,255,255,.12); color: var(--text); } }
+    /* Une carte étiquetée n'a pas de bouton : rien à cliquer par mégarde. */
+    .protege { display: inline-block; padding: 4px 9px; border: 1px dashed rgba(255,255,255,.14);
+               border-radius: 8px; color: var(--dim); font: 500 11px ui-sans-serif, system-ui, sans-serif; }
+    /*
+     * Déjà en vente. Verte, parce que ce n'est pas un empêchement mais un
+     * fait accompli : la carte est au marché, l'emplacement est pris, il
+     * n'y a rien à faire de plus. Le tiret de « protégée » dirait le
+     * contraire — qu'on est bloqué.
+     */
+    .encours { display: inline-block; padding: 4px 9px; border-radius: 8px;
+               background: color-mix(in srgb, var(--live) 12%, transparent); color: var(--live);
+               font: 500 11px ui-sans-serif, system-ui, sans-serif; }
+    /*
+     * En file : la carte attend son tour, elle n'est pas encore au marché.
+     * Le lavande la distingue du vert de « en vente » — c'est une promesse,
+     * pas un fait. Même teinte que la rareté R du jeu, la seule de la
+     * palette qui ne soit prise ni par l'action ni par l'alerte.
+     */
+    .encours.file { background: color-mix(in srgb, ${RARITY_COLOR.R} 14%, transparent); color: ${RARITY_COLOR.R}; }
+    /* Le second geste de la ligne : il pèse moins que « Vendre », qui
+       passe par le formulaire du site et vous laisse valider. */
+    .go.file { color: var(--dim); }
+    tr:hover td .go.file { color: ${RARITY_COLOR.R}; }
+    .go.file:hover, .go.file:focus-visible {
+      background: color-mix(in srgb, ${RARITY_COLOR.R} 15%, transparent); border-color: ${RARITY_COLOR.R}; color: ${RARITY_COLOR.R};
+    }
+    .note { padding: 13px 20px; color: var(--dim); font-size: 11px; line-height: 1.55;
+            max-width: 90ch; border-top: 1px solid var(--line); }
+    .empty { padding: 48px 40px; text-align: center; color: var(--dim); line-height: 1.6; }
+    /* La jauge du relevé : mêmes 3 px, même vert et même transition que
+       celle de la régénération, dans le panneau. */
+    .empty .prog {
+      height: 3px; width: min(320px, 60%); margin: 0 auto 20px;
+      border-radius: 2px; background: var(--line); overflow: hidden;
+    }
+    .empty .prog i {
+      display: block; height: 100%; border-radius: 2px; background: var(--live);
+      transition: width .4s linear;
+    }
+    .slots { color: var(--live); font-weight: 600; }
+    /* Autant de lignes surlignées que d'emplacements libres : ce sont les
+       cartes à lister maintenant, sans avoir à compter soi-même. */
+    tr.next td { background: color-mix(in srgb, var(--live) 6%, transparent); }
+    tr.next:hover td { background: color-mix(in srgb, var(--live) 10%, transparent); }
+    tr.next td:first-child { box-shadow: inset 2px 0 0 var(--live); }
+    /*
+     * Le journal se lisait comme une suite de la page, sans rien qui le
+     * distingue du tableau au-dessus : même fond, même graisse, collé
+     * dessous. C'est pourtant l'autre sujet — ce que TU as demandé et ce
+     * que tu as obtenu, quand le tableau dit ce que le marché vaut.
+     *
+     * Il s'enfonce donc au lieu de s'élever : un fond légèrement plus
+     * sombre que la boîte, qui le range visiblement au second plan. Aucun
+     * texte en « --dim » n'y vit — les tons employés ici sont le blanc, le
+     * vert et l'ambre — le plancher de contraste ne s'y applique donc pas.
+     */
+    .journal { border-top: 1px solid var(--line); padding: 14px 20px;
+               background: rgba(0,0,0,.28); }
+    /*
+     * Vide, il ne réserve rien. Tant qu'il n'avait ni fond ni filet, une
+     * boîte vide de 28 px de rembourrage passait inaperçue ; le fond l'a
+     * rendue visible — une bande sombre et muette entre le tableau et la
+     * note, pendant tout le relevé, sur un compte qui n'a encore rien
+     * vendu. C'est le fond qui l'a révélée, pas lui qui l'a créée.
+     */
+    .journal:empty { display: none; }
+    /*
+     * Le journal est la boucle de retour de la page : le tableau dit à quel
+     * prix vendre, le journal dit si ce prix s'est vendu. Il était pourtant
+     * la partie la plus pauvre de l'écran, et pour deux raisons.
+     *
+     * Il occupait douze rangs pleine largeur — 230 px pris au tableau, qui
+     * est le sujet — pour un contenu large de 400. Il passe en colonnes :
+     * autant qu'il en tient, et les douze entrées se rangent en trois
+     * rangs. Le tableau récupère la différence.
+     *
+     * Et chaque ligne disait « demandé 240 vendu 240 », le même nombre
+     * deux fois, sur toutes les ventes conclues au prix demandé —
+     * c'est-à-dire presque toutes. Le seul cas intéressant est celui où les
+     * deux DIFFÈRENT : une enchère qui monte. On n'écrit donc qu'un
+     * nombre, et la flèche ne paraît que lorsqu'il y en a deux à comparer.
+     */
+    .jhead { display: flex; align-items: flex-start; gap: 26px; margin-bottom: 11px; }
+    .jhead h3 { align-self: center; font-size: 12px; font-weight: 600; color: var(--text);
+                letter-spacing: -.005em; margin-right: 2px; }
+    .journal .list {
+      display: grid; grid-template-columns: repeat(auto-fill, minmax(250px, 1fr));
+      gap: 2px 28px;
+    }
+    .journal .j { display: flex; gap: 9px; align-items: baseline; font-size: 12px; }
+    .journal .j i { flex: none; width: 5px; height: 5px; border-radius: 50%;
+                    background: var(--live); transform: translateY(-1px); }
+    .journal .j.ko i { background: var(--warn); }
+    .journal .n { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis;
+                  white-space: nowrap; color: var(--text); }
+    .journal .px { flex: none; color: var(--muted); font-variant-numeric: tabular-nums; }
+    /* Le prix atteint, quand il dépasse celui demandé : c'est le seul
+       chiffre du journal qui soit une bonne nouvelle, il la porte. */
+    .journal .px em { font-style: normal; color: var(--live); font-weight: 600; }
+    .journal .j.ko .px { color: var(--warn); }
+
+    /* Le clavier doit voir où il est : la Revente est une modale, on peut
+       la parcourir entièrement à la tabulation. */
+    :focus-visible { outline: 2px solid var(--live); outline-offset: 2px; }
+    @media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
+  `;
+
   function buildSellUI() {
     const host = document.createElement('div');
     host.id = 'wm-sell-page';
     host.style.cssText = 'position:fixed;inset:0;z-index:2147483646;display:none';
     const root = host.attachShadow({ mode: 'open' });
     root.innerHTML = `
-      <style>
-        :host { all: initial; }
-        * { box-sizing: border-box; margin: 0; }
-        /*
-         * Le fond de la page passe de 86 % à 94 % d'opacité, et le flou de 10 à
-         * 20 px.
-         *
-         * L'élévation ne peut PAS venir d'une boîte plus claire : « --dim »
-         * (#717C8D) est calé à 4,54:1 sur #0D0F13, soit quatre centièmes
-         * au-dessus du plancher AA. Éclaircir le fond de la modale, ne
-         * serait-ce que vers #101319, le fait retomber à 4,43:1 — et c'est le
-         * ton de l'amplitude et des en-têtes de colonnes, les plus petits
-         * textes du tableau. On gagne donc le relief en ENFONÇANT ce qu'il y a
-         * derrière, jamais en remontant ce qu'il y a devant.
-         */
-        .wrap {
-          position: absolute; inset: 0; background: rgba(6,8,11,.94);
-          backdrop-filter: blur(20px) saturate(.9);
-          display: flex; align-items: center; justify-content: center;
-          padding: 28px; font: 13px/1.5 ui-sans-serif, system-ui, -apple-system,
-            "Segoe UI Variable", "Segoe UI", sans-serif; color: #F1F4F8;
-        }
-        /*
-         * 1 180 px et non 980 : à neuf colonnes, la largeur d'avant laissait le
-         * titre des cartes se faire couper sur un écran qui avait la place. La
-         * boîte reste bornée — au-delà, l'œil ne fait plus le lien entre le nom
-         * à gauche et le prix à droite.
-         *
-         * L'arête claire du haut, elle, est ce qui remplace le fond éclairci :
-         * un filet blanc à 7 % là où la lumière frapperait la tranche. C'est
-         * tout ce qui sépare visuellement la boîte du fond, et ça suffit.
-         */
-        .box {
-          width: min(1180px, 100%); max-height: 100%; display: flex; flex-direction: column;
-          background: #0D0F13; border: 1px solid rgba(255,255,255,.09); border-radius: 18px;
-          box-shadow: 0 40px 100px rgba(0,0,0,.7), 0 2px 10px rgba(0,0,0,.5),
-                      inset 0 1px 0 rgba(255,255,255,.07);
-          overflow: hidden;
-        }
-        /*
-         * L'en-tête portait le titre et, à sa suite, quatre faits distincts
-         * cousus par des points médians : « 15 cartes · ~1 234 wb · cote il y a
-         * 41 min · concurrence il y a 6 min ». C'est une phrase qu'on relit
-         * deux fois pour y trouver un nombre.
-         *
-         * Ils deviennent des relevés étiquetés, valeur au-dessus, intitulé
-         * en-dessous — la disposition que le panneau emploie déjà pour ses
-         * compteurs (« .fig »). Les deux surfaces de l'outil disent donc leurs
-         * chiffres de la même façon, et le point médian disparaît.
-         */
-        .top { display: flex; align-items: flex-start; gap: 28px; padding: 18px 20px 16px;
-               border-bottom: 1px solid rgba(255,255,255,.07); }
-        .top h2 { font-size: 17px; font-weight: 650; letter-spacing: -.015em; padding-top: 2px; }
-        .sum { display: flex; align-items: flex-start; gap: 26px; flex-wrap: wrap; }
-        /* Le relevé chiffré : valeur au-dessus, intitulé en-dessous. Défini une
-           fois — l'en-tête et le journal s'en servent tous les deux, et les
-           deux blocs de la page disent donc leurs chiffres à l'identique. */
-        .f { display: flex; flex-direction: column; gap: 3px; }
-        .f b { font-size: 15px; font-weight: 650; letter-spacing: -.01em; line-height: 1.1;
-               font-variant-numeric: tabular-nums; }
-        .f span { color: #717C8D; font-size: 11px; line-height: 1.1; }
-        /* Un relevé qui alerte — cote distancée, concurrence incomplète —
-           prend l'ambre, la même que ⚠ ailleurs dans l'outil. */
-        .f.due b { color: #F0A94B; }
-        .x { margin-left: auto; flex: none; width: 30px; height: 30px; border: 0; border-radius: 9px;
-             background: rgba(255,255,255,.05); color: #949DAD; cursor: pointer; font-size: 14px;
-             transition: background .14s, color .14s; }
-        .x:hover { color: #F1F4F8; background: rgba(255,255,255,.1); }
-        /*
-         * La bande des mises en garde. Ambre, comme ⚠ et comme le tri par
-         * prix : c'est la couleur du « ce chiffre est plus mince qu'il n'en a
-         * l'air » dans tout l'outil. Elle n'existe que lorsqu'il y a quelque
-         * chose à dire — « [hidden] » la retire du flux, elle ne réserve pas
-         * de hauteur vide au-dessus des filtres.
-         */
-        .caveat {
-          display: flex; flex-direction: column; gap: 3px;
-          padding: 10px 20px; border-bottom: 1px solid rgba(255,255,255,.07);
-          background: rgba(240,169,75,.07); color: #F0A94B;
-          font-size: 11.5px; line-height: 1.5;
-        }
-        .caveat[hidden] { display: none; }
-
-        /*
-         * La barre de filtres. C'est ici que la page trahissait son âge : la
-         * case à cocher, la liste déroulante et le compteur étaient les
-         * widgets du système. Trois objets dessinés par Windows au milieu
-         * d'une interface dessinée à la main — coche bleue, chevron gris,
-         * flèches de compteur — chacun avec ses propres angles, sa propre
-         * graisse et sa propre idée de la hauteur de ligne.
-         *
-         * Tout est redessiné ci-dessous. Aucune règle ne change ce que les
-         * contrôles FONT : ce sont les mêmes éléments, avec les mêmes
-         * écouteurs et le même clavier — une case reste cochable à la barre
-         * d'espace, la liste garde le menu natif à l'ouverture.
-         *
-         * Les commandes se regroupent aussi : « ventes mini » et « rareté »
-         * restreignent la liste, « sans concurrence » et « masquer » la
-         * filtrent. Un séparateur les sépare, au lieu d'un rang unique où
-         * huit contrôles se suivaient sans hiérarchie.
-         */
-        .bar { display: flex; flex-wrap: wrap; gap: 8px 14px; align-items: center;
-               padding: 11px 20px; border-bottom: 1px solid rgba(255,255,255,.07);
-               color: #949DAD; font-size: 12px; }
-        .bar label { display: flex; align-items: center; gap: 7px; white-space: nowrap; }
-        /* Le temps du relevé : la barre entière se retire, en bloc. */
-        .bar.inerte { opacity: .45; }
-        .bar.inerte label { cursor: default; }
-        .bar .sep { flex: none; width: 1px; height: 18px; background: rgba(255,255,255,.16); }
-
-        /* Le compteur : les flèches natives sont retirées, la valeur se tape
-           ou se corrige au clavier — elles n'ajoutaient qu'un ornement gris. */
-        .bar input[type=number] {
-          width: 52px; -moz-appearance: textfield; appearance: textfield;
-          background: rgba(255,255,255,.05); border: 1px solid rgba(255,255,255,.09);
-          border-radius: 8px; color: #F1F4F8; padding: 5px 8px;
-          font: 500 12px ui-sans-serif, system-ui, sans-serif; font-variant-numeric: tabular-nums;
-          transition: border-color .14s, background .14s;
-        }
-        .bar input[type=number]::-webkit-outer-spin-button,
-        .bar input[type=number]::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
-        .bar input[type=number]:hover { background: rgba(255,255,255,.08); }
-        .bar input[type=number]:focus { outline: 0; border-color: #35D68F; background: rgba(255,255,255,.08); }
-
-        /*
-         * La case à cocher. « appearance: none » la vide de son rendu système,
-         * et la coche est tracée en propre : deux côtés d'un carré, tourné de
-         * 45°. Pas de glyphe ✓ — il change de dessin selon la police
-         * installée, et la case doit avoir le même trait partout.
-         */
-        .bar input[type=checkbox] {
-          flex: none; appearance: none; -webkit-appearance: none;
-          width: 16px; height: 16px; margin: 0; border-radius: 5px;
-          background: rgba(255,255,255,.05); box-shadow: inset 0 0 0 1px rgba(255,255,255,.14);
-          cursor: pointer; transition: background .14s, box-shadow .14s;
-        }
-        .bar input[type=checkbox]:hover { background: rgba(255,255,255,.1); }
-        .bar input[type=checkbox]:checked { background: #35D68F; box-shadow: none; }
-        .bar input[type=checkbox]:checked::after {
-          content: ''; display: block; width: 4px; height: 8px; margin: 2px auto 0;
-          border: solid #06130C; border-width: 0 2px 2px 0; transform: rotate(45deg);
-        }
-        /* Le filtre neutralisé le temps du relevé : il ne doit pas avoir l'air
-           d'agir. Le curseur le dit autant que l'opacité, portée par le label. */
-        .bar input[type=checkbox]:disabled { cursor: default; }
-        .tags { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
-        .tags > [data-tag] { display: flex; gap: 6px; flex-wrap: wrap; }
-        .tagchip {
-          padding: 3px 9px; border-radius: 999px; border: 1px solid rgba(255,255,255,.12);
-          background: none; color: #949DAD; cursor: pointer;
-          font: 500 11px ui-sans-serif, system-ui, sans-serif; transition: .16s;
-        }
-        .tagchip:hover { color: #F1F4F8; }
-        .tagchip.on { background: rgba(53,214,143,.18); border-color: #35D68F; color: #35D68F; }
-        /*
-         * La liste déroulante. Le chevron du système est remplacé par un tracé
-         * en SVG, posé en image de fond — il suit la couleur du texte et garde
-         * la même épaisseur de trait que le reste de l'interface. Le menu qui
-         * s'ouvre au clic reste celui du navigateur : c'est la seule partie
-         * qu'une page ne peut pas dessiner sans réécrire le contrôle entier,
-         * et le réécrire lui coûterait son clavier.
-         */
-        .bar select {
-          appearance: none; -webkit-appearance: none;
-          background: rgba(255,255,255,.05)
-            url("data:image/svg+xml;charset=utf8,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'%3E%3Cpath d='M1 1l4 4 4-4' fill='none' stroke='%23949DAD' stroke-width='1.6' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E")
-            no-repeat right 9px center;
-          border: 1px solid rgba(255,255,255,.09); border-radius: 8px;
-          color: #F1F4F8; padding: 5px 28px 5px 9px;
-          font: 500 12px ui-sans-serif, system-ui, sans-serif; cursor: pointer;
-          transition: border-color .14s, background-color .14s;
-        }
-        .bar select:hover { background-color: rgba(255,255,255,.09); }
-        .bar select:focus { outline: 0; border-color: #35D68F; }
-        /* Le menu déroulant, lui, est peint par le navigateur : sans couleur
-           explicite ses options tombaient en noir sur blanc. */
-        .bar select option { background: #14171C; color: #F1F4F8; }
-
-        .bar button { margin-left: auto; flex: none; padding: 6px 13px; border: 0; border-radius: 8px;
-              background: rgba(255,255,255,.06); color: #949DAD; cursor: pointer;
-              font: 500 12px ui-sans-serif, system-ui, sans-serif; transition: background .14s, color .14s; }
-        .bar button:hover { color: #F1F4F8; background: rgba(255,255,255,.1); }
-        /*
-         * Cote distancée. La même ambre que ⚠ et que le tri par prix — c'est
-         * la couleur du « ce chiffre est plus mince qu'il n'en a l'air » dans
-         * tout le panneau. Pas de clignotement : l'écart se comble quand on
-         * veut, il n'urge pas.
-         */
-        .bar button.due { background: rgba(240,169,75,.16); color: #F0A94B; }
-        .bar button.due:hover { background: rgba(240,169,75,.24); color: #F0A94B; }
-        .scroll { overflow: auto; }
-        /*
-         * « min-width » : le conteneur était prêt à défiler, mais une table en
-         * « width: 100% » sans plancher se comprime au lieu de le déclencher.
-         * Neuf colonnes — rareté, carte, thème, ventes, en vente, prix visé,
-         * médiane, amplitude, action — s'écrasaient donc en silence sur une
-         * fenêtre étroite. Elles défilent maintenant.
-         */
-        table { width: 100%; min-width: 720px; border-collapse: collapse; }
-        th { position: sticky; top: 0; z-index: 1; background: #0D0F13; text-align: left; color: #717C8D;
-             font-size: 11px; font-weight: 500; padding: 10px 14px;
-             border-bottom: 1px solid rgba(255,255,255,.07); }
-        td { padding: 9px 14px; border-bottom: 1px solid rgba(255,255,255,.04);
-             font-variant-numeric: tabular-nums; }
-        tr:hover td { background: rgba(255,255,255,.035); }
-        /*
-         * La rareté était deux lettres colorées, seules dans leur colonne.
-         * C'était l'unique endroit du tableau où la palette du jeu servait à
-         * quelque chose, et à cette taille les six teintes — dont quatre
-         * pastels très proches — ne se distinguaient plus.
-         *
-         * Elles deviennent des pastilles teintées, exactement celles que le
-         * panneau emploie pour ses raretés (« .chip »). Le fond porte la
-         * couleur autant que le texte : la teinte se lit sur une surface, plus
-         * sur deux glyphes de onze pixels. Les valeurs, elles, restent celles
-         * relevées sur le site — elles ne s'inventent pas.
-         */
-        .r { width: 1%; white-space: nowrap; }
-        .r i {
-          display: inline-block; min-width: 28px; padding: 2px 7px; border-radius: 999px;
-          background: color-mix(in srgb, var(--c) 22%, transparent); color: var(--c);
-          font: 700 10px ui-sans-serif, system-ui, sans-serif; font-style: normal;
-          text-align: center; letter-spacing: .01em;
-        }
-        /* L'action est en bout de ligne : elle s'aligne sur ce bord, comme les
-           nombres s'alignent sur le leur. Sans quoi les boutons flottaient au
-           milieu d'une colonne large, à distance variable de la ligne suivante. */
-        th:last-child, td:last-child { text-align: right; }
-        .t { max-width: 340px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-             font-weight: 500; }
-        .num { text-align: right; }
-        /*
-         * Le prix visé est la réponse à la question que pose la page. Il portait
-         * la même taille que les six autres nombres de sa ligne, à une graisse
-         * près. Il passe à 14 px : c'est le seul écart de taille du tableau, et
-         * il désigne la colonne qu'on est venu lire.
-         */
-        .med { font-size: 14px; font-weight: 650; letter-spacing: -.01em; }
-        .amp { color: #717C8D; font-size: 11px; white-space: nowrap; }
-        .th { color: #949DAD; font-size: 11px; white-space: nowrap; }
-        .free { color: #35D68F; }
-        .busy { color: #F0A94B; }
-        /* Peu de ventes : le prix visé n'est pas un prix de marché. */
-        .thin { color: #F0A94B; cursor: help; }
-        .th .liq { color: #717C8D; margin-left: 6px; }
-        .tag { padding: 1px 7px; border-radius: 999px; background: rgba(53,214,143,.15); color: #35D68F; font-size: 10px; }
-        /*
-         * « Vendre », répété sur chaque ligne, faisait une colonne d'une
-         * quinzaine de cadres identiques — le motif le plus lourd de l'écran,
-         * pour une action qui ne concerne qu'une ligne à la fois.
-         *
-         * Le bouton perd donc son contour au repos et ne le reprend qu'au
-         * survol de SA ligne. Il reste lisible et cliquable en permanence — ce
-         * n'est pas une action cachée, seulement une action qui cesse de
-         * dessiner un cadre autour d'elle-même quinze fois de suite.
-         */
-        .go { padding: 5px 12px; border: 1px solid rgba(255,255,255,.12); border-radius: 8px;
-              background: none; color: #F1F4F8; cursor: pointer;
-              font: 500 11px ui-sans-serif, system-ui, sans-serif;
-              transition: background .14s, border-color .14s, color .14s; }
-        /*
-         * Le contour ne s'efface QUE dans le tableau — « td .go », pas « .go ».
-         * La même classe habille « Relâcher les filtres », qui vit seul au
-         * milieu d'un tableau vide : sans ligne à survoler, il n'aurait jamais
-         * repris son cadre et se lisait comme du texte mort. C'est le seul
-         * bouton de cet écran-là, il doit rester un bouton.
-         */
-        td .go { border-color: transparent; color: #949DAD; }
-        tr:hover td .go { border-color: rgba(255,255,255,.12); color: #F1F4F8; }
-        .go:hover, .go:focus-visible { background: rgba(53,214,143,.15); border-color: #35D68F; color: #35D68F; }
-        /* Un écran tactile n'a pas de survol : le contour y est permanent. */
-        @media (hover: none) { td .go { border-color: rgba(255,255,255,.12); color: #F1F4F8; } }
-        /* Une carte étiquetée n'a pas de bouton : rien à cliquer par mégarde. */
-        .protege { display: inline-block; padding: 4px 9px; border: 1px dashed rgba(255,255,255,.14);
-                   border-radius: 8px; color: #717C8D; font: 500 11px ui-sans-serif, system-ui, sans-serif; }
-        /*
-         * Déjà en vente. Verte, parce que ce n'est pas un empêchement mais un
-         * fait accompli : la carte est au marché, l'emplacement est pris, il
-         * n'y a rien à faire de plus. Le tiret de « protégée » dirait le
-         * contraire — qu'on est bloqué.
-         */
-        .encours { display: inline-block; padding: 4px 9px; border-radius: 8px;
-                   background: rgba(53,214,143,.12); color: #35D68F;
-                   font: 500 11px ui-sans-serif, system-ui, sans-serif; }
-        /*
-         * En file : la carte attend son tour, elle n'est pas encore au marché.
-         * Le lavande la distingue du vert de « en vente » — c'est une promesse,
-         * pas un fait. Même teinte que la rareté R du jeu, la seule de la
-         * palette qui ne soit prise ni par l'action ni par l'alerte.
-         */
-        .encours.file { background: rgba(198,167,242,.14); color: #C6A7F2; }
-        /* Le second geste de la ligne : il pèse moins que « Vendre », qui
-           passe par le formulaire du site et vous laisse valider. */
-        .go.file { color: #717C8D; }
-        tr:hover td .go.file { color: #C6A7F2; }
-        .go.file:hover, .go.file:focus-visible {
-          background: rgba(198,167,242,.15); border-color: #C6A7F2; color: #C6A7F2;
-        }
-        .note { padding: 13px 20px; color: #717C8D; font-size: 11px; line-height: 1.55;
-                max-width: 90ch; border-top: 1px solid rgba(255,255,255,.07); }
-        .empty { padding: 48px 40px; text-align: center; color: #717C8D; line-height: 1.6; }
-        /* La jauge du relevé : mêmes 3 px, même vert et même transition que
-           celle de la régénération, dans le panneau. */
-        .empty .prog {
-          height: 3px; width: min(320px, 60%); margin: 0 auto 20px;
-          border-radius: 2px; background: rgba(255,255,255,.07); overflow: hidden;
-        }
-        .empty .prog i {
-          display: block; height: 100%; border-radius: 2px; background: #35D68F;
-          transition: width .4s linear;
-        }
-        .slots { color: #35D68F; font-weight: 600; }
-        /* Autant de lignes surlignées que d'emplacements libres : ce sont les
-           cartes à lister maintenant, sans avoir à compter soi-même. */
-        tr.next td { background: rgba(53,214,143,.06); }
-        tr.next:hover td { background: rgba(53,214,143,.1); }
-        tr.next td:first-child { box-shadow: inset 2px 0 0 #35D68F; }
-        /*
-         * Le journal se lisait comme une suite de la page, sans rien qui le
-         * distingue du tableau au-dessus : même fond, même graisse, collé
-         * dessous. C'est pourtant l'autre sujet — ce que TU as demandé et ce
-         * que tu as obtenu, quand le tableau dit ce que le marché vaut.
-         *
-         * Il s'enfonce donc au lieu de s'élever : un fond légèrement plus
-         * sombre que la boîte, qui le range visiblement au second plan. Aucun
-         * texte en « --dim » n'y vit — les tons employés ici sont le blanc, le
-         * vert et l'ambre — le plancher de contraste ne s'y applique donc pas.
-         */
-        .journal { border-top: 1px solid rgba(255,255,255,.07); padding: 14px 20px;
-                   background: rgba(0,0,0,.28); }
-        /*
-         * Vide, il ne réserve rien. Tant qu'il n'avait ni fond ni filet, une
-         * boîte vide de 28 px de rembourrage passait inaperçue ; le fond l'a
-         * rendue visible — une bande sombre et muette entre le tableau et la
-         * note, pendant tout le relevé, sur un compte qui n'a encore rien
-         * vendu. C'est le fond qui l'a révélée, pas lui qui l'a créée.
-         */
-        .journal:empty { display: none; }
-        /*
-         * Le journal est la boucle de retour de la page : le tableau dit à quel
-         * prix vendre, le journal dit si ce prix s'est vendu. Il était pourtant
-         * la partie la plus pauvre de l'écran, et pour deux raisons.
-         *
-         * Il occupait douze rangs pleine largeur — 230 px pris au tableau, qui
-         * est le sujet — pour un contenu large de 400. Il passe en colonnes :
-         * autant qu'il en tient, et les douze entrées se rangent en trois
-         * rangs. Le tableau récupère la différence.
-         *
-         * Et chaque ligne disait « demandé 240 vendu 240 », le même nombre
-         * deux fois, sur toutes les ventes conclues au prix demandé —
-         * c'est-à-dire presque toutes. Le seul cas intéressant est celui où les
-         * deux DIFFÈRENT : une enchère qui monte. On n'écrit donc qu'un
-         * nombre, et la flèche ne paraît que lorsqu'il y en a deux à comparer.
-         */
-        .jhead { display: flex; align-items: flex-start; gap: 26px; margin-bottom: 11px; }
-        .jhead h3 { align-self: center; font-size: 12px; font-weight: 600; color: #F1F4F8;
-                    letter-spacing: -.005em; margin-right: 2px; }
-        .journal .list {
-          display: grid; grid-template-columns: repeat(auto-fill, minmax(250px, 1fr));
-          gap: 2px 28px;
-        }
-        .journal .j { display: flex; gap: 9px; align-items: baseline; font-size: 12px; }
-        .journal .j i { flex: none; width: 5px; height: 5px; border-radius: 50%;
-                        background: #35D68F; transform: translateY(-1px); }
-        .journal .j.ko i { background: #F0A94B; }
-        .journal .n { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis;
-                      white-space: nowrap; color: #F1F4F8; }
-        .journal .px { flex: none; color: #949DAD; font-variant-numeric: tabular-nums; }
-        /* Le prix atteint, quand il dépasse celui demandé : c'est le seul
-           chiffre du journal qui soit une bonne nouvelle, il la porte. */
-        .journal .px em { font-style: normal; color: #35D68F; font-weight: 600; }
-        .journal .j.ko .px { color: #F0A94B; }
-
-        /* Le clavier doit voir où il est : la Revente est une modale, on peut
-           la parcourir entièrement à la tabulation. */
-        :focus-visible { outline: 2px solid #35D68F; outline-offset: 2px; }
-        @media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
-      </style>
+      <style>${SELL_CSS}</style>
       <div class="wrap" data-wrap>
         <div class="box">
           <div class="top">
@@ -12182,7 +13065,17 @@
      * somme concatène « 1050 » et « 2500 » au lieu de les additionner.
      */
     const gains = vendues.reduce((s, e) => s + (Number(e.final) || 0), 0);
-    const nb = (v) => Number(v).toLocaleString('fr-FR');
+    /*
+     * Les nombres passent par `fmtWb`, comme partout ailleurs.
+     *
+     * Il y avait ici un `nb` local qui refaisait exactement la même chose —
+     * `Number(v).toLocaleString('fr-FR')` — à cent cinquante lignes de
+     * distance de l'original, et SANS son garde `n == null` : un compteur
+     * absent écrivait « NaN » ici et « — » partout ailleurs. Deux
+     * réinventions de la même idée qui divergent, ce qui est le mode de
+     * duplication de ce fichier : pas du copier-coller, des redécouvertes.
+     */
+    const nb = fmtWb;
     /*
      * Le compte brut, pas seulement le taux. Un « 75 % » se lit bien et ne dit
      * pas s'il porte sur quatre ventes ou sur quatre cents, et les invendues
@@ -12211,6 +13104,139 @@
       .join('') + '</div>');
   }
 
+
+  /**
+   * Ce qu'une ligne de la Revente PROPOSE — et c'est une décision, pas un
+   * affichage.
+   *
+   * Elle se prenait en plein milieu du gabarit HTML, entre deux cellules de
+   * tableau : quatre `const` qui décidaient si la carte affiche « Vendre »,
+   * « en file », « en vente » ou « protégée ». Une carte étiquetée n'a même
+   * pas de bouton, une carte déjà en vente occupe un emplacement, une carte
+   * en file partira seule — trois issues très différentes, décidées là où
+   * personne ne va les lire.
+   *
+   * Les quatre faits sont donc nommés ici, une fois, et le gabarit se contente
+   * de les rendre.
+   *
+   * @param {Set<string>} enVente  vos ventes en cours, si le relevé est frais
+   * @param {number} restants      emplacements encore libres à cet instant
+   */
+  function etatLigne(x, enVente, restants) {
+    const protegee = x.tags.length > 0;
+    const dejaEnVente = enVente.has(x.id);
+    /*
+     * Déjà dans la file. C'est `state.watch`, la même que celle du volet
+     * Relances — une seule machine, qui sait déjà attendre un emplacement,
+     * retrouver l'exemplaire, écarter une carte étiquetée. Le bouton n'ouvre
+     * qu'une porte de plus vers elle.
+     */
+    const enFile = !!(state.watch && state.watch[x.id]);
+    const listable = !dejaEnVente && !protegee;
+    return { protegee, dejaEnVente, enFile, listable, aLister: listable && restants > 0 };
+  }
+
+  /**
+   * Le résumé de la Revente : les chiffres de son en-tête et ses mises en garde.
+   *
+   * Il se calculait au milieu de `renderSell`, entre deux `paint()` — cent
+   * quarante lignes de décisions prises dans une fonction dont le métier est
+   * de dessiner. Ce qu'il produit ne dépend que de l'état : c'est donc une
+   * fonction pure, et elle se lit sans traverser un gabarit HTML.
+   *
+   * Sorti au passage : `concGene`, calculé et jamais lu par personne. Les
+   * alertes de concurrence lisent `sell.compAt` et `sell.compTronque`
+   * directement, et le faisaient déjà.
+   */
+  function resumeRevente(rows) {
+    const valeur = rows.reduce((a, x) => a + (x.q3 || x.med), 0);
+    const libres = state.slots.at ? state.slots.max - state.slots.used : null;
+    /*
+     * Ce que tu as DÉJÀ en vente.
+     *
+     * Le tableau l'ignorait complètement : une carte dont l'enchère court
+     * gardait son bouton « Vendre », et pouvait même être surlignée comme
+     * « à lister maintenant ». La colonne « En vente » ne dit rien de ce
+     * cas-là — elle compte les annonces des AUTRES joueurs, pas les tiennes.
+     *
+     * Le relevé n'existe que si la surveillance tourne ; sans lui on ne
+     * prétend rien, plutôt que de présenter comme libre ce qu'on n'a pas lu.
+     * C'est la même prudence que le filtre « sans concurrence » applique déjà
+     * en attendant son propre relevé.
+     */
+    /*
+     * Et on ne s'en sert que si le relevé est FRAIS.
+     *
+     * Il ne testait que « a-t-on déjà lu une fois » : un relevé vieux de dix
+     * minutes servait donc à marquer des lignes « en vente » avec l'aplomb
+     * d'un relevé de la seconde. Se taire coûte un bouton « Vendre » proposé
+     * sur une carte déjà en vente — le site refusera, et on le saura tout de
+     * suite. Affirmer à tort coûte une carte qu'on croit vendue et qui ne
+     * l'est pas, ou l'inverse, et ça ne se voit jamais.
+     *
+     * Deux minutes : c'est la durée au-delà de laquelle ce relevé cesse de
+     * valoir pour AFFICHER. Pour agir, le volet Relances est deux fois plus
+     * exigeant — voir `VENTES_POUR_AGIR_MS`.
+     */
+    const ventesFraiches = state.sales.at && Date.now() - state.sales.at < VENTES_FRAICHES_MS;
+    const mesVentes = new Set(
+      ventesFraiches ? (state.sales.list || []).map((v) => v.card).filter(Boolean) : []
+    );
+    /*
+     * La couverture se dit ICI, à côté de l'âge de la cote, parce que c'est la
+     * question suivante : « de quand » ne vaut rien sans « sur quoi ».
+     * Formulée en cartes manquantes plutôt qu'en pourcentage seul — un « 17 % »
+     * ne dit pas s'il en manque cent ou dix mille.
+     */
+    const c = couvertureDistancee();
+    /*
+     * Deux nombres, pas trois. « N de vos N cartes (17 %) — N
+     * sans prix » disait trois fois la même chose : les deux premiers
+     * s'additionnent pour faire le troisième.
+     */
+    /*
+     * Les mises en garde quittent la ligne des chiffres.
+     *
+     * Elles y étaient cousues aux relevés par des points médians — « 15 cartes
+     * · ~1 234 wb · cote il y a 41 min · relevé de la concurrence interrompu —
+     * “sans concurrence” n'est pas fiable ». Une phrase entière, en gris, en
+     * quatrième position d'une énumération de nombres : c'est l'endroit d'un
+     * écran où l'on regarde le moins. Elles prennent leur propre bande, en
+     * ambre, sous l'en-tête — et n'apparaissent que lorsqu'il y a lieu.
+     */
+    const alertes = [
+      c && `La cote couvre ${c.pct} % de vos cartes : ${c.manquantes.toLocaleString('fr-FR')} `
+        + 'sont sans prix et tombent en fin de tri.',
+      !sell.compAt && sell.compTronque
+        && 'Relevé de la concurrence interrompu — « sans concurrence » n’est pas fiable.',
+      !sell.compAt && !sell.compTronque
+        && 'Relevé de la concurrence en cours — « sans concurrence » ne filtre pas encore.',
+      sell.compAt && sell.compTronque
+        && 'Dernier relevé de la concurrence interrompu — le serveur a freiné.',
+      /*
+       * La note du serveur — « les prix sont réservés aux comptes PRO » — ne
+       * monte dans la bande QUE si le tableau a des lignes. Sans lignes, c'est
+       * elle que le corps affiche en grand, au centre : la mettre aussi dans
+       * la bande écrivait deux fois la même phrase, l'une sous l'autre, à
+       * trois lignes d'intervalle. Vu à l'écran sur le cas du compte gratuit,
+       * qui est précisément celui où elle est la plus longue.
+       */
+      rows.length ? sell.note : '',
+      /*
+       * Le relevé des ventes est en retard. On le DIT, parce que sans lui la
+       * colonne d'action ne sait plus distinguer une carte déjà en vente d'une
+       * carte libre — et qu'un tableau qui a cessé de savoir ne doit pas avoir
+       * l'air de savoir encore. Il se relit tout seul à l'ouverture ; cette
+       * phrase ne dure donc que le temps de l'aller-retour, ou signale que le
+       * serveur ne répond pas.
+       */
+      !ventesFraiches
+        && 'Vos ventes en cours ne sont pas encore relues : les cartes déjà '
+           + 'en vente ne sont pas signalées comme telles.',
+    ].filter(Boolean);
+
+    return { valeur, libres, ventesFraiches, mesVentes, couverture: c, alertes };
+  }
 
   function renderSell() {
     if (!sellUI) return;
@@ -12286,97 +13312,8 @@
     }
 
     const rows = sellRows();
-    const valeur = rows.reduce((a, x) => a + (x.q3 || x.med), 0);
-    const libres = state.slots.at ? state.slots.max - state.slots.used : null;
-    /*
-     * Ce que tu as DÉJÀ en vente.
-     *
-     * Le tableau l'ignorait complètement : une carte dont l'enchère court
-     * gardait son bouton « Vendre », et pouvait même être surlignée comme
-     * « à lister maintenant ». La colonne « En vente » ne dit rien de ce
-     * cas-là — elle compte les annonces des AUTRES joueurs, pas les tiennes.
-     *
-     * Le relevé n'existe que si la surveillance tourne ; sans lui on ne
-     * prétend rien, plutôt que de présenter comme libre ce qu'on n'a pas lu.
-     * C'est la même prudence que le filtre « sans concurrence » applique déjà
-     * en attendant son propre relevé.
-     */
-    /*
-     * Et on ne s'en sert que si le relevé est FRAIS.
-     *
-     * Il ne testait que « a-t-on déjà lu une fois » : un relevé vieux de dix
-     * minutes servait donc à marquer des lignes « en vente » avec l'aplomb
-     * d'un relevé de la seconde. Se taire coûte un bouton « Vendre » proposé
-     * sur une carte déjà en vente — le site refusera, et on le saura tout de
-     * suite. Affirmer à tort coûte une carte qu'on croit vendue et qui ne
-     * l'est pas, ou l'inverse, et ça ne se voit jamais.
-     *
-     * Deux minutes, la même fenêtre que le volet Relances emploie pour décider
-     * s'il agit — c'est la durée au-delà de laquelle ce relevé cesse de valoir
-     * pour prendre une décision.
-     */
-    const ventesFraiches = state.sales.at && Date.now() - state.sales.at < VENTES_FRAICHES_MS;
-    const mesVentes = new Set(
-      ventesFraiches ? (state.sales.list || []).map((v) => v.card).filter(Boolean) : []
-    );
-    /*
-     * La couverture se dit ICI, à côté de l'âge de la cote, parce que c'est la
-     * question suivante : « de quand » ne vaut rien sans « sur quoi ».
-     * Formulée en cartes manquantes plutôt qu'en pourcentage seul — un « 17 % »
-     * ne dit pas s'il en manque cent ou dix mille.
-     */
-    const c = couvertureDistancee();
-    /*
-     * Deux nombres, pas trois. « N de vos N cartes (17 %) — N
-     * sans prix » disait trois fois la même chose : les deux premiers
-     * s'additionnent pour faire le troisième.
-     */
-    /*
-     * Un relevé de concurrence interrompu se dit. Le filtre « sans
-     * concurrence » repose entièrement dessus : le laisser passer pour complet
-     * ferait proposer comme exclusives des cartes qu'on n'a pas fini de lire.
-     */
-    const concGene = !sell.compAt || sell.compTronque;
-    /*
-     * Les mises en garde quittent la ligne des chiffres.
-     *
-     * Elles y étaient cousues aux relevés par des points médians — « 15 cartes
-     * · ~1 234 wb · cote il y a 41 min · relevé de la concurrence interrompu —
-     * “sans concurrence” n'est pas fiable ». Une phrase entière, en gris, en
-     * quatrième position d'une énumération de nombres : c'est l'endroit d'un
-     * écran où l'on regarde le moins. Elles prennent leur propre bande, en
-     * ambre, sous l'en-tête — et n'apparaissent que lorsqu'il y a lieu.
-     */
-    const alertes = [
-      c && `La cote couvre ${c.pct} % de vos cartes : ${c.manquantes.toLocaleString('fr-FR')} `
-        + 'sont sans prix et tombent en fin de tri.',
-      !sell.compAt && sell.compTronque
-        && 'Relevé de la concurrence interrompu — « sans concurrence » n’est pas fiable.',
-      !sell.compAt && !sell.compTronque
-        && 'Relevé de la concurrence en cours — « sans concurrence » ne filtre pas encore.',
-      sell.compAt && sell.compTronque
-        && 'Dernier relevé de la concurrence interrompu — le serveur a freiné.',
-      /*
-       * La note du serveur — « les prix sont réservés aux comptes PRO » — ne
-       * monte dans la bande QUE si le tableau a des lignes. Sans lignes, c'est
-       * elle que le corps affiche en grand, au centre : la mettre aussi dans
-       * la bande écrivait deux fois la même phrase, l'une sous l'autre, à
-       * trois lignes d'intervalle. Vu à l'écran sur le cas du compte gratuit,
-       * qui est précisément celui où elle est la plus longue.
-       */
-      rows.length ? sell.note : '',
-      /*
-       * Le relevé des ventes est en retard. On le DIT, parce que sans lui la
-       * colonne d'action ne sait plus distinguer une carte déjà en vente d'une
-       * carte libre — et qu'un tableau qui a cessé de savoir ne doit pas avoir
-       * l'air de savoir encore. Il se relit tout seul à l'ouverture ; cette
-       * phrase ne dure donc que le temps de l'aller-retour, ou signale que le
-       * serveur ne répond pas.
-       */
-      !ventesFraiches
-        && 'Vos ventes en cours ne sont pas encore relues : les cartes déjà '
-           + 'en vente ne sont pas signalées comme telles.',
-    ].filter(Boolean);
+    const { valeur, libres, ventesFraiches, mesVentes, couverture: c, alertes }
+      = resumeRevente(rows);
 
     /*
      * La case ne doit pas avoir l'air d'agir tant qu'elle n'agit pas : cochée
@@ -12472,16 +13409,7 @@
       (() => { let restants = libres || 0; return rows
         .map(
           (x) => {
-            const dejaEnVente = mesVentes.has(x.id);
-            /*
-             * Déjà dans la file. C'est `state.watch`, la même que celle du
-             * volet Relances — une seule machine, qui sait déjà attendre un
-             * emplacement, retrouver l'exemplaire, écarter une carte
-             * étiquetée. Le bouton n'ouvre qu'une porte de plus vers elle.
-             */
-            const enFile = !!(state.watch && state.watch[x.id]);
-            const listable = !dejaEnVente && !x.tags.length;
-            const aLister = listable && restants > 0;
+            const { protegee, dejaEnVente, enFile, aLister } = etatLigne(x, mesVentes, restants);
             if (aLister) restants -= 1;
             return `<tr class="${aLister ? 'next' : ''}">
             <td class="r"><i style="--c:${RARITY_COLOR[x.r] || '#949DAD'}">${x.r}</i></td>
@@ -12502,7 +13430,7 @@
             <td class="num med">${(x.q3 || x.med).toLocaleString('fr-FR')}</td>
             <td class="num">${x.med.toLocaleString('fr-FR')}</td>
             <td class="amp">${x.min.toLocaleString('fr-FR')} – ${x.max.toLocaleString('fr-FR')}</td>
-            <td>${x.tags.length
+            <td>${protegee
               ? `<span class="protege" title="Carte étiquetée : hors de portée de la revente. Retire l’étiquette sur le site pour pouvoir la vendre.">protégée</span>`
               : dejaEnVente
                 ? `<span class="encours" title="Votre enchère court déjà sur cette carte. Elle occupe un de vos emplacements de vente ; son échéance est dans l’onglet Marché, volet Ventes.">en vente</span>`
@@ -12563,10 +13491,33 @@
    * Il porte aussi le plancher de débit appris — le banc l'a rappelé en
    * perdant deux contrôles le jour où il est passé derrière le montage.
    */
-  restore();
-  installNotifProxy();
-  installNotifWsProxy();
-  installNotifDomFiltre();
+  /*
+   * Et chacun dans son filet.
+   *
+   * Ces quatre appels tournaient hors de tout `try`. `restore()` est très
+   * défensif, donc le risque était faible — mais si l'un d'eux lève un jour,
+   * le script meurt AVANT que `window.__wmAuto` n'existe : la personne perd le
+   * panneau ET la poignée de diagnostic, c'est-à-dire tout ce qui permettrait
+   * de dire pourquoi. C'est strictement pire que l'échec du montage, qui, lui,
+   * est instrumenté depuis longtemps.
+   *
+   * On journalise donc et on continue : des réglages par défaut valent mieux
+   * qu'un écran muet, et un filtre de notifications qui ne se pose pas ne coûte
+   * qu'un avis d'invendu affiché.
+   */
+  for (const [quoi, faire] of [
+    ['la relecture des réglages', restore],
+    ['le filtre des notifications', installNotifProxy],
+    ['le filtre du canal temps réel', installNotifWsProxy],
+    ['le filtre des avis à l’écran', installNotifDomFiltre],
+  ]) {
+    try {
+      faire();
+    } catch (err) {
+      console.error(`[WikiMasters Tools] ${quoi} a échoué au démarrage :`, err);
+      noterFait('démarrage', 'échec', `${quoi} : ${raison(err)}`);
+    }
+  }
 
   /*
    * Le montage, lui, attend le DOM : il n'existe pas encore à `document-start`.
@@ -12694,19 +13645,39 @@
    * s'arrête sur trois comparaisons.
    */
   const RELIST_TICK_MS = 1000;
+  /*
+   * Un tour qui échoue ne réessaie pas la seconde suivante : quatre échecs en
+   * quatre secondes prendraient un hoquet du serveur pour une panne installée.
+   * Quinze secondes entre deux essais, soit une minute avant que la note
+   * paraisse — le temps qu'un vrai hoquet passe, pas le temps d'un mardi.
+   */
+  const RELIST_RETRY_MS = 15000;
   let relistTickBusy = false;
 
   setInterval(async () => {
-    if (relistTickBusy || !prefs.relistUnsold) return;
+    if (relistTickBusy || !prefs.relistUnsold || enPanne('relances')) return;
     if (!Object.keys(state.watch).length) return;
     if (Date.now() < state.nextRelistAt) return;
     relistTickBusy = true;
     try {
       // reconcileWatch refuse d'agir sur un relevé de ventes périmé.
-      if (Date.now() - state.sales.at > 45000) await scanSales();
+      if (!ventesSuresPourAgir()) {
+        // Un autre tour le relève déjà : rien à juger, et surtout rien à
+        // compter — `scanSales` rendrait la main sans rien faire.
+        if (scanSales.busy) return;
+        await scanSales();
+      }
+      if (!ventesSuresPourAgir()) throw new Error('le relevé des ventes ne se rafraîchit plus');
       await reconcileWatch();
-    } catch (_) {
-      /* le tour suivant rattrapera */
+      noterSucces('relances');
+    } catch (err) {
+      /*
+       * Celle-ci d'abord, si un seul de ces filets devait exister : elle agit
+       * sur le compte, elle a été cochée à la main, et elle est la seule dont
+       * la panne se paie en cartes qui dorment hors du Marché.
+       */
+      state.nextRelistAt = Date.now() + RELIST_RETRY_MS;
+      noterEchec('relances', err);
     } finally {
       relistTickBusy = false;
     }
@@ -12873,11 +13844,83 @@
       .map(([n, v]) => `${n} ${oui(v)}`)
       .join(' · ');
 
-    /* Le nom du navigateur suffit : on cherche « Firefox ou Chrome », pas une empreinte. */
+    /*
+     * Le nom du navigateur suffit : on cherche « Firefox ou Chrome », pas une
+     * empreinte. Et il se lit sous garde — un diagnostic qui LÈVE est pire
+     * qu'un diagnostic incomplet : c'est le seul outil qui reste à quelqu'un
+     * dont le panneau ne monte pas, et il ne doit rien pouvoir lui refuser.
+     */
     const nav =
-      (navigator.userAgent.match(/(Firefox|Edg|OPR|Chrome|Safari)\/(\d+)/) || [])
+      ((((typeof navigator === 'object' && navigator && navigator.userAgent) || '')
+        .match(/(Firefox|Edg|OPR|Chrome|Safari)\/(\d+)/)) || [])
         .slice(1)
         .join(' ') || 'inconnu';
+
+    /*
+     * Le dernier succès de chaque sous-système.
+     *
+     * La plupart de ces horodatages existaient déjà — chaque relevé porte son
+     * `at` — mais ils n'étaient nulle part réunis : il fallait connaître le nom
+     * de la clé pour aller le lire, ce qui revient à ne pas les avoir. Réunis,
+     * ils répondent d'un coup d'œil à « lequel est en retard ? », qui est la
+     * question qu'on pose vraiment quand quelque chose ne marche plus.
+     *
+     * Aucun de ces chiffres n'identifie un compte : ce sont des dates, pas des
+     * quantités. C'est la règle qui a fait retirer d'ici la taille de la
+     * collection, le nombre de Légendaires et l'avancement des succès.
+     */
+    const succes = [
+      ['boucle', (state.sains.boucle || {}).ok],
+      ['marché', state.sales.at],
+      ['guilde', state.guild.at],
+      ['souhaits', state.wishHits.at],
+      ['revente', sell.at],
+    ]
+      .map(([n, at]) => `${n} ${at ? fmtAge(at) : 'jamais'}`)
+      .join(' · ');
+
+    /*
+     * Le verrou. Un panneau qui dit « Déjà actif dans un autre onglet » sans
+     * dire depuis quand, ni si c'est lui-même, envoie chercher un onglet
+     * fantôme — le cas classique étant l'onglet tué brutalement dont le verrou
+     * traîne jusqu'à expiration.
+     */
+    const tenu = lockHolder();
+    const verrou = !tenu
+      ? 'libre'
+      : tenu === instanceId
+        ? 'tenu par cet onglet'
+        : `tenu par un autre onglet (il expire dans ${Math.max(0, Math.round(LOCK_TTL / 1000))} s au plus)`;
+
+    // Les sélecteurs du site qui ont cessé de trouver quoi que ce soit.
+    const perdus = Object.entries(state.selecteurs)
+      .filter(([, s]) => s.perdu)
+      .map(([n, s]) => `${n} — ${s.manques} passages à vide depuis ${fmtSpan(Date.now() - s.depuis)}`);
+
+    /*
+     * Et la trajectoire. Un instantané dit où on est ; c'est cet anneau qui dit
+     * comment on y est arrivé. Sans lui, un message collé sur le Discord décrit
+     * un présent dont personne ne peut rien tirer — « ça ne marche pas » avec
+     * plus de détails. Les faits sont datés en RELATIF : « il y a 4 min » se
+     * lit sans connaître le fuseau de celui qui colle, et ne le dit pas non
+     * plus.
+     */
+    /*
+     * `fmtSpan` compte en minutes : sur un anneau où quatre échecs tiennent en
+     * quarante secondes, il écrivait « il y a 0 min » quatre fois de suite —
+     * c'est-à-dire précisément l'inverse de ce qu'on lui demande. En dessous
+     * d'une minute, on compte donc en secondes.
+     */
+    const ilYA = (at) => {
+      const ms = Math.max(0, Date.now() - at);
+      return ms < 60000 ? `${Math.round(ms / 1000)} s` : fmtSpan(ms);
+    };
+    const faits = state.faits.length
+      ? ['Journal des sous-systèmes (le plus récent en dernier) :'].concat(
+        state.faits.map((f) => `  il y a ${ilYA(f.at).padStart(7)} · ${f.nom} ${f.verdict}`
+          + (f.detail ? ` — ${f.detail}` : ''))
+      )
+      : [];
 
     return [
       `WikiMasters Tools ${VERSION}`
@@ -12887,11 +13930,23 @@
       `Boucle : ${state.running ? 'en marche' : 'arrêtée'}`
         + (state.message ? ` — ${state.message}` : ''),
       `Session : ${state.packs} paquet(s), ${state.cards} carte(s)`,
+      /*
+       * La cadence apprise, qui explique à elle seule la plupart des « c'est
+       * lent chez moi » : un plancher monté à 30 s après une série de refus se
+       * lit ici, et nulle part ailleurs.
+       */
+      `Cadence : ${state.delayMs} ms`
+        + (state.probeFloorMs ? `, plancher appris ${state.probeFloorMs} ms` : ', aucun plancher appris')
+        + ` · ${state.throttles} refus 429 depuis le départ`,
+      `Verrou : ${verrou}`,
+      `Derniers succès : ${succes}`,
+      perdus.length ? `Sélecteurs perdus : ${perdus.join(' ; ')}` : null,
       `Réglages : ${opts}`,
       state.dbNote ? `Base : ${state.dbNote}` : null,
       state.bonusNote ? `Bonus : ${state.bonusNote}` : null,
     ]
       .filter(Boolean)
+      .concat(faits)
       .join('\n');
   }
 
@@ -12915,5 +13970,24 @@
     notifTrames,
     // Le filet du DOM, atteignable pour l’éprouver : `__wmAuto.appliquerMasquage()`.
     appliquerMasquage, masquerLignesInvendues, rendreLignesInvendues,
+    /*
+     * Les deux calculs de la Revente, sortis du gabarit et donc éprouvables :
+     * ce qu'une ligne propose (« Vendre », « en file », « en vente »,
+     * « protégée ») et le résumé de l'en-tête avec ses mises en garde.
+     */
+    etatLigne, resumeRevente,
+    /*
+     * Le filet des tours secondaires, atteignable lui aussi. Éprouver qu'une
+     * boucle abandonne au bout de quatre échecs demanderait sinon d'attendre
+     * quatre vraies pannes du serveur — c'est-à-dire de ne jamais l'éprouver.
+     * `noterEchec('relances', new Error('essai'))` quatre fois pose la note.
+     */
+    noterEchec, noterSucces, enPanne,
+    /*
+     * Le relevé que le bouton des Réglages met dans le presse-papiers, sans
+     * passer par le presse-papiers : `__wmAuto.diagnostic()` l'écrit en clair
+     * pour qui a la console ouverte, et le banc le lit sans DOM.
+     */
+    diagnostic: construireDiagnostic,
   };
 })();
