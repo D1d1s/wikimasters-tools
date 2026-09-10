@@ -93,6 +93,14 @@ panneau. Un clic dessus l'installe tout de suite.
 | Toujours pas de panneau | Reprenez l'étape 2. C'est presque toujours l'étape 2. |
 | « réservé aux comptes PRO » sur les prix | Réglages → **Accès direct à la base**. Coché par défaut. |
 | Le script s'arrête et parle d'une vérification | Faites-la à la main dans l'onglet. Il repart seul. |
+| Une partie du panneau s'est arrêtée | La note dit laquelle et depuis quand. Le bouton **Réessayer** la relance sans recharger. |
+| On vous demande un diagnostic, et le panneau ne s'affiche pas | `F12`, onglet **Console**, tapez `copy(__wmAuto.diagnostic())` puis `Entrée`. Le relevé est dans votre presse-papiers. |
+
+Quand le panneau est là, le même relevé s'obtient sans console : **Réglages →
+Copier le diagnostic**. Il dit la version, la page, l'état de la boucle, la
+cadence apprise, la date du dernier succès de chaque partie, et les dernières
+pannes horodatées. Il ne dit ni la taille de votre collection, ni vos
+Légendaires, ni vos succès : vous pouvez le coller dans un salon public.
 
 Le reste se demande sur le **[Discord](https://discord.gg/m5NHPSSk6B)** : c'est
 le seul endroit. Vous y trouverez aussi les nouvelles versions et le guide du
