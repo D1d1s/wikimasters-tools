@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WikiMasters Tools
 // @namespace    https://www.wiki-masters.com/
-// @version      3.6.3
+// @version      3.6.4
 // @description  Boîte à outils WikiMasters : ouverture automatique des paquets, suivi des tirages, cote des cartes et revente.
 // @match        https://www.wiki-masters.com/*
 // @match        https://wiki-masters.com/*
@@ -41,7 +41,7 @@
    *
    * Il est lu par le garde juste en dessous, d'où sa place en tête.
    */
-  const VERSION = '3.6.3';
+  const VERSION = '3.6.4';
 
   /*
    * Une seule instance par page — et savoir laquelle
@@ -2959,9 +2959,8 @@
    * Ce que la guilde marque, et où il reste du gras.
    *
    * Formule du score hebdomadaire, vérifiée au point près sur les totaux du
-   * serveur : `total = 500 × combats + wikibidous_encaissés + karma`.
-   * Mesuré le 4 septembre 2026 : 500 × combats + wikibidous + karma,
-   * exactement le `total_score` annoncé.
+   * serveur : `total = 500 × combats + wikibidous_encaissés + karma`. Les trois
+   * termes recomposent le `total_score` annoncé, à l'unité.
    *
    * Ce que ça dit : le karma pèse 2 % du score, alors que le plafond
    * théorique — une réception par membre et par jour — vaut plusieurs fois le
@@ -8763,8 +8762,8 @@
   /*
    * Les textes qui viennent du site n'ont pas nos séparateurs : il écrit
    * « Posséder 100000 cartes ». Posé trois lignes sous un palier que le
-   * panneau écrit « N », c'est la même quantité écrite de deux façons
-   * dans le même bloc — et c'est ce qu'on voyait dans l'onglet Paquets.
+   * panneau écrit avec ses séparateurs, c'est la même quantité écrite de deux
+   * façons dans le même bloc — et c'est ce qu'on voyait dans l'onglet Paquets.
    */
   const chiffresFr = (s) =>
     String(s == null ? '' : s).replace(/\d{4,}/g, (n) => Number(n).toLocaleString('fr-FR'));
@@ -12346,8 +12345,8 @@
    * on puisse se fier (2,33 à 35 ventes et plus). Ce qui dépasse est coupé.
    *
    * Ce que ça ne fait pas : baisser les prix en général. Le rapport médian
-   * étant de 1,8, l'immense majorité des lignes ne bouge pas — N cartes sur
-   * N dépassaient 3×.
+   * étant de 1,8, l'immense majorité des lignes ne bouge pas — moins d'une
+   * carte cotée sur cinq dépassait 3×.
    */
   const Q3_PLAFOND = 3;
 
