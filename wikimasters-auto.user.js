@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WikiMasters Tools
 // @namespace    https://www.wiki-masters.com/
-// @version      3.6.1
+// @version      3.6.2
 // @description  Boîte à outils WikiMasters : ouverture automatique des paquets, suivi des tirages, cote des cartes et revente.
 // @match        https://www.wiki-masters.com/*
 // @match        https://wiki-masters.com/*
@@ -41,7 +41,7 @@
    *
    * Il est lu par le garde juste en dessous, d'où sa place en tête.
    */
-  const VERSION = '3.6.1';
+  const VERSION = '3.6.2';
 
   /*
    * Une seule instance par page — et savoir laquelle
@@ -3068,7 +3068,7 @@
   /*
    * Ce que tu peux réellement offrir, lu dans ta collection.
    *
-   * Mesuré : N cartes distinctes pour N doublons seulement — à l'échelle
+   * Mesuré : une poignée de doublons pour une collection entière — à l'échelle
    * de ce catalogue (2,77 M de cartes), le surplus n'existe pas. Donner puise
    * donc dans la collection elle-même, et le jeu l'autorise : les sept souhaits
    * servables du jour portaient tous sur des exemplaires uniques.
@@ -10341,7 +10341,7 @@
    * requête de plus, et la protection est aussi fraîche que l'index lui-même.
    */
   const owned = { map: new Map(), tagged: new Set(), copies: new Map(), at: 0, tried: 0,
-                  tronque: false };
+                  tronque: false, repetitions: 0 };
 
   /*
    * Une carte étiquetée ne se vend pas. L'étiquette est posée sur l'exemplaire,
@@ -10374,6 +10374,22 @@
      * donc savoir compter, pas seulement reconnaître.
      */
     const combien = new Map();
+    /*
+     * ON COMPTE DES EXEMPLAIRES, PAS DES LIGNES REÇUES.
+     *
+     * La pagination du site n'est pas stable : mesuré en lecture seule sur un
+     * balayage de cent vingt pages, une ligne est revenue deux fois — donc une
+     * autre a été sautée. C'est rare et ça ne se reproduit pas à volonté, mais
+     * compter les lignes reviendrait à croire qu'on possède deux exemplaires
+     * d'une carte qu'on n'a qu'une fois.
+     *
+     * Ce n'est pas une inexactitude d'affichage : c'est exactement la
+     * condition qui autorise « Vendre un double » à publier. Un double
+     * imaginaire ferait vendre le dernier exemplaire d'une carte gardée.
+     * L'identifiant d'exemplaire tranche, lui, et le serveur le donne.
+     */
+    const exemplairesVus = new Set();
+    let repetitions = 0;
     // Les cartes dont on a vu au moins un exemplaire LIBRE : voir la boucle.
     const libres = new Set();
     let complet = true;
@@ -10396,6 +10412,10 @@
         const col = d.collection || [];
         for (const c of col) {
           if (!c.card_id) continue;
+          if (c.id) {
+            if (exemplairesVus.has(c.id)) { repetitions += 1; continue; }
+            exemplairesVus.add(c.id);
+          }
           combien.set(c.card_id, (combien.get(c.card_id) || 0) + 1);
           /*
            * UN EXEMPLAIRE VENDABLE, pas le dernier venu.
@@ -10452,6 +10472,17 @@
      * conclure de son absence ici.
      */
     owned.tronque = !fini;
+    /*
+     * Une ligne revue, c'est une ligne sautée ailleurs : le balayage n'a pas vu
+     * toute la collection, même s'il est allé au bout. On le retient pour le
+     * diagnostic — et `reconcileWatch` ne conclut de toute façon jamais d'une
+     * absence sans avoir demandé la carte par son titre.
+     */
+    owned.repetitions = repetitions;
+    if (repetitions) {
+      noterFait('relances', 'note',
+        `la collection a rendu ${repetitions} ligne(s) en double : autant de sautées`);
+    }
 
     if (complet && m.size) {
       owned.map = m;
@@ -11786,6 +11817,16 @@
   function cartesDistinctes(cards) {
     const out = [];
     const vus = new Map();
+    /*
+     * Ici on ne se garde PAS de la pagination qui rend deux fois la même
+     * ligne : `fetchCollectionRaw` l'écarte déjà à la lecture, sur
+     * l'identifiant d'exemplaire, et compte ce qu'elle a écarté dans
+     * `sell.doublons`. Un second filtre serait un code que rien ne peut faire
+     * échouer — et une seconde vérité sur le même fait.
+     *
+     * L'index de la revente, lui, lit la collection par un autre chemin et se
+     * garde tout seul : voir `exemplairesVus` dans `ownedIndex`.
+     */
     for (const c of cards) {
       if (!c.id) continue;
       const vu = vus.get(c.id);
@@ -14167,6 +14208,20 @@
       `Verrou : ${verrou}`,
       `Derniers succès : ${succes}`,
       perdus.length ? `Sélecteurs perdus : ${perdus.join(' ; ')}` : null,
+      /*
+       * L'état de la lecture de la collection, sans jamais dire sa taille.
+       *
+       * Deux choses seulement, et ce sont des faits sur le SERVEUR, pas sur le
+       * compte : le balayage est-il allé au bout, et la pagination a-t-elle
+       * rendu deux fois la même ligne. Elles expliquent à elles deux la
+       * question « pourquoi cette carte n'est-elle jamais retrouvée ».
+       */
+      owned.at && (owned.tronque || owned.repetitions)
+        ? 'Lecture de la collection : '
+          + [owned.tronque ? 'bornée avant la fin' : null,
+            owned.repetitions ? 'la pagination a rendu des lignes en double' : null]
+            .filter(Boolean).join(' · ')
+        : null,
       `Réglages : ${opts}`,
       state.dbNote ? `Base : ${state.dbNote}` : null,
       state.bonusNote ? `Bonus : ${state.bonusNote}` : null,
