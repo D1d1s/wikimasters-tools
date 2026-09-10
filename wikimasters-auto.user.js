@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WikiMasters Tools
 // @namespace    https://www.wiki-masters.com/
-// @version      3.6.2
+// @version      3.6.3
 // @description  Boîte à outils WikiMasters : ouverture automatique des paquets, suivi des tirages, cote des cartes et revente.
 // @match        https://www.wiki-masters.com/*
 // @match        https://wiki-masters.com/*
@@ -41,7 +41,7 @@
    *
    * Il est lu par le garde juste en dessous, d'où sa place en tête.
    */
-  const VERSION = '3.6.2';
+  const VERSION = '3.6.3';
 
   /*
    * Une seule instance par page — et savoir laquelle
@@ -1277,11 +1277,11 @@
   // --------------------------------------------- trier la collection par valeur
 
   /*
-   * La collection est paginée CÔTÉ SERVEUR : 50 cartes par page, N pages pour
-   * N cartes, et `/api/my-collection` ne connaît qu'un tri — `sort=rarity`.
-   * Réordonner les nœuds affichés ne trierait donc que les 50 cartes sous les
-   * yeux : sur N pages, ça ne répond pas à la question posée, « lesquelles de
-   * mes cartes valent quelque chose ».
+   * La collection est paginée CÔTÉ SERVEUR : 50 cartes par page, et
+   * `/api/my-collection` ne connaît qu'un tri — `sort=rarity`. Réordonner les
+   * nœuds affichés ne trierait donc que les 50 cartes sous les yeux : sur une
+   * collection qui tient en centaines de pages, ça ne répond pas à la question
+   * posée, « lesquelles de mes cartes valent quelque chose ».
    *
    * On trie donc la collection ENTIÈRE et on laisse le site l'afficher : la
    * réponse de `/api/my-collection` est interceptée, et son tableau `collection`
@@ -1417,9 +1417,9 @@
    *
    * Les étiquettes voyagent avec chaque entrée de `/api/my-collection` — `tags`,
    * un tableau d'objets `{id, name, …}` — donc le classement les porte déjà et
-   * les reproduire ne coûte aucune requête. Mesuré sur ce compte : N cartes
-   * en tout, N sans étiquette, soit exactement les N exemplaires
-   * étiquetés — le prédicat local et `untagged=1` désignent le même ensemble.
+   * les reproduire ne coûte aucune requête. Vérifié sur une collection
+   * entière : le prédicat local et `untagged=1` désignent exactement le même
+   * ensemble, à un exemplaire près aucun écart.
    *
    * Un paramètre inconnu rend la main au site plutôt que d'afficher les mauvaises
    * cartes : un filtre ajouté demain éteindra le tri sur cette vue-là, il ne
@@ -2400,7 +2400,8 @@
    * On la déduit alors de la vitesse totale, pondérée par la part que cette
    * rareté occupe **dans la collection entière** — des milliers de tirages,
    * bien plus solide que ce qu'une fenêtre courte peut voir. Le taux observé
-   * sur des milliers de cartes est stable ; c'est la meilleure estimation disponible.
+   * sur des milliers de cartes est stable ; c'est la meilleure estimation
+   * disponible.
    */
   function goalPerHour(of) {
     const direct = perHourOf(of);
@@ -8707,7 +8708,7 @@
      *
      * Les deux blocs tiraient de la même liste par deux chemins : `GOALS`,
      * écrit en dur, et le relevé de la page Succès. On lisait donc, à trois
-     * lignes d'intervalle, « +3 000 Va donc jouer dehors — N cartes »
+     * lignes d'intervalle, « +3 000 Va donc jouer dehors — <votre compte> »
      * puis « Mieux payé encore verrouillé : +3 000 Va donc jouer dehors ». Le
      * bloc des paliers gagne : il a l'échéance, que le relevé n'a pas. Celui-ci
      * ne garde que ce que l'autre ne montre pas — un succès de bataille, par
@@ -8761,9 +8762,9 @@
 
   /*
    * Les textes qui viennent du site n'ont pas nos séparateurs : il écrit
-   * « Posséder 100000 cartes ». Posé trois lignes sous « N / 30 000 »,
-   * c'est la même quantité écrite de deux façons dans le même bloc — et c'est
-   * ce qu'on voyait dans l'onglet Paquets.
+   * « Posséder 100000 cartes ». Posé trois lignes sous un palier que le
+   * panneau écrit « N », c'est la même quantité écrite de deux façons
+   * dans le même bloc — et c'est ce qu'on voyait dans l'onglet Paquets.
    */
   const chiffresFr = (s) =>
     String(s == null ? '' : s).replace(/\d{4,}/g, (n) => Number(n).toLocaleString('fr-FR'));
@@ -11541,7 +11542,7 @@
                   * « sur quelle part de la collection ». Or la cote se remplit
                   * cinq cartes par paquet ouvert : entre deux relevés complets
                   * elle décroche à mesure que la collection grossit, et rien ne
-                  * le disait. Mesuré sur le compte réel : 17 % de N lignes,
+                  * le disait. Mesuré sur un compte réel : 17 % des lignes,
                   * soit quatre cartes sur cinq sans prix — un tri « par prix »
                   * qui range l'essentiel de la collection en fin de liste, sans
                   * que personne puisse le savoir.
@@ -11588,8 +11589,9 @@
          * Le cache porte aussi des LIGNES EN DOUBLE : le relevé posait une
          * ligne par exemplaire possédé, et un exemplaire en double donnait deux
          * lignes identiques, indiscernables, chacune avec son bouton « Vendre ».
-         * Relevé sur un compte réel : N lignes pour N cartes. Le compte
-         * de tête annonçait donc des lignes en disant « cartes ».
+         * Vu sur un compte réel : quelques dizaines de lignes de plus que de
+         * cartes. Le compte de tête annonçait donc des lignes en disant
+         * « cartes ».
          *
          * Réparé ici plutôt qu'au prochain relevé complet, qui dure deux
          * minutes et que personne ne relance pour un correctif qu'il ignore —
@@ -12183,9 +12185,9 @@
    * Le relevé de la concurrence a-t-il eu lieu ? `sell.comp` vide se lisait
    * comme « personne ne vend rien », et le filtre « sans concurrence » laissait
    * alors passer TOUT le catalogue en le présentant comme exclusif. Mesuré au
-   * chronomètre sur un compte réel : N cartes annoncées sans concurrence
-   * pendant le relevé, N une fois celui-ci terminé — N cartes présentées
-   * comme uniques ne l'étaient pas. L'absence de donnée n'est pas une donnée.
+   * chronomètre sur un compte réel : une carte sur dix annoncées « sans
+   * concurrence » pendant le relevé ne l'était plus une fois celui-ci terminé.
+   * L'absence de donnée n'est pas une donnée.
    */
   const concurrenceConnue = () => !!sell.compAt;
 
@@ -12323,8 +12325,8 @@
    * **5 000**. Personne ne l'achète, et le taux de ventes conclues est passé de
    * 16 à 11 sur 100 pendant que ces prix-là dormaient en tête de tableau.
    *
-   * Mesuré sur N cartes cotées d'un compte réel, rapport q3/médiane par
-   * taille d'échantillon :
+   * Mesuré sur un millier de cartes cotées, rapport q3/médiane par taille
+   * d'échantillon :
    *
    *   ventes   cartes   médian   p90    max
    *    5–7      326      1,47    3,70   30,0
@@ -13440,9 +13442,9 @@
      */
     const c = couvertureDistancee();
     /*
-     * Deux nombres, pas trois. « N de vos N cartes (17 %) — N
-     * sans prix » disait trois fois la même chose : les deux premiers
-     * s'additionnent pour faire le troisième.
+     * Deux nombres, pas trois. « X de vos Y cartes (17 %) — Z sans prix »
+     * disait trois fois la même chose : les deux premiers s'additionnent pour
+     * faire le troisième.
      */
     /*
      * Les mises en garde quittent la ligne des chiffres.
@@ -13544,7 +13546,7 @@
       /*
        * Une jauge, parce que le relevé dure deux minutes.
        *
-       * « N / N » est exact et ne se lit pas d'un coup d'œil : il
+       * « lues / totales » est exact et ne se lit pas d'un coup d'œil : il
        * faut diviser pour savoir si l'on est au tiers ou aux trois quarts.
        * Trois pixels de haut le disent sans un chiffre, et c'est déjà
        * l'idiome du panneau pour la régénération des paquets — même hauteur,
@@ -13567,8 +13569,9 @@
 
     /*
      * La case ne doit pas avoir l'air d'agir tant qu'elle n'agit pas : cochée
-     * pendant le relevé, elle affirmait N cartes exclusives dont 159 ne
-     * l'étaient pas. On la neutralise le temps que la concurrence soit connue.
+     * pendant le relevé, elle affirmait « exclusives » une carte sur dix qui
+     * ne l'était pas. On la neutralise le temps que la concurrence soit
+     * connue.
      */
     /*
      * Le bouton porte le remède : c'est lui qui doit changer d'air, pas
@@ -13592,7 +13595,7 @@
       : 'En attente du relevé de la concurrence : le filtre ne peut pas encore savoir qui vend quoi.';
 
     // Les deux nombres de la même ligne s'écrivaient dans deux formats : « 1234
-    // cartes · ~56 789 wb ».
+    // cartes · ~56 789 wb » — l'un sans séparateur, l'autre avec.
     const fig = (v, l, due) =>
       `<div class="f${due ? ' due' : ''}"><b>${esc(v)}</b><span>${esc(l)}</span></div>`;
     paint(sellUI.sum,
