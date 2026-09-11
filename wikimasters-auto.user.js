@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WikiMasters Tools
 // @namespace    https://www.wiki-masters.com/
-// @version      3.6.4
+// @version      3.6.6
 // @description  Boîte à outils WikiMasters : ouverture automatique des paquets, suivi des tirages, cote des cartes et revente.
 // @match        https://www.wiki-masters.com/*
 // @match        https://wiki-masters.com/*
@@ -41,7 +41,7 @@
    *
    * Il est lu par le garde juste en dessous, d'où sa place en tête.
    */
-  const VERSION = '3.6.4';
+  const VERSION = '3.6.6';
 
   /*
    * Une seule instance par page — et savoir laquelle
@@ -11535,6 +11535,13 @@
                  checked: new Set(), themes: {}, comp: new Map(), compAt: 0, compTronque: false,
                  prunedAt: 0,   // dernière vérification de ce qui est encore possédé
                  /*
+                  * Ce que la dernière lecture COMPLÈTE de la collection a vu :
+                  * les cartes possédées, et l'instant où la lecture a commencé.
+                  * En mémoire seulement — un rechargement relit la collection à
+                  * la première ouverture. Voir `tiragesACoter`.
+                  */
+                 possedees: null,
+                 /*
                   * De quoi dire si la cote est DISTANCÉE.
                   *
                   * `sell.at` répond « de quand date la dernière cote », jamais
@@ -11845,24 +11852,26 @@
     return out;
   }
 
+  /** Un exemplaire de la collection, réduit à ce dont la cote a besoin. */
+  const ligneCollection = (e) => ({
+    id: e.card_id,
+    t: e.card?.wikipedia_title || '',
+    r: e.card?.rarity || '?',
+    cat: e.card?.category || '',
+    vues: e.card?.pageviews || 0,
+    tags: (e.tags || []).map((x) => (typeof x === 'string' ? x : x.name)).filter(Boolean),
+    /*
+     * L'étoile appartient à l'EXEMPLAIRE, comme les étiquettes. Le tableau ne
+     * la lisait pas : une carte mise en favori s'y affichait « libre », avec
+     * son bouton « Vendre », et la file la refusait ensuite en silence. Deux
+     * avis contraires sur le même fait, et le faux était celui qu'on voyait.
+     */
+    starred: !!e.starred,
+  });
+
   /** La même collection, réduite à ce dont la cote a besoin. */
   async function fetchCollection(onProgress) {
-    const brut = await fetchCollectionRaw(onProgress);
-    return brut.map((e) => ({
-      id: e.card_id,
-      t: e.card?.wikipedia_title || '',
-      r: e.card?.rarity || '?',
-      cat: e.card?.category || '',
-      vues: e.card?.pageviews || 0,
-      tags: (e.tags || []).map((x) => (typeof x === 'string' ? x : x.name)).filter(Boolean),
-      /*
-       * L'étoile appartient à l'EXEMPLAIRE, comme les étiquettes. Le tableau ne
-       * la lisait pas : une carte mise en favori s'y affichait « libre », avec
-       * son bouton « Vendre », et la file la refusait ensuite en silence. Deux
-       * avis contraires sur le même fait, et le faux était celui qu'on voyait.
-       */
-      starred: !!e.starred,
-    }));
+    return (await fetchCollectionRaw(onProgress)).map(ligneCollection);
   }
 
   /*
@@ -11895,6 +11904,7 @@
     sell.note = '';
     sell.refusVentes = 0;
     sell.refusVentesN = 0;
+    const debut = Date.now();
     let cards = [];
     try {
       cards = await fetchCollection((n) => {
@@ -11925,6 +11935,10 @@
       renderSell();
       return;
     }
+
+    // Ce que vous possédez, pour `tiragesACoter`. Une lecture tronquée n'en
+    // dit rien de sûr : elle ne remplace pas la précédente.
+    if (!sell.tronque) sell.possedees = { ids: new Set(cards.map((c) => c.id)), at: debut };
 
     /*
      * Un exemplaire par ligne, c'est la collection. Une carte par ligne, c'est
@@ -12505,9 +12519,61 @@
    */
   const PRUNE_TTL = 600000;
 
+  /*
+   * La recherche par titre du site, telle qu'elle se comporte vraiment —
+   * relevé en lecture seule sur le vrai site :
+   *
+   * - sous trois caractères elle ne rend RIEN, carte possédée ou non : « M »
+   *   ou « 90 » reviennent vides. Une absence n'y prouve donc rien ;
+   * - elle rend cinquante lignes par page, sans total. Un titre court a des
+   *   homonymes par dizaines, et une page pleine ne dit pas s'il y en a
+   *   d'autres derrière ;
+   * - la ponctuation, les accents et les parenthèses passent.
+   *
+   * `VERIF_MAX` borne le coût d'un nettoyage : on en a mesuré quelques
+   * dizaines d'absentes par lecture, pas des centaines. Au-delà, les cartes
+   * restent au tableau jusqu'au nettoyage suivant plutôt que d'être tranchées
+   * sans avoir été cherchées.
+   */
+  const Q_MIN = 3;
+  const Q_PAGES_MAX = 4;
+  const VERIF_MAX = 60;
+  const cherchable = (titre) => [...(titre || '')].length >= Q_MIN;
+
+  /**
+   * Les exemplaires d'une carte, demandés au serveur par son titre.
+   *
+   * Le filtre est une correspondance PARTIELLE : il rend aussi les homonymes
+   * plus longs. On ne garde donc que les lignes de CETTE carte, par son
+   * identifiant — la leçon du scénario 35.
+   *
+   * @returns {Promise<object[]|null>} ses exemplaires — vide : elle n'est plus
+   *   dans la collection —, ou `null` quand la réponse ne permet pas de conclure
+   *   (réseau, refus, homonymes au-delà des pages lues).
+   */
+  async function exemplairesParTitre(id, titre) {
+    const copies = new Map();
+    for (let page = 0; page < Q_PAGES_MAX; page++) {
+      let d;
+      try {
+        d = await api(`/api/my-collection?page=${page}&q=${encodeURIComponent(titre)}`);
+      } catch (_) {
+        return null;
+      }
+      const lignes = d.status === 200 && d.data && Array.isArray(d.data.collection)
+        ? d.data.collection : null;
+      if (!lignes) return null;
+      for (const e of lignes) if (e.card_id === id && e.id != null) copies.set(e.id, e);
+      if (lignes.length < COLLECTION_PAGE) return [...copies.values()].map(ligneCollection);
+    }
+    // Des homonymes à perte de vue : ce qu'on a trouvé est sûr, l'absence non.
+    return copies.size ? [...copies.values()].map(ligneCollection) : null;
+  }
+
   async function pruneSold() {
     if (sell.scanning || !sell.rows.length) return;
     if (Date.now() - sell.prunedAt < PRUNE_TTL) return;
+    const debut = Date.now();
     let cards;
     try {
       cards = await fetchCollection();
@@ -12518,15 +12584,95 @@
     // serveur n'a pas rendue reviendrait à effacer sa cote pour une coupure.
     if (!cards.length || sell.tronque) return;
     sell.prunedAt = Date.now();
-    const owned = new Set(cards.map((c) => c.id));
-    const before = sell.rows.length;
-    sell.rows = sell.rows.filter((r) => owned.has(r.id));
-    // Les étiquettes ont pu bouger aussi : on les reprend au passage.
-    const tagsById = new Map(cards.map((c) => [c.id, c.tags]));
-    for (const r of sell.rows) r.tags = tagsById.get(r.id) || r.tags;
+
+    /*
+     * UNE CARTE QUE LA LECTURE N'A PAS VUE N'EST PAS UNE CARTE VENDUE.
+     *
+     * La pagination du site saute des lignes, et pas rarement : relevé en
+     * lecture seule sur un vrai compte, boucle en marche dans un autre onglet,
+     * trois lectures de suite ont chacune manqué plusieurs cartes possédées —
+     * jamais les mêmes. Le nettoyage les retirait toutes, à chaque ouverture :
+     * la Revente perdait des cartes que vous aviez, jusqu'au relevé complet.
+     *
+     * On demande donc au serveur, par le titre, chaque carte absente de la
+     * lecture — la règle que `reconcileWatch` suit déjà. Retrouvée : elle reste,
+     * recomptée sur ses vrais exemplaires. Introuvable sur une réponse qui
+     * permet de conclure : elle part. Sinon on la laisse telle qu'elle était.
+     */
+    const lues = new Set(cards.map((c) => c.id));
+    const douteuses = new Set();
+    let demandes = 0;
+    for (const r of sell.rows) {
+      if (lues.has(r.id)) continue;
+      let copies = null;
+      if (cherchable(r.t) && demandes < VERIF_MAX) {
+        demandes += 1;
+        copies = await exemplairesParTitre(r.id, r.t);
+      }
+      if (copies) cards.push(...copies);
+      else douteuses.add(r.id);
+    }
+    // Un relevé complet a fini pendant ces vérifications : ses lignes sont plus
+    // fraîches que notre lecture, on ne les touche pas.
+    if (sell.scanning || sell.scanAt >= debut) return;
+
+    /*
+     * Les EXEMPLAIRES se recomptent ici, pas seulement les étiquettes.
+     *
+     * Vendre un double laisse la carte au tableau — il vous en reste une, et sa
+     * cote reste juste. Mais la ligne gardait le compte d'avant la vente : un
+     * exemplaire libre, alors qu'il ne restait que la copie gardée. Elle
+     * proposait donc « Vendre » sur une carte vendue pour de bon, jusqu'au
+     * relevé complet suivant — signalé à l'usage.
+     *
+     * Et les étiquettes se lisaient sur UN exemplaire, le dernier rencontré :
+     * la faute que `cartesDistinctes` a réparée pour le relevé complet. On
+     * passe par elle — un seul décompte pour les deux chemins.
+     */
+    const parCarte = new Map(cartesDistinctes(cards).map((c) => [c.id, c]));
+    sell.possedees = { ids: new Set(parCarte.keys()), at: debut };
+    sell.rows = sell.rows.filter((r) => parCarte.has(r.id) || douteuses.has(r.id));
+    for (const r of sell.rows) {
+      const c = parCarte.get(r.id);
+      if (!c) continue;   // douteuse : laissée telle qu'elle était
+      r.tags = c.tags;
+      r.exemplaires = c.exemplaires;
+      r.libres = c.libres;
+    }
     sell.tags = [...new Set(cards.flatMap((c) => c.tags))];
-    if (sell.rows.length !== before) saveCote();
+    saveCote();
     renderSell();
+  }
+
+  /*
+   * Les tirages de l'historique à coter à l'ouverture — ceux que vous avez
+   * ENCORE.
+   *
+   * Ce rattrapage cote les cartes des paquets qui auraient échappé à la cote,
+   * sans relire toute la collection. Il ne demandait pas si elles étaient
+   * toujours là. `priceCards` écarte ce qu'elle a déjà vu, mais « déjà vu » se
+   * reconstruit à chaque rechargement depuis les lignes du tableau — dont
+   * `pruneSold` venait justement de retirer la carte vendue. Elle redevenait
+   * inconnue, se faisait recoter, et revenait au tableau avec son bouton
+   * « Vendre » jusqu'au nettoyage suivant, puis encore au rechargement d'après.
+   * D'où une panne « pas tout le temps ».
+   *
+   * La dernière lecture complète de la collection tranche : une carte tirée
+   * AVANT elle, et qu'elle n'a pas vue, n'est plus à vous. Une carte tirée
+   * APRÈS n'a pas pu y figurer — c'est celle qu'on veut coter. Sans lecture du
+   * tout, rien : les cartes neuves se cotent déjà à l'ouverture de leur paquet,
+   * et on ne propose pas à la vente ce qu'on n'a pas su compter.
+   */
+  function tiragesACoter() {
+    const p = sell.possedees;
+    if (!p) return [];
+    const vus = new Map();
+    for (const c of state.history) {
+      if (!c.id || vus.has(c.id)) continue;
+      if (!p.ids.has(c.id) && !(Date.parse(c.at) >= p.at)) continue;
+      vus.set(c.id, { id: c.id, t: c.title, r: c.rarity, tags: [] });
+    }
+    return [...vus.values()];
   }
 
   async function refreshCompetition() {
@@ -12687,9 +12833,7 @@
      * message. Le bouton « Rafraîchir la cote » reste là si l'abonnement change.
      */
     if (!sell.rows.length && !sell.scanning && sell.refusVentes !== 403) scanCote();
-    else pruneSold().then(() =>
-      priceCards(state.history.map((c) => ({ id: c.id, t: c.title, r: c.rarity, tags: [] })))
-    );
+    else pruneSold().then(() => priceCards(tiragesACoter()));
     renderSell();
   }
 
