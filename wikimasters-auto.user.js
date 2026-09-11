@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WikiMasters Tools
 // @namespace    https://www.wiki-masters.com/
-// @version      3.6.6
+// @version      3.7.0
 // @description  Boîte à outils WikiMasters : ouverture automatique des paquets, suivi des tirages, cote des cartes et revente.
 // @match        https://www.wiki-masters.com/*
 // @match        https://wiki-masters.com/*
@@ -41,7 +41,7 @@
    *
    * Il est lu par le garde juste en dessous, d'où sa place en tête.
    */
-  const VERSION = '3.6.6';
+  const VERSION = '3.7.0';
 
   /*
    * Une seule instance par page — et savoir laquelle
@@ -949,6 +949,14 @@
     if (typeof s.sellHideTag === 'string' && s.sellHideTag) sellPrefs.hideTags = [s.sellHideTag];
     if (Array.isArray(s.sellHideTags)) sellPrefs.hideTags = s.sellHideTags;
     if (typeof s.sellHideTagged === 'boolean') sellPrefs.hideTagged = s.sellHideTagged;
+    // Les trois autres filtres de la Revente, oubliés à chaque rechargement.
+    if (Number.isFinite(s.sellMin) && s.sellMin >= 1) sellPrefs.minSales = s.sellMin;
+    if (s.sellRar === '' || RARITIES.includes(s.sellRar)) sellPrefs.rarity = s.sellRar;
+    if (typeof s.sellFree === 'boolean') sellPrefs.onlyFree = s.sellFree;
+    if (typeof s.sellJournal === 'boolean') sellPrefs.journalOuvert = s.sellJournal;
+    if (typeof s.sellAide === 'boolean') sellPrefs.aide = s.sellAide;
+    if (s.sellTri === '' || (typeof s.sellTri === 'string' && s.sellTri in VALEUR_TRI)) sellPrefs.tri = s.sellTri;
+    if (s.sellSens === 1 || s.sellSens === -1) sellPrefs.sens = s.sellSens;
     if (s.bids && Array.isArray(s.bids.list)) state.bids = s.bids;
     if (Array.isArray(s.journal)) state.journal = s.journal;
     /*
@@ -4144,6 +4152,14 @@
     state.sales = { at: Date.now(), list };
     saveStore({ sales: state.sales, lastListing: state.lastListing });
     render();
+    /*
+     * Et la Revente, si elle est ouverte. `render()` ne dessine que le petit
+     * panneau : la page gardait donc l'état d'avant la relecture — « vos ventes
+     * ne sont pas encore relues » alors qu'elles venaient de l'être, et des
+     * lignes « Vendre » sur des cartes déjà en vente. L'ouverture relance ce
+     * relevé exprès pour ça ; encore fallait-il en montrer le résultat.
+     */
+    if (sell.open) renderSell();
   }
 
   /*
@@ -11523,13 +11539,18 @@
   }
 
   /*
-   * Le bouton « Vendre un double » armé, s'il y en a un : l'identifiant de la
-   * carte, et l'instant du premier clic. Un seul à la fois — deux boutons armés
-   * en même temps, c'est un clic confirmé sur la mauvaise carte.
+   * La ligne dont on choisit le prix avant de la mettre en file :
+   * `{ id, titre, prix }`, le prix tel que tapé — plus `double` (le nombre
+   * d'exemplaires) et `ouvertA` quand c'est « Vendre un double ». Une seule à
+   * la fois : deux saisies ouvertes, c'est un prix validé sur la mauvaise
+   * carte.
+   *
+   * « Mettre en file » et « Vendre un double » inscrivaient la carte au prix
+   * visé, sans demander : pour en changer, il fallait aller la retrouver dans
+   * le volet Relances. Signalé à l'usage — le prix se choisit maintenant dans
+   * la ligne, avant l'inscription.
    */
-  let doubleArme = '';
-  let doubleArmeA = 0;
-  let doubleArmeTimer = null;
+  let saisieFile = null;
 
   const sell = { open: false, scanning: false, done: 0, total: 0, read: 0, rows: [], at: 0, tags: [],
                  checked: new Set(), themes: {}, comp: new Map(), compAt: 0, compTronque: false,
@@ -11565,7 +11586,14 @@
                  // Lignes relues à cause du glissement de pagination, écartées.
                  note: '', refus: 0, tronque: false, freinages: 0, doublons: 0,
                  // Refus rencontrés sur l'historique des ventes, carte par carte.
-                 refusVentes: 0, refusVentesN: 0 };
+                 refusVentes: 0, refusVentesN: 0,
+                 /*
+                  * La défausse en lot, demandée sur #suggestions : les cartes
+                  * cochées (par identifiant de carte), les exemplaires engagés
+                  * dans un échange en attente — le site les donne avec chaque
+                  * page de collection —, et le bilan de la dernière défausse.
+                  */
+                 aDefausser: new Set(), echanges: new Set(), defausse: null };
 
   function loadCote() {
     try {
@@ -11763,6 +11791,8 @@
   async function fetchCollectionRaw(onProgress) {
     const out = [];
     const vues = new Set();
+    // Les exemplaires engagés dans un échange : jamais à défausser.
+    const echanges = new Set();
     sell.refus = 0;
     sell.tronque = false;
     sell.doublons = 0;
@@ -11786,6 +11816,7 @@
           fini = true;
           continue;
         }
+        if (Array.isArray(d.pendingTradeCardIds)) for (const x of d.pendingTradeCardIds) echanges.add(x);
         for (const e of d.collection) {
           if (e && e.id != null) {
             if (vues.has(e.id)) { sell.doublons += 1; continue; }
@@ -11802,6 +11833,7 @@
       }
       if (fini) break;
     }
+    sell.echanges = echanges;
     return out;
   }
 
@@ -12189,7 +12221,45 @@
    * quatre seules à porter un bouton « Vendre » étaient les quatre marquées ⚠.
    * Deux seuils qui se contredisent ne valent pas mieux qu'aucun seuil.
    */
-  const sellPrefs = { minSales: THIN_SALES, hideTags: [], hideTagged: false, rarity: '', onlyFree: true };
+  const sellPrefs = { minSales: THIN_SALES, hideTags: [], hideTagged: false, rarity: '', onlyFree: true,
+                      // « Tes ventes » déplié, et l'aide ouverte : repliés tant qu'on ne les demande pas.
+                      journalOuvert: false, aide: false,
+                      // Le tri choisi en cliquant une colonne (vide : l'ordre par défaut), son sens,
+                      // le nom cherché, et combien de lignes on affiche.
+                      tri: '', sens: -1, cherche: '', affiche: 200 };
+
+  /*
+   * Deux cents lignes à la fois. Un compte cote des milliers de cartes : tout
+   * dessiner, c'était ~2 Mo de HTML reconstruits à chaque rafraîchissement de
+   * la page — mesuré au banc à 190 ms de calcul pour 4 000 lignes, et `paint()`
+   * compare les deux chaînes avant d'écrire. Personne ne lit la millième.
+   */
+  const PAGE_REVENTE = 200;
+
+  /*
+   * Ce qu'on trie quand on clique une colonne. Le nom se compare en français,
+   * le reste en nombre ; une cote sans historique compte zéro vente.
+   */
+  const VALEUR_TRI = {
+    r: (x) => RARITIES.length - RARITIES.indexOf(x.r),
+    t: null,
+    n: (x) => (x.seule ? 0 : x.n),
+    comp: (x) => sell.comp.get(x.id) || 0,
+    q3: (x) => x.q3 || x.med,
+    med: (x) => x.med,
+  };
+
+  /** Les lignes dans l'ordre que vous avez choisi, ou telles quelles. */
+  function trierVue(rows) {
+    const k = sellPrefs.tri;
+    if (!k || !(k in VALEUR_TRI)) return rows;
+    const s = sellPrefs.sens;
+    if (k === 't') return rows.slice().sort((a, b) => s * a.t.localeCompare(b.t, 'fr', { sensitivity: 'base' }));
+    return rows.slice().sort((a, b) => s * (VALEUR_TRI[k](a) - VALEUR_TRI[k](b)));
+  }
+
+  /** Pour chercher un nom sans se soucier des accents ni des majuscules. */
+  const sansAccents = (s) => String(s || '').normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase();
 
   /** Une cote assise sur assez de ventes pour qu'on la classe devant. */
   const fiable = (x) => (!x.seule && x.n >= THIN_SALES ? 1 : 0);
@@ -12214,6 +12284,8 @@
       .filter((x) => !(sellPrefs.hideTagged && x.tags.length))
       .filter((x) => sellPrefs.hideTagged || !x.tags.some((t) => sellPrefs.hideTags.includes(t)))
       .filter((x) => !sellPrefs.rarity || x.r === sellPrefs.rarity)
+      // Le nom cherché dans la barre, accents et majuscules confondus.
+      .filter((x) => !sellPrefs.cherche || sansAccents(x.t).includes(sansAccents(sellPrefs.cherche)))
       // Sans concurrence d'abord, puis par prix visé.
       .filter((x) => !sellPrefs.onlyFree || !concurrenceConnue() || !sell.comp.get(x.id))
       /*
@@ -12225,10 +12297,21 @@
       .sort((a, b) => fiable(b) - fiable(a) || (b.q3 || b.med) - (a.q3 || a.med));
   }
 
-  /** Ouvre la fiche de la carte au formulaire d'enchère, prix pré-rempli. */
-  async function prepareSale(title, price) {
+  /**
+   * Ouvre la fiche de la carte au formulaire d'enchère, prix pré-rempli.
+   *
+   * Sur une COPIE LIBRE. La fiche se choisit par le titre, et la page
+   * collection montre une tuile par exemplaire : ouvrir la première venue,
+   * c'était ouvrir peut-être la copie que vous gardez, et la mettre en vente.
+   * Faute de copie libre reconnue à l'écran, on n'ouvre rien, et on le dit.
+   */
+  async function prepareSale(title, price, tags = []) {
     closeSell();
-    const ok = await openCardDetail(title);
+    const ok = await openCardDetail(title, { libre: true, tags });
+    if (ok === 'aucune libre') {
+      setStatus(`« ${title} » : aucune copie libre à l'écran, rien n'a été ouvert.`, true);
+      return;
+    }
     if (!ok) return;
     const bouton = [...document.querySelectorAll('button')].find((b) => /enchères/i.test(b.textContent));
     if (!bouton) return;
@@ -12241,18 +12324,59 @@
     saveStore({ asks: state.asks });
   }
 
-  /** Recherche la carte dans la collection et ouvre sa fiche. */
-  async function openCardDetail(title) {
+  /*
+   * La tuile d'une copie LIBRE, reconnue à l'écran.
+   *
+   * Relevé sur le vrai site : la page collection montre une tuile par
+   * exemplaire, l'étiquette y est écrite en clair, et le bouton étoile dit
+   * « Ajouter aux favoris » tant que la copie n'est pas en favori. Une tuile
+   * est tenue pour libre si elle ne porte aucune des étiquettes connues de la
+   * carte, n'affiche rien que ses jumelles n'affichent aussi — une étiquette
+   * écrite autrement que dans nos relevés se trahit ainsi — et n'est pas en
+   * favori. Dans le doute, elle ne l'est pas.
+   */
+  function tuileLibre(tuile, jumelles, tags) {
+    const textes = (t) => new Set([...t.querySelectorAll('*')]
+      .filter((n) => !n.children.length && n.textContent.trim())
+      .map((n) => n.textContent.trim()));
+    const siens = textes(tuile);
+    if (tags.some((t) => siens.has(t))) return false;
+    if (jumelles.length > 1) {
+      const communs = jumelles.map(textes).reduce((a, b) => new Set([...a].filter((x) => b.has(x))));
+      if ([...siens].some((x) => !communs.has(x))) return false;
+    }
+    const etoile = [...tuile.querySelectorAll('button')]
+      .find((b) => /favori/i.test(b.getAttribute('aria-label') || ''));
+    return !etoile || /^ajouter/i.test(etoile.getAttribute('aria-label'));
+  }
+
+  /**
+   * Recherche la carte dans la collection et ouvre sa fiche.
+   *
+   * @param {{libre?: boolean, tags?: string[]}} [opts] `libre` : n'ouvrir
+   *   qu'une copie libre (voir `tuileLibre`). Rend alors « aucune libre » quand
+   *   les tuiles sont là mais toutes gardées.
+   */
+  async function openCardDetail(title, { libre = false, tags = [] } = {}) {
     goFilteredTo('/collection', title);
     for (let i = 0; i < 40; i++) {
       await delay(250);
-      const h = [...document.querySelectorAll('h3')].find((x) => x.textContent.trim() === title);
-      const card = h && h.closest(CARD_ITEM);
-      if (card) {
-        (card.firstElementChild || card).click();
-        await delay(900);
-        return true;
-      }
+      const tuiles = [...document.querySelectorAll('h3')]
+        .filter((x) => x.textContent.trim() === title)
+        .map((h) => h.closest(CARD_ITEM))
+        .filter(Boolean);
+      if (!tuiles.length) continue;
+      // Laisser la grille finir de se remplir : une tuile de plus peut être la libre.
+      if (libre) await delay(400);
+      const toutes = libre
+        ? [...document.querySelectorAll('h3')].filter((x) => x.textContent.trim() === title)
+          .map((h) => h.closest(CARD_ITEM)).filter(Boolean)
+        : tuiles;
+      const card = libre ? toutes.find((t) => tuileLibre(t, toutes, tags)) : toutes[0];
+      if (!card) return 'aucune libre';
+      (card.firstElementChild || card).click();
+      await delay(900);
+      return true;
     }
     return false;
   }
@@ -12456,7 +12580,10 @@
   }
 
   async function priceCards(cards) {
-    const todo = cards.filter((c) => c.id && !sell.checked.has(c.id));
+    // Une carte tirée deux fois dans le même lot ne fait qu'une ligne : sans
+    // ce tri, elle en faisait deux, identiques, jusqu'au rechargement suivant.
+    const todo = [...new Map(cards.filter((c) => c.id && !sell.checked.has(c.id))
+      .map((c) => [c.id, c])).values()];
     if (!todo.length) return;
     let ajout = 0;
 
@@ -12551,8 +12678,10 @@
    *   dans la collection —, ou `null` quand la réponse ne permet pas de conclure
    *   (réseau, refus, homonymes au-delà des pages lues).
    */
-  async function exemplairesParTitre(id, titre) {
+  async function exemplairesParTitre(id, titre, brut = false) {
     const copies = new Map();
+    // `brut` : les lignes telles que le site les rend, identifiant de COPIE compris.
+    const rendre = () => (brut ? [...copies.values()] : [...copies.values()].map(ligneCollection));
     for (let page = 0; page < Q_PAGES_MAX; page++) {
       let d;
       try {
@@ -12563,11 +12692,12 @@
       const lignes = d.status === 200 && d.data && Array.isArray(d.data.collection)
         ? d.data.collection : null;
       if (!lignes) return null;
+      if (Array.isArray(d.data.pendingTradeCardIds)) for (const x of d.data.pendingTradeCardIds) sell.echanges.add(x);
       for (const e of lignes) if (e.card_id === id && e.id != null) copies.set(e.id, e);
-      if (lignes.length < COLLECTION_PAGE) return [...copies.values()].map(ligneCollection);
+      if (lignes.length < COLLECTION_PAGE) return rendre();
     }
     // Des homonymes à perte de vue : ce qu'on a trouvé est sûr, l'absence non.
-    return copies.size ? [...copies.values()].map(ligneCollection) : null;
+    return copies.size ? rendre() : null;
   }
 
   async function pruneSold() {
@@ -12599,18 +12729,38 @@
      * recomptée sur ses vrais exemplaires. Introuvable sur une réponse qui
      * permet de conclure : elle part. Sinon on la laisse telle qu'elle était.
      */
+    /*
+     * ET UNE CARTE EN VENTE N'EST PAS PARTIE NON PLUS.
+     *
+     * Sur le site, l'exemplaire mis aux enchères quitte la collection le temps
+     * de l'enchère : ni la lecture ni la recherche par titre ne le rendent. Le
+     * nettoyage retirait donc la ligne — et si l'enchère finissait sans
+     * acheteur, l'exemplaire revenait sans que rien ne remette la ligne avant le
+     * relevé complet suivant. L'état « en vente » d'une ligne ne se voyait
+     * presque jamais.
+     *
+     * Une carte de vos ventes en cours, relevé frais, garde donc sa ligne telle
+     * quelle : elle s'affiche « en vente », et reste si personne n'achète. Une
+     * vente conclue la fait sortir de vos ventes, et le nettoyage suivant — que
+     * la notification de vente déclenche — la retire.
+     */
+    const ventesFraiches = state.sales.at && Date.now() - state.sales.at < VENTES_FRAICHES_MS;
+    const enVente = new Set(ventesFraiches ? (state.sales.list || []).map((v) => v.card).filter(Boolean) : []);
     const lues = new Set(cards.map((c) => c.id));
-    const douteuses = new Set();
+    // Les lignes qu'on laisse telles qu'elles étaient : en vente, ou sans réponse
+    // qui permette de conclure.
+    const inchangees = new Set();
     let demandes = 0;
     for (const r of sell.rows) {
       if (lues.has(r.id)) continue;
+      if (enVente.has(r.id)) { inchangees.add(r.id); continue; }
       let copies = null;
       if (cherchable(r.t) && demandes < VERIF_MAX) {
         demandes += 1;
         copies = await exemplairesParTitre(r.id, r.t);
       }
       if (copies) cards.push(...copies);
-      else douteuses.add(r.id);
+      else inchangees.add(r.id);
     }
     // Un relevé complet a fini pendant ces vérifications : ses lignes sont plus
     // fraîches que notre lecture, on ne les touche pas.
@@ -12631,10 +12781,10 @@
      */
     const parCarte = new Map(cartesDistinctes(cards).map((c) => [c.id, c]));
     sell.possedees = { ids: new Set(parCarte.keys()), at: debut };
-    sell.rows = sell.rows.filter((r) => parCarte.has(r.id) || douteuses.has(r.id));
+    sell.rows = sell.rows.filter((r) => parCarte.has(r.id) || inchangees.has(r.id));
     for (const r of sell.rows) {
       const c = parCarte.get(r.id);
-      if (!c) continue;   // douteuse : laissée telle qu'elle était
+      if (!c) continue;   // en vente ou sans conclusion : laissée telle qu'elle était
       r.tags = c.tags;
       r.exemplaires = c.exemplaires;
       r.libres = c.libres;
@@ -12809,6 +12959,7 @@
 
   function openSell() {
     sell.open = true;
+    sellPrefs.affiche = PAGE_REVENTE;
     syncJournal();
     refreshCompetition();
     refreshOwned();
@@ -12826,19 +12977,27 @@
      * `scanSales` porte son propre verrou de ré-entrée : l'appeler ici ne
      * double aucun tour en vol.
      */
-    scanSales();
+    const ventesRelues = scanSales();
     /*
      * Un compte gratuit s'est déjà vu refuser le marché : relancer le relevé à
      * chaque ouverture, c'est vingt-cinq requêtes refusées de plus pour le même
      * message. Le bouton « Rafraîchir la cote » reste là si l'abonnement change.
+     *
+     * Le nettoyage attend la relecture des ventes : c'est elle qui lui dit
+     * quelles cartes sont en vente, donc absentes de la collection sans être
+     * parties.
      */
     if (!sell.rows.length && !sell.scanning && sell.refusVentes !== 403) scanCote();
-    else pruneSold().then(() => priceCards(tiragesACoter()));
+    // Une relecture en échec ne prive pas du nettoyage : il se passera
+    // simplement de savoir ce qui est en vente, comme avant.
+    else ventesRelues.catch(() => {}).then(pruneSold).then(() => priceCards(tiragesACoter()));
     renderSell();
   }
 
   function closeSell() {
     sell.open = false;
+    saisieFile = null;
+    desarmerDefausse();
     renderSell();
   }
 
@@ -12855,8 +13014,214 @@
     if (e.key !== 'Escape' || !sell.open) return;
     if (e.ctrlKey || e.altKey || e.metaKey || e.shiftKey) return;
     e.preventDefault();
+    // Un prix en cours de saisie : Échap l'abandonne, sans fermer la page.
+    if (saisieFile) { saisieFile = null; renderSell(); return; }
     closeSell();
   });
+
+  /*
+   * LA DÉFAUSSE EN LOT, demandée sur #suggestions : « j'ai beaucoup trop de
+   * cartes, et je défausse la plupart de celles que je trouve dans mes
+   * paquets ». Plutôt qu'une défausse automatique à l'ouverture des paquets —
+   * au hasard des tirages —, on coche dans la Revente les cartes dont on ne
+   * veut pas, et on les défausse d'un coup.
+   *
+   * C'est le geste le plus destructeur de l'outil : une carte défaussée ne
+   * revient pas. D'où trois barrières, toutes tenues AU MOMENT de défausser,
+   * sur une lecture fraîche de la collection — jamais sur l'état du tableau :
+   *
+   * - seules partent les copies LIBRES : jamais une copie étiquetée ou en
+   *   favori, la règle de toute la revente ;
+   * - jamais une carte en vente ou en file, ni un exemplaire engagé dans un
+   *   échange en attente (le site en donne la liste avec chaque page) ;
+   * - deux clics, le second jamais dans la foulée du premier, et le premier
+   *   dit combien d'exemplaires partiront.
+   *
+   * L'appel est celui du site, relevé dans son propre code :
+   * `POST /api/user-cards/bulk-discard { card_ids: [...] }` — des identifiants
+   * d'EXEMPLAIRE, sous `user_cards` — qui rend `discarded_count`. Il ne rend
+   * pas la récompense : le bilan ne dit donc que le nombre défaussé. La
+   * différence de solde a été écartée — une vente conclue pendant la défausse
+   * l'aurait faussée.
+   */
+  const DEFAUSSE_LOT = 50;
+  // Au-delà, une requête par carte coûterait plus que la lecture complète.
+  const DEFAUSSE_PAR_TITRE_MAX = 100;
+  let defausseArmeeA = 0;
+  let defausseTimer = null;
+
+  const desarmerDefausse = () => { defausseArmeeA = 0; clearTimeout(defausseTimer); };
+
+  /** Les cartes cochées que la défausse peut toucher, parmi celles affichées. */
+  function cocheesDefaussables(rows = sellRows(), mesVentes = resumeRevente(rows).mesVentes) {
+    return rows.filter((r) => sell.aDefausser.has(r.id)).filter((r) => {
+      const e = etatLigne(r, mesVentes, 0);
+      return !e.protegee && !e.dejaEnVente && !e.enFile;
+    });
+  }
+
+  async function defausserCochees() {
+    if (sell.scanning || (sell.defausse && sell.defausse.enCours)) return;
+    const cartes = cocheesDefaussables();
+    desarmerDefausse();
+    if (!cartes.length) return;
+    sell.defausse = { enCours: true, lues: 0, total: cartes.length };
+    renderSell();
+
+    /*
+     * Les exemplaires, lus MAINTENANT — ceux des cartes cochées seulement.
+     *
+     * Par le TITRE d'abord : une requête par carte, quatre à la fois. La
+     * première version relisait toute la collection pour retrouver dix
+     * cartes — des centaines de pages, et une défausse qui paraissait figée.
+     * Signalé à l'usage : « très longue alors qu'il n'y avait que 10
+     * exemplaires ». Ne passent par la lecture complète que les cartes que le
+     * titre ne tranche pas (titre trop court, homonymes, panne) et les très
+     * grosses sélections, où une requête par carte coûterait davantage.
+     */
+    const copies = new Map();
+    const aLire = [];
+    if (cartes.length <= DEFAUSSE_PAR_TITRE_MAX) {
+      for (let i = 0; i < cartes.length; i += 4) {
+        await Promise.all(cartes.slice(i, i + 4).map(async (r) => {
+          const trouvees = cherchable(r.t) ? await exemplairesParTitre(r.id, r.t, true) : null;
+          if (trouvees) copies.set(r.id, trouvees);
+          else aLire.push(r);
+        }));
+        sell.defausse.lues = Math.min(cartes.length, i + 4);
+        renderSelection();
+      }
+    } else aLire.push(...cartes);
+    if (aLire.length) {
+      const ids = new Set(aLire.map((r) => r.id));
+      let brut = [];
+      try {
+        brut = await fetchCollectionRaw((n) => { sell.defausse.pages = n; renderSelection(); });
+      } catch (_) { brut = []; }
+      for (const e of brut) {
+        if (!ids.has(e.card_id) || e.id == null) continue;
+        if (!copies.has(e.card_id)) copies.set(e.card_id, []);
+        copies.get(e.card_id).push(e);
+      }
+    }
+    sell.defausse.envoi = true;
+    renderSelection();
+
+    const aEnvoyer = [];
+    const laissees = [];
+    const libresDe = new Map();
+    for (const r of cartes) {
+      const libres = (copies.get(r.id) || []).filter((e) => !(e.tags || []).length && !e.starred
+        && !sell.echanges.has(e.id) && !sell.echanges.has(e.card_id));
+      if (!libres.length) { laissees.push(r.t); continue; }
+      libresDe.set(r.id, libres.map((e) => e.id));
+      aEnvoyer.push(...libres.map((e) => e.id));
+    }
+
+    let defaussees = 0;
+    let erreur = '';
+    const parties = new Set();
+    for (let i = 0; i < aEnvoyer.length; i += DEFAUSSE_LOT) {
+      const lot = aEnvoyer.slice(i, i + DEFAUSSE_LOT);
+      let d;
+      try { d = await api('/api/user-cards/bulk-discard', 'POST', { card_ids: lot }); } catch (_) { d = { status: 0 }; }
+      // Un refus arrête tout : on ne s'obstine pas sur un geste irréversible.
+      if (d.status !== 200) { erreur = d.status ? `refus ${d.status}` : 'réseau'; break; }
+      console.info('[WikiMasters Tools] défausse — réponse du serveur :', d.data);
+      defaussees += Number.isFinite(d.data && d.data.discarded_count) ? d.data.discarded_count : lot.length;
+      for (const x of lot) parties.add(x);
+    }
+
+    // Le tableau suit : chaque carte perd ses exemplaires partis, et sort s'il n'en reste aucun.
+    const sorties = new Set();
+    for (const r of cartes) {
+      const partis = (libresDe.get(r.id) || []).filter((x) => parties.has(x)).length;
+      if (!partis) continue;
+      const lues = copies.get(r.id) || [];
+      r.exemplaires = lues.length - partis;
+      r.libres = Math.max(0, lues.filter((e) => !(e.tags || []).length && !e.starred).length - partis);
+      if (r.exemplaires <= 0) sorties.add(r.id);
+    }
+    sell.rows = sell.rows.filter((r) => !sorties.has(r.id));
+    if (sell.possedees) for (const id of sorties) sell.possedees.ids.delete(id);
+    sell.aDefausser.clear();
+    sell.owned = { ...sell.owned, at: 0 };   // la collection a rétréci : à recompter
+    saveCote();
+    sell.defausse = { fini: true, exemplaires: defaussees, laissees, erreur };
+    renderSell();
+    render();
+  }
+
+  /** La barre de la sélection : ce qui est coché, le geste, puis le bilan. */
+  function renderSelection(rows, mesVentes) {
+    const bar = sellUI.selbar;
+    const d = sell.defausse;
+    const pl = (n, mot) => `${n} ${mot}${n > 1 ? 's' : ''}`;
+    if (d && d.enCours) {
+      bar.hidden = false;
+      // Où en est la défausse : une attente sans chiffre ressemble à un blocage.
+      paint(bar, `<span>Défausse en cours : ${d.envoi ? 'envoi au site…'
+        : d.pages ? `lecture de votre collection, ${d.pages.toLocaleString('fr-FR')} exemplaires lus…`
+          : `vérification des exemplaires, ${d.lues || 0} / ${d.total} ${d.total > 1 ? 'cartes' : 'carte'}…`}</span>`);
+      return;
+    }
+    const cartes = cocheesDefaussables(rows, mesVentes);
+    if (cartes.length) {
+      const ex = cartes.reduce((s, r) => s + (r.libres != null ? r.libres : 1), 0);
+      const arme = !!defausseArmeeA;
+      bar.hidden = false;
+      paint(bar, `<span><b>${pl(cartes.length, 'carte')}</b> ${cartes.length > 1 ? 'cochées' : 'cochée'}`
+        + ` · ${pl(ex, 'exemplaire')} ${ex > 1 ? 'libres' : 'libre'}</span>`
+        + `<button class="defausse${arme ? ' arme' : ''}" data-defausser title="Détruit définitivement les copies libres`
+        + ' des cartes cochées. Jamais une copie étiquetée ou en favori, ni une carte en vente, en file ou engagée'
+        + ` dans un échange. Deux clics.">${arme ? `Confirmer : défausser ${pl(ex, 'exemplaire')} ?` : 'Défausser'}</button>`
+        + '<button data-decocher>Tout décocher</button>');
+      return;
+    }
+    if (d && d.fini) {
+      bar.hidden = false;
+      paint(bar, `<span><b>${pl(d.exemplaires, 'exemplaire')}</b> ${d.exemplaires > 1 ? 'défaussés' : 'défaussé'}`
+        + (d.laissees.length ? ` · ${pl(d.laissees.length, 'carte')} ${d.laissees.length > 1 ? 'laissées' : 'laissée'} :`
+          + ' plus de copie libre, ou engagée dans un échange' : '')
+        + (d.erreur ? ` · le site a arrêté la défausse (${esc(d.erreur)})` : '')
+        + '</span><button data-bilanok>OK</button>');
+      return;
+    }
+    bar.hidden = true;
+  }
+
+  /**
+   * Le champ de prix d'une ligne et ses deux boutons, pour « Mettre en file »
+   * comme pour « Vendre un double » : `valider` est le libellé du bouton qui
+   * inscrit.
+   */
+  const editeurPrix = (valider) => `<span class="fedit"><input type="number" data-fprix min="1" step="1"`
+    + ` value="${esc(String(saisieFile.prix))}" aria-label="Prix de mise en file"`
+    + ` title="Le prix visé est proposé : gardez-le ou changez-le. Entrée pour valider, Échap pour annuler.">`
+    + `<span class="u">wb</span><button class="go" data-fok>${esc(valider)}</button>`
+    + '<button class="go" data-fnon>Annuler</button></span>';
+
+  /**
+   * Inscrit en file la carte dont on vient de choisir le prix — une carte
+   * libre, ou UNE copie d'un double gardé (`saisieFile.double`).
+   */
+  function confirmerFile() {
+    if (!saisieFile) return;
+    // Un double gardé : pas de validation dans le même geste que l'ouverture.
+    if (saisieFile.double && Date.now() - saisieFile.ouvertA < WISH_ARME_MIN_MS) return;
+    const prix = Math.round(Number(saisieFile.prix));
+    if (!(prix >= 1)) {
+      const champ = sellUI.scroll.querySelector('[data-fprix]');
+      if (champ) { champ.classList.add('ko'); champ.focus(); }
+      return;
+    }
+    if (saisieFile.double) enrolWatch(saisieFile.id, saisieFile.titre, prix, FILE_MINUTES, 0, false, true);
+    else enrolWatch(saisieFile.id, saisieFile.titre, prix, FILE_MINUTES, 0);
+    saisieFile = null;
+    saveStore({ watch: state.watch });
+    renderSell();
+    render();
+  }
 
   /*
    * La feuille de la Revente, sortie de la fonction qui la posait.
@@ -13002,6 +13367,17 @@
       font: 500 12px ui-sans-serif, system-ui, sans-serif; font-variant-numeric: tabular-nums;
       transition: border-color .14s, background .14s;
     }
+    /* Chercher une carte : le même champ que « Ventes mini », plus large. */
+    .bar input[type=search] {
+      width: 170px; appearance: none; -webkit-appearance: none;
+      background: rgba(255,255,255,.05); border: 1px solid rgba(255,255,255,.09);
+      border-radius: 8px; color: var(--text); padding: 5px 9px;
+      font: 500 12px ui-sans-serif, system-ui, sans-serif;
+      transition: border-color .14s, background .14s;
+    }
+    .bar input[type=search]::placeholder { color: var(--dim); }
+    .bar input[type=search]:hover { background: rgba(255,255,255,.08); }
+    .bar input[type=search]:focus { outline: 0; border-color: var(--live); background: rgba(255,255,255,.08); }
     .bar input[type=number]::-webkit-outer-spin-button,
     .bar input[type=number]::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
     .bar input[type=number]:hover { background: rgba(255,255,255,.08); }
@@ -13073,7 +13449,14 @@
      */
     .bar button.due { background: color-mix(in srgb, var(--warn) 16%, transparent); color: var(--warn); }
     .bar button.due:hover { background: color-mix(in srgb, var(--warn) 24%, transparent); color: var(--warn); }
-    .scroll { overflow: auto; }
+    /*
+     * Le tableau prend la place, les autres blocs gardent la leur. C'était
+     * l'inverse : seul le tableau savait rétrécir, et il payait pour tous —
+     * cinq lignes visibles sur un portable, aucune à largeur de téléphone.
+     * Mesuré au banc de rendu, contrôlé par banc.controlesRevente().
+     */
+    .scroll { overflow: auto; flex: 1 1 auto; min-height: 120px; }
+    .top, .caveat, .bar, .journal, .note { flex: none; }
     /*
      * « min-width » : le conteneur était prêt à défiler, mais une table en
      * « width: 100% » sans plancher se comprime au lieu de le déclencher.
@@ -13085,7 +13468,11 @@
     th { position: sticky; top: 0; z-index: 1; background: #0D0F13; text-align: left; color: var(--dim);
          font-size: 11px; font-weight: 500; padding: 10px 14px;
          border-bottom: 1px solid var(--line); }
-    td { padding: 9px 14px; border-bottom: 1px solid rgba(255,255,255,.04);
+    /* Les colonnes qu'on trie au clic ; celle qui trie porte le vert et sa flèche. */
+    th.tri { cursor: pointer; transition: color .14s; user-select: none; }
+    th.tri:hover { color: var(--text); }
+    th.tri.on { color: var(--live); }
+    td { padding: 6px 14px; border-bottom: 1px solid rgba(255,255,255,.04);
          font-variant-numeric: tabular-nums; }
     tr:hover td { background: rgba(255,255,255,.035); }
     /*
@@ -13114,6 +13501,52 @@
     .t { max-width: 340px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
          font-weight: 500; }
     .num { text-align: right; }
+    /* « ×2 » à côté du titre : combien d'exemplaires vous en avez. */
+    .t .nb { margin-left: 4px; color: var(--muted); font-size: 11px; font-weight: 500; }
+    /* Les cases de la défausse, dessinées comme celle de la barre. */
+    .sel { width: 1%; padding-right: 0; }
+    .sel input[type=checkbox] {
+      display: block; appearance: none; -webkit-appearance: none;
+      width: 16px; height: 16px; margin: 0; border-radius: 5px;
+      background: rgba(255,255,255,.05); box-shadow: inset 0 0 0 1px rgba(255,255,255,.14);
+      cursor: pointer; transition: background .14s, box-shadow .14s;
+    }
+    .sel input[type=checkbox]:hover { background: rgba(255,255,255,.1); }
+    .sel input[type=checkbox]:checked { background: var(--warn); box-shadow: none; }
+    .sel input[type=checkbox]:checked::after {
+      content: ''; display: block; width: 4px; height: 8px; margin: 2px auto 0;
+      border: solid #1A1206; border-width: 0 2px 2px 0; transform: rotate(45deg);
+    }
+    /* La barre de la sélection : ce qui est coché, la défausse, puis son bilan. */
+    .selbar { flex: none; display: flex; align-items: center; gap: 10px 14px; flex-wrap: wrap;
+              padding: 8px 20px; border-bottom: 1px solid var(--line); font-size: 12px; color: var(--text);
+              background: color-mix(in srgb, var(--warn) 7%, transparent); }
+    .selbar[hidden] { display: none; }
+    .selbar b { font-weight: 650; font-variant-numeric: tabular-nums; }
+    .selbar button { flex: none; padding: 5px 12px; border: 0; border-radius: 8px; cursor: pointer;
+                     background: rgba(255,255,255,.06); color: var(--muted);
+                     font: 500 12px ui-sans-serif, system-ui, sans-serif; transition: background .14s, color .14s; }
+    .selbar button:hover { color: var(--text); background: rgba(255,255,255,.1); }
+    .selbar .defausse { background: color-mix(in srgb, var(--warn) 18%, transparent); color: var(--warn); }
+    .selbar .defausse:hover { background: color-mix(in srgb, var(--warn) 28%, transparent); color: var(--warn); }
+    /* Armée : pleine, pour qu'on voie que le prochain clic détruit. */
+    .selbar .defausse.arme { background: var(--warn); color: #1A1206; font-weight: 650; }
+    /* Le prix choisi avant de mettre en file, dans la ligne même. */
+    .fedit { display: inline-flex; align-items: center; gap: 6px; }
+    .fedit input {
+      width: 76px; appearance: textfield; -moz-appearance: textfield;
+      background: rgba(255,255,255,.06); border: 1px solid var(--live); border-radius: 8px;
+      color: var(--text); padding: 4px 8px; text-align: right;
+      font: 600 12px ui-sans-serif, system-ui, sans-serif; font-variant-numeric: tabular-nums;
+    }
+    .fedit input::-webkit-outer-spin-button, .fedit input::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
+    .fedit input:focus { outline: 0; background: rgba(255,255,255,.1); }
+    .fedit input.ko { border-color: var(--warn); }
+    .fedit .u { color: var(--dim); font-size: 11px; margin-right: 4px; }
+    /* La fin de la tranche affichée, et de quoi voir la suite. */
+    tr.plus td { text-align: center; padding: 12px 14px; color: var(--dim); font-size: 11px; }
+    tr.plus:hover td { background: none; }
+    tr.plus .go { margin-right: 12px; }
     /*
      * Le prix visé est la réponse à la question que pose la page. Il portait
      * la même taille que les six autres nombres de sa ligne, à une graisse
@@ -13139,7 +13572,7 @@
      * n'est pas une action cachée, seulement une action qui cesse de
      * dessiner un cadre autour d'elle-même quinze fois de suite.
      */
-    .go { padding: 5px 12px; border: 1px solid rgba(255,255,255,.12); border-radius: 8px;
+    .go { padding: 4px 10px; border: 1px solid rgba(255,255,255,.12); border-radius: 8px;
           background: none; color: var(--text); cursor: pointer;
           font: 500 11px ui-sans-serif, system-ui, sans-serif;
           transition: background .14s, border-color .14s, color .14s; }
@@ -13181,8 +13614,16 @@
     .go.file:hover, .go.file:focus-visible {
       background: color-mix(in srgb, ${RARITY_COLOR.R} 15%, transparent); border-color: ${RARITY_COLOR.R}; color: ${RARITY_COLOR.R};
     }
-    .note { padding: 13px 20px; color: var(--dim); font-size: 11px; line-height: 1.55;
-            max-width: 90ch; border-top: 1px solid var(--line); }
+    /* L'aide, repliée sur son titre tant qu'on ne l'ouvre pas. */
+    .note { padding: 8px 20px; border-top: 1px solid var(--line); }
+    .note summary { cursor: pointer; list-style: none; width: max-content;
+                    color: var(--muted); font-size: 11.5px; transition: color .14s; }
+    .note summary::-webkit-details-marker { display: none; }
+    .note summary::before { content: '?'; display: inline-block; width: 15px; height: 15px; margin-right: 7px;
+                            border-radius: 50%; background: rgba(255,255,255,.07); color: var(--dim);
+                            font: 700 10px/15px ui-sans-serif, system-ui, sans-serif; text-align: center; }
+    .note summary:hover { color: var(--text); }
+    .note p { margin: 8px 0 4px; max-width: 90ch; color: var(--dim); font-size: 11px; line-height: 1.55; }
     .empty { padding: 48px 40px; text-align: center; color: var(--dim); line-height: 1.6; }
     /* La jauge du relevé : mêmes 3 px, même vert et même transition que
        celle de la régénération, dans le panneau. */
@@ -13211,7 +13652,7 @@
      * texte en « --dim » n'y vit — les tons employés ici sont le blanc, le
      * vert et l'ambre — le plancher de contraste ne s'y applique donc pas.
      */
-    .journal { border-top: 1px solid var(--line); padding: 14px 20px;
+    .journal { border-top: 1px solid var(--line); padding: 10px 20px;
                background: rgba(0,0,0,.28); }
     /*
      * Vide, il ne réserve rien. Tant qu'il n'avait ni fond ni filet, une
@@ -13237,10 +13678,17 @@
      * deux DIFFÈRENT : une enchère qui monte. On n'écrit donc qu'un
      * nombre, et la flèche ne paraît que lorsqu'il y en a deux à comparer.
      */
-    .jhead { display: flex; align-items: flex-start; gap: 26px; margin-bottom: 11px; }
-    .jhead h3 { align-self: center; font-size: 12px; font-weight: 600; color: var(--text);
-                letter-spacing: -.005em; margin-right: 2px; }
+    .jhead { display: flex; align-items: flex-start; gap: 26px; flex-wrap: wrap; }
+    /* Le titre de « Tes ventes » est le bouton qui la déplie. */
+    .jtoggle { align-self: center; display: flex; align-items: center; gap: 8px; margin-right: 2px;
+               padding: 0; border: 0; background: none; cursor: pointer; color: var(--text);
+               font: 600 12px ui-sans-serif, system-ui, sans-serif; letter-spacing: -.005em; }
+    .jtoggle:hover { color: var(--live); }
+    .chev { width: 6px; height: 6px; border: solid var(--dim); border-width: 0 1.5px 1.5px 0;
+            transform: rotate(-45deg); transition: transform .14s; }
+    .chev.on { transform: rotate(45deg) translate(-2px, -2px); }
     .journal .list {
+      margin-top: 10px; max-height: 30vh; overflow: auto;
       display: grid; grid-template-columns: repeat(auto-fill, minmax(250px, 1fr));
       gap: 2px 28px;
     }
@@ -13260,6 +13708,20 @@
        la parcourir entièrement à la tabulation. */
     :focus-visible { outline: 2px solid var(--live); outline-offset: 2px; }
     @media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
+
+    /*
+     * Largeur de téléphone. L'en-tête et la barre passaient chacun à ~180 px
+     * de haut en s'enroulant, et le tableau tombait à zéro. Marges et écarts
+     * resserrés : il reste de la place pour lui.
+     */
+    @media (max-width: 640px) {
+      .wrap { padding: 8px; }
+      .top { gap: 12px; padding: 12px 14px; }
+      .sum { gap: 10px 16px; }
+      .bar { gap: 6px 10px; padding: 8px 14px; }
+      .journal, .note { padding-left: 14px; padding-right: 14px; }
+      .jhead { gap: 10px 16px; }
+    }
   `;
 
   function buildSellUI() {
@@ -13277,6 +13739,7 @@
           </div>
           <div class="caveat" data-caveat hidden></div>
           <div class="bar">
+            <input type="search" data-cherche placeholder="Chercher une carte" aria-label="Chercher une carte par son nom">
             <label>Ventes mini <input type="number" data-min min="1" max="50"></label>
             <label>Rareté <select data-rar></select></label>
             <span class="sep"></span>
@@ -13285,23 +13748,32 @@
             <span class="tags" data-taglabel hidden>Masquer <button class="tagchip" data-all>toutes les étiquetées</button><span data-tag></span></span>
             <button data-rescan>Rafraîchir la cote</button>
           </div>
+          <div class="selbar" data-selbar hidden></div>
           <div class="scroll" data-scroll></div>
           <div class="journal" data-journal></div>
-          <div class="note">
-            ⚠ signale une cote établie sur moins de 5 ventes : le prix visé y
+          <details class="note" data-aide>
+            <summary>Comment ça marche</summary>
+            <p>⚠ signale une cote établie sur moins de 5 ventes : le prix visé y
             retombe sur la médiane, et ces cartes passent en fin de tableau.
             « Vendre » ouvre la fiche de la carte sur le formulaire du site,
             prix pré-rempli — vous choisissez la durée et vous lancez l'enchère
-            vous-même. « Mettre en file » inscrit la carte au prix visé : elle
-            partira seule, sans vous, dès qu'un de vos dix emplacements se
-            libère. Rien ne part d'ici sans l'un de ces deux clics.
-          </div>
+            vous-même. « Mettre en file » vous demande un prix — le prix visé
+            est proposé — puis inscrit la carte : elle partira seule, sans
+            vous, dès qu'un de vos dix emplacements se libère. Rien ne part
+            d'ici sans l'un de ces deux gestes.</p>
+            <p>Les cases à gauche servent à défausser d'un coup les cartes
+            dont vous ne voulez pas. Seules leurs copies libres partent —
+            jamais une copie étiquetée ou en favori, ni une carte en vente, en
+            file ou engagée dans un échange —, et une défausse est
+            définitive : deux clics, le premier dit combien d'exemplaires.</p>
+          </details>
         </div>
       </div>`;
     document.body.appendChild(host);
 
     const q = (s) => root.querySelector(s);
     sellUI = { host, root, sum: q('[data-sum]'), caveat: q('[data-caveat]'), scroll: q('[data-scroll]'),
+      cherche: q('[data-cherche]'), selbar: q('[data-selbar]'),
       journal: q('[data-journal]'), min: q('[data-min]'), rar: q('[data-rar]'), free: q('[data-free]'), tag: q('[data-tag]'),
       taglabel: q('[data-taglabel]'), all: q('[data-all]'), freeLabel: q('[data-freelabel]'),
       rescan: q('[data-rescan]'), bar: q('.bar') };
@@ -13309,15 +13781,79 @@
     q('[data-close]').addEventListener('click', closeSell);
     q('[data-wrap]').addEventListener('click', (e) => { if (e.target === q('[data-wrap]')) closeSell(); });
     q('[data-rescan]').addEventListener('click', scanCote);
+    /*
+     * L'aide et « Tes ventes » se replient, et l'état se retient. Tous deux
+     * restaient ouverts sous le tableau, à hauteur fixe : sur un portable, ils
+     * prenaient plus de place que lui.
+     */
+    const aide = q('[data-aide]');
+    aide.open = sellPrefs.aide;
+    aide.addEventListener('toggle', () => {
+      sellPrefs.aide = aide.open;
+      saveStore({ sellAide: aide.open });
+    });
+    /*
+     * La défausse des cartes cochées : deux clics, le second jamais dans la
+     * foulée du premier (`WISH_ARME_MIN_MS`), et l'armement retombe seul au
+     * bout de `ARME_MS` — un compte annoncé ne s'exécute pas longtemps après.
+     */
+    sellUI.selbar.addEventListener('click', (e) => {
+      if (e.target.closest('[data-decocher]')) { sell.aDefausser.clear(); desarmerDefausse(); renderSell(); return; }
+      if (e.target.closest('[data-bilanok]')) { sell.defausse = null; renderSell(); return; }
+      if (!e.target.closest('[data-defausser]')) return;
+      if (!defausseArmeeA) {
+        defausseArmeeA = Date.now();
+        clearTimeout(defausseTimer);
+        defausseTimer = setTimeout(() => { desarmerDefausse(); renderSell(); }, ARME_MS);
+        renderSell();
+        return;
+      }
+      if (Date.now() - defausseArmeeA < WISH_ARME_MIN_MS) return;
+      defausserCochees();
+    });
+    // Le prix de mise en file, retenu à la frappe ; Entrée valide.
+    sellUI.scroll.addEventListener('input', (e) => {
+      if (saisieFile && e.target.matches('[data-fprix]')) saisieFile.prix = e.target.value;
+    });
+    sellUI.scroll.addEventListener('keydown', (e) => {
+      if (saisieFile && e.key === 'Enter' && e.target.matches('[data-fprix]')) { e.preventDefault(); confirmerFile(); }
+    });
+    // Chercher une carte par son nom : le tableau suit la frappe.
+    sellUI.cherche.addEventListener('input', () => {
+      sellPrefs.cherche = sellUI.cherche.value.trim();
+      sellPrefs.affiche = PAGE_REVENTE;
+      renderSell();
+    });
+    sellUI.journal.addEventListener('click', (e) => {
+      if (!e.target.closest('[data-jtoggle]')) return;
+      sellPrefs.journalOuvert = !sellPrefs.journalOuvert;
+      saveStore({ sellJournal: sellPrefs.journalOuvert });
+      renderJournal();
+    });
+    /*
+     * Les quatre filtres se retiennent. Seules les étiquettes masquées
+     * l'étaient : « Ventes mini », « Rareté » et « Sans concurrence »
+     * revenaient à leur valeur par défaut à chaque rechargement de la page.
+     */
     sellUI.min.value = sellPrefs.minSales;
     sellUI.min.addEventListener('change', (e) => {
       sellPrefs.minSales = Math.max(1, +e.target.value || 1);
+      saveStore({ sellMin: sellPrefs.minSales });
       renderSell();
     });
     sellUI.rar.innerHTML = '<option value="">toutes</option>' + RARITIES.map((r) => `<option>${r}</option>`).join('');
-    sellUI.rar.addEventListener('change', (e) => { sellPrefs.rarity = e.target.value; renderSell(); });
+    sellUI.rar.value = sellPrefs.rarity;
+    sellUI.rar.addEventListener('change', (e) => {
+      sellPrefs.rarity = e.target.value;
+      saveStore({ sellRar: sellPrefs.rarity });
+      renderSell();
+    });
     sellUI.free.checked = sellPrefs.onlyFree;
-    sellUI.free.addEventListener('change', (e) => { sellPrefs.onlyFree = e.target.checked; renderSell(); });
+    sellUI.free.addEventListener('change', (e) => {
+      sellPrefs.onlyFree = e.target.checked;
+      saveStore({ sellFree: sellPrefs.onlyFree });
+      renderSell();
+    });
     sellUI.all.addEventListener('click', () => {
       sellPrefs.hideTagged = !sellPrefs.hideTagged;
       saveStore({ sellHideTagged: sellPrefs.hideTagged });
@@ -13335,86 +13871,132 @@
       saveStore({ sellHideTags: sellPrefs.hideTags });
       renderSell();
     });
-    sellUI.scroll.addEventListener('click', (e) => {
-      /*
-       * Sortie de secours du tableau vide : des cartes cotées qu'aucun filtre
-       * ne laisse passer, c'est un cul-de-sac — surtout sur un petit compte,
-       * où « ventes mini 2 » et « sans concurrence » écartent tout. Le bouton
-       * remet les filtres à plat en un clic, plutôt que de laisser chercher
-       * lequel des quatre est en cause.
-       */
-      if (e.target.closest('[data-relache]')) {
-        sellPrefs.minSales = 1;
-        sellPrefs.onlyFree = false;
-        sellPrefs.rarity = '';
-        sellPrefs.hideTagged = false;
-        sellPrefs.hideTags = [];
-        sellUI.min.value = 1;
-        sellUI.free.checked = false;
-        sellUI.rar.value = '';
-        saveStore({ sellHideTagged: false, sellHideTags: [] });
-        renderSell();
-        return;
-      }
-      /*
-       * Mettre en file. La carte rejoint `state.watch` au prix visé et à la
-       * durée minimale ; la boucle de relance la publiera dès qu'un des dix
-       * emplacements se libère.
-       *
-       * La Revente reste ouverte : on en met plusieurs d'affilée, c'est tout
-       * l'intérêt. Seule la ligne change d'air, sur place.
-       *
-       * `enrolWatch` refuse d'elle-même une carte étiquetée — c'est sa
-       * première barrière, et elle vaut aussi bien ici qu'ailleurs.
-       */
-      const f = e.target.closest('[data-file]');
-      if (f) {
-        enrolWatch(f.dataset.file, f.dataset.titre, Number(f.dataset.prix), FILE_MINUTES, 0);
-        saveStore({ watch: state.watch });
-        renderSell();
-        render();
-        return;
-      }
-      /*
-       * « Vendre un double » : le seul geste qui passe outre une étiquette.
-       *
-       * Deux clics, comme les trois autres boutons du panneau qui engagent
-       * quelque chose, et pour la même raison : le premier ARME et le libellé
-       * change, le second exécute. La demi-seconde de `WISH_ARME_MIN_MS`
-       * empêche un double-clic d'armer et de confirmer dans le même geste —
-       * sans elle, l'armement ne serait qu'un décor.
-       *
-       * Ce que le second clic fait exactement : il inscrit la carte en file. Il
-       * ne vend rien tout de suite, et `reconcileWatch` revérifiera qu'il vous
-       * reste bien plusieurs exemplaires avant de publier quoi que ce soit.
-       */
-      const dbl = e.target.closest('[data-double]');
-      if (dbl) {
-        const id = dbl.dataset.double;
-        if (doubleArme !== id) {
-          doubleArme = id;
-          doubleArmeA = Date.now();
-          clearTimeout(doubleArmeTimer);
-          doubleArmeTimer = setTimeout(() => { doubleArme = ''; renderSell(); }, ARME_MS);
-          renderSell();
-          return;
-        }
-        if (Date.now() - doubleArmeA < WISH_ARME_MIN_MS) return;
-        clearTimeout(doubleArmeTimer);
-        doubleArme = '';
-        enrolWatch(id, dbl.dataset.titre, Number(dbl.dataset.prix), FILE_MINUTES, 0, false, true);
-        saveStore({ watch: state.watch });
-        renderSell();
-        render();
-        return;
-      }
-      const b = e.target.closest('[data-sell]');
-      if (!b) return;
-      // L'étiquette a pu être posée depuis le dernier rendu du tableau.
-      const ligne = sell.rows.find((x) => x.t === b.dataset.sell);
-      if (ligne && ligne.tags && ligne.tags.length) return;
-      prepareSale(b.dataset.sell, b.dataset.prix);
-    });
+    sellUI.scroll.addEventListener('click', clicTableau);
+  }
+
+  /**
+   * Les clics dans le tableau de la Revente : le tri par colonne, la suite de
+   * la liste, la sortie de secours du tableau vide, et les trois gestes par
+   * ligne. Sorti de `buildSellUI`, qui ne garde que son gabarit et ses
+   * références — un contrôle de `verifier.js` y veille.
+   */
+  function clicTableau(e) {
+    // Cocher une carte à défausser, ou toutes celles affichées. Toute
+    // modification désarme une défausse déjà armée : son compte a changé.
+    const cb = e.target.closest('[data-sel]');
+    if (cb) {
+      if (sell.aDefausser.has(cb.dataset.sel)) sell.aDefausser.delete(cb.dataset.sel);
+      else sell.aDefausser.add(cb.dataset.sel);
+      desarmerDefausse();
+      if (sell.defausse && sell.defausse.fini) sell.defausse = null;
+      renderSell();
+      return;
+    }
+    if (e.target.closest('[data-selall]')) {
+      const vus = [...sellUI.scroll.querySelectorAll('[data-sel]')].map((x) => x.dataset.sel);
+      const tous = vus.length > 0 && vus.every((id) => sell.aDefausser.has(id));
+      for (const id of vus) { if (tous) sell.aDefausser.delete(id); else sell.aDefausser.add(id); }
+      desarmerDefausse();
+      if (sell.defausse && sell.defausse.fini) sell.defausse = null;
+      renderSell();
+      return;
+    }
+    // Trier par une colonne : une fois, l'autre sens, puis l'ordre par défaut.
+    const th = e.target.closest('[data-tri]');
+    if (th) {
+      const k = th.dataset.tri;
+      const premier = k === 't' ? 1 : -1;   // le nom de A à Z, les nombres du plus grand au plus petit
+      if (sellPrefs.tri !== k) { sellPrefs.tri = k; sellPrefs.sens = premier; }
+      else if (sellPrefs.sens === premier) sellPrefs.sens = -premier;
+      else sellPrefs.tri = '';
+      saveStore({ sellTri: sellPrefs.tri, sellSens: sellPrefs.sens });
+      renderSell();
+      return;
+    }
+    if (e.target.closest('[data-plus]')) {
+      sellPrefs.affiche += PAGE_REVENTE;
+      renderSell();
+      return;
+    }
+    /*
+     * Sortie de secours du tableau vide : des cartes cotées qu'aucun filtre
+     * ne laisse passer, c'est un cul-de-sac — surtout sur un petit compte,
+     * où « ventes mini 2 » et « sans concurrence » écartent tout. Le bouton
+     * remet les filtres à plat en un clic, plutôt que de laisser chercher
+     * lequel des quatre est en cause.
+     */
+    if (e.target.closest('[data-relache]')) {
+      sellPrefs.minSales = 1;
+      sellPrefs.onlyFree = false;
+      sellPrefs.rarity = '';
+      sellPrefs.hideTagged = false;
+      sellPrefs.hideTags = [];
+      sellPrefs.cherche = '';
+      sellUI.min.value = 1;
+      sellUI.free.checked = false;
+      sellUI.rar.value = '';
+      sellUI.cherche.value = '';
+      saveStore({ sellHideTagged: false, sellHideTags: [], sellMin: 1, sellFree: false, sellRar: '' });
+      renderSell();
+      return;
+    }
+    /*
+     * Mettre en file. Le premier clic ouvre, dans la ligne, le choix du prix —
+     * le prix visé proposé, à garder ou à changer. Le second inscrit la carte
+     * dans `state.watch`, à ce prix et à la durée minimale ; la boucle de
+     * relance la publiera dès qu'un des dix emplacements se libère.
+     *
+     * La Revente reste ouverte : on en met plusieurs d'affilée, c'est tout
+     * l'intérêt. Seule la ligne change d'air, sur place.
+     *
+     * `enrolWatch` refuse d'elle-même une carte étiquetée — c'est sa
+     * première barrière, et elle vaut aussi bien ici qu'ailleurs.
+     */
+    const f = e.target.closest('[data-file]');
+    if (f) {
+      saisieFile = { id: f.dataset.file, titre: f.dataset.titre, prix: f.dataset.prix };
+      renderSell();
+      const champ = sellUI.scroll.querySelector('[data-fprix]');
+      if (champ) { champ.focus(); champ.select(); }
+      return;
+    }
+    if (e.target.closest('[data-fok]')) { confirmerFile(); return; }
+    if (e.target.closest('[data-fnon]')) { saisieFile = null; renderSell(); return; }
+    /*
+     * « Vendre un double » : le seul geste qui passe outre une étiquette.
+     *
+     * Deux temps, comme les autres boutons du panneau qui engagent quelque
+     * chose : le premier clic ouvre le choix du prix — il était fixé au prix
+     * visé, signalé à l'usage —, le second inscrit. La demi-seconde de
+     * `WISH_ARME_MIN_MS` reste exigée entre les deux, dans `confirmerFile` :
+     * un double-clic ne doit pas ouvrir et valider dans le même geste.
+     *
+     * Ce que le second temps fait exactement : il inscrit la carte en file,
+     * marquée « voulue ». Il ne vend rien tout de suite, et `reconcileWatch`
+     * revérifiera qu'il vous reste bien plusieurs exemplaires avant de publier
+     * quoi que ce soit.
+     */
+    const dbl = e.target.closest('[data-double]');
+    if (dbl) {
+      saisieFile = { id: dbl.dataset.double, titre: dbl.dataset.titre, prix: dbl.dataset.prix,
+                     double: Number(dbl.dataset.copies) || 2, ouvertA: Date.now() };
+      renderSell();
+      const champ = sellUI.scroll.querySelector('[data-fprix]');
+      if (champ) { champ.focus(); champ.select(); }
+      return;
+    }
+    const b = e.target.closest('[data-sell]');
+    if (!b) return;
+    /*
+     * La ligne a pu changer depuis son dessin. Le garde regardait si la carte
+     * portait UNE étiquette, sur n'importe laquelle de ses copies : un double
+     * dont une copie est gardée affichait « Vendre », et le clic ne faisait
+     * rien, sans un mot. Ce qui compte, c'est qu'il reste une copie LIBRE —
+     * la même règle que celle qui a dessiné le bouton.
+     */
+    const ligne = sell.rows.find((x) => x.t === b.dataset.sell);
+    if (ligne && etatLigne(ligne, new Set(), 0).protegee) return;
+    prepareSale(b.dataset.sell, b.dataset.prix, (ligne && ligne.tags) || []);
   }
 
   /** Ce que tu as demandé, ce que tu as obtenu. La seule référence qui soit tienne. */
@@ -13452,12 +14034,46 @@
      * ont leur propre relevé plutôt que d'être le reste d'une soustraction
      * qu'on laisserait faire au lecteur.
      */
-    const tete = `<div class="jhead"><h3>Tes ventes</h3>`
-      + `<div class="f"><b>${nb(vendues.length)} / ${nb(state.journal.length)}</b><span>vendues</span></div>`
+    /*
+     * Repliée par défaut sur sa ligne de chiffres. La liste des douze dernières
+     * ventes prenait 130 px sous le tableau — plus que le tableau lui-même sur
+     * un portable, où il ne montrait plus que cinq lignes. Le titre l'ouvre et
+     * la referme, et l'état se retient.
+     */
+    const ouvert = sellPrefs.journalOuvert;
+    /*
+     * Le taux de ventes conclues, en clair. C'est lui qui juge les réglages de
+     * prix — le plafond du prix visé a été posé sur ce pari — et il fallait
+     * faire la division de tête.
+     */
+    const taux = state.journal.length ? Math.round((vendues.length / state.journal.length) * 100) : 0;
+    /*
+     * Ce que vous encaissez, rapporté à ce que vous demandiez. Les deux prix
+     * sont notés à chaque vente et rien ne les rapprochait. Une vente close,
+     * pas une espérance : c'est de l'argent arrivé. Muet sous cinq ventes
+     * comparables, où un seul écart ferait le chiffre.
+     */
+    const comparables = vendues.filter((e) => Number(e.ask) > 0 && Number.isFinite(Number(e.final)));
+    const demande = comparables.reduce((s, e) => s + Number(e.ask), 0);
+    const obtenu = comparables.reduce((s, e) => s + Number(e.final), 0);
+    const rapport = comparables.length >= 5 && demande ? Math.round((obtenu / demande) * 100) : null;
+    const tete = `<div class="jhead"><button class="jtoggle" data-jtoggle aria-expanded="${ouvert}"`
+      + ` title="${ouvert ? 'Replier la liste de vos dernières ventes' : 'Voir vos dernières ventes, une par une'}">`
+      + `<i class="chev${ouvert ? ' on' : ''}"></i>Tes ventes</button>`
+      + `<div class="f" title="Sur vos ${nb(state.journal.length)} dernières fins d’enchère : ${taux} % ont trouvé un acheteur.">`
+      + `<b>${nb(vendues.length)} / ${nb(state.journal.length)}</b><span>vendues · ${taux} %</span></div>`
       + `<div class="f"><b>${nb(gains)}</b><span>wb encaissés</span></div>`
+      + (rapport != null
+        ? `<div class="f" title="Sur ${nb(comparables.length)} ventes dont le prix demandé est connu : ${nb(obtenu)} wb encaissés pour ${nb(demande)} demandés.">`
+          + `<b>${rapport} %</b><span>du prix demandé</span></div>`
+        : '')
       + (sans ? `<div class="f due"><b>${nb(sans)}</b><span>sans acheteur</span></div>` : '')
       + '</div>';
 
+    if (!ouvert) {
+      paint(sellUI.journal, tete);
+      return;
+    }
     paint(sellUI.journal, tete + '<div class="list">' + j
       .map((e) => {
         // Trois cas, trois écritures. Le prix demandé ne se répète que
@@ -13676,6 +14292,7 @@
       // Le relevé emprunte la même disposition que la page finie : c'est le
       // même compteur qui monte, il n'a pas à changer de forme en cours de route.
       sellUI.caveat.hidden = true;
+      sellUI.selbar.hidden = true;   // pas de tableau, pas de sélection
       if (!sell.total) {
         paint(sellUI.sum,
           `<div class="f"><b>${sell.read.toLocaleString('fr-FR')}</b><span>cartes lues</span></div>`);
@@ -13773,7 +14390,8 @@
       const filtres = [`ventes mini ${sellPrefs.minSales}`]
         .concat(sellPrefs.onlyFree ? ['sans concurrence'] : [])
         .concat(sellPrefs.rarity ? [`rareté ${sellPrefs.rarity}`] : [])
-        .concat(sellPrefs.hideTagged ? ['étiquetées masquées'] : []);
+        .concat(sellPrefs.hideTagged ? ['étiquetées masquées'] : [])
+        .concat(sellPrefs.cherche ? [`nom « ${sellPrefs.cherche} »`] : []);
       const filtrees = !sell.note && sell.rows.length;
       paint(sellUI.scroll, `<div class="empty">${esc(
         sell.note
@@ -13781,39 +14399,88 @@
             ? `${sell.rows.length} cartes cotées, mais aucune ne passe les filtres (${filtres.join(' · ')}).`
             : 'Aucune carte cotée pour l’instant.')
       )}${filtrees ? '<div style="margin-top:14px"><button class="go" data-relache>Relâcher les filtres</button></div>' : ''}</div>`);
+      renderSelection(rows, mesVentes);   // le bilan d'une défausse qui vient de vider le tableau
       renderJournal();
       return;
     }
 
     renderJournal();
 
+    /*
+     * Le surlignage « à lister maintenant » comptait les premières lignes du
+     * tableau, sans regarder si elles étaient listables. Il désignait donc
+     * des cartes étiquetées — qui n'ont même pas de bouton — et des cartes
+     * dont l'enchère courait déjà. Autant de lignes vertes qui ne menaient à
+     * rien, et autant d'emplacements libres promis à personne.
+     *
+     * On décompte maintenant sur ce qui est réellement à faire — et dans
+     * l'ordre PAR DÉFAUT, quel que soit le tri choisi : trié par nom, le
+     * tableau désignerait sinon les cartes qui commencent par A.
+     */
+    const aListerIds = new Set();
+    let restants = libres || 0;
+    for (const x of rows) {
+      if (restants <= 0) break;
+      if (etatLigne(x, mesVentes, restants).aLister) { aListerIds.add(x.id); restants -= 1; }
+    }
+    const vue = trierVue(rows).slice(0, sellPrefs.affiche);
+
+    /*
+     * Les colonnes se trient au clic : une fois, deux fois pour l'autre sens,
+     * trois fois pour revenir à l'ordre par défaut — cotes solides d'abord,
+     * puis prix visé.
+     */
+    const COLONNES = [['r', 'Rareté', ''], ['t', 'Carte', ''], ['', 'Thème', ''], ['n', 'Ventes', 'num'],
+      ['comp', 'En vente', 'num'], ['q3', 'Prix visé', 'num'], ['med', 'Médiane', 'num'], ['', 'Amplitude', ''], ['', '', '']];
+    const entete = COLONNES.map(([k, nom, cls]) => {
+      if (!k) return `<th${cls ? ` class="${cls}"` : ''}>${nom}</th>`;
+      const actif = sellPrefs.tri === k;
+      return `<th class="${cls ? `${cls} ` : ''}tri${actif ? ' on' : ''}" data-tri="${k}"`
+        + ` title="Trier par ${nom.toLowerCase()}${actif ? ' — cliquer encore inverse, puis revient à l’ordre par défaut' : ''}">`
+        + `${nom}${actif ? (sellPrefs.sens > 0 ? ' ↑' : ' ↓') : ''}</th>`;
+    }).join('');
+
+    renderSelection(rows, mesVentes);
+    /*
+     * La case de l'en-tête coche toutes les lignes AFFICHÉES qu'on peut
+     * défausser — jamais celles hors de la tranche ou écartées par un filtre.
+     */
+    const cochables = vue.filter((x) => {
+      const e = etatLigne(x, mesVentes, 0);
+      return !e.protegee && !e.dejaEnVente && !e.enFile;
+    });
+    const toutCoche = cochables.length > 0 && cochables.every((x) => sell.aDefausser.has(x.id));
+    const caseTout = `<th class="sel">${cochables.length
+      ? `<input type="checkbox" data-selall${toutCoche ? ' checked' : ''} aria-label="Cocher toutes les cartes affichées"`
+        + ' title="Cocher toutes les cartes affichées, pour les défausser">'
+      : ''}</th>`;
+    // La page se redessine seule pendant qu'on tape un prix : le champ garde
+    // la main, et sa valeur vit dans `saisieFile`, pas dans le DOM.
+    const tapait = !!(sellUI.root.activeElement && sellUI.root.activeElement.matches('[data-fprix]'));
     paint(sellUI.scroll,
-      `<table><thead><tr>
-         <th>Rareté</th><th>Carte</th><th>Thème</th><th class="num">Ventes</th>
-         <th class="num">En vente</th><th class="num">Prix visé</th>
-         <th class="num">Médiane</th><th>Amplitude</th><th></th>
-       </tr></thead><tbody>` +
-      /*
-       * Le surlignage « à lister maintenant » comptait les premières lignes du
-       * tableau, sans regarder si elles étaient listables. Il désignait donc
-       * des cartes étiquetées — qui n'ont même pas de bouton — et des cartes
-       * dont l'enchère courait déjà. Autant de lignes vertes qui ne menaient à
-       * rien, et autant d'emplacements libres promis à personne.
-       *
-       * On décompte maintenant sur ce qui est réellement à faire.
-       */
-      (() => { let restants = libres || 0; return rows
+      `<table><thead><tr>${caseTout}${entete}</tr></thead><tbody>` +
+      vue
         .map(
           (x) => {
-            const { protegee, dejaEnVente, enFile, aLister, doubleGarde, copies } =
-              etatLigne(x, mesVentes, restants);
-            if (aLister) restants -= 1;
+            const { protegee, dejaEnVente, enFile, doubleGarde, copies } = etatLigne(x, mesVentes, 0);
+            const aLister = aListerIds.has(x.id);
+            const cochable = !protegee && !dejaEnVente && !enFile;
             return `<tr class="${aLister ? 'next' : ''}">
+            <td class="sel">${cochable
+              ? `<input type="checkbox" data-sel="${esc(x.id)}"${sell.aDefausser.has(x.id) ? ' checked' : ''}`
+                + ` aria-label="Cocher ${esc(x.t)} pour la défausser">`
+              : ''}</td>
             <td class="r"><i style="--c:${RARITY_COLOR[x.r] || '#949DAD'}">${x.r}</i></td>
-            <td class="t">${esc(x.t)} ${x.tags.map((t) => `<span class="tag">${esc(t)}</span>`).join('')}</td>
+            <td class="t">${esc(x.t)}${copies > 1 ? ` <span class="nb" title="Vous en avez ${copies} exemplaires">×${copies}</span>` : ''} ${x.tags.map((t) => `<span class="tag">${esc(t)}</span>`).join('')}</td>
             <td class="th">${
               x.theme
-                ? `${esc(x.theme)}<span class="liq">${Math.round(((sell.themes[x.theme] || {}).rate || 0) * 100)} %</span>`
+                /*
+                 * Le pourcentage ne disait pas ce qu'il mesure. C'est la part
+                 * de vos cartes de ce thème qui ont déjà trouvé acheteur au
+                 * moins une fois sur le marché — un indice de liquidité,
+                 * calculé au dernier relevé complet.
+                 */
+                ? `${esc(x.theme)}<span class="liq" title="${Math.round(((sell.themes[x.theme] || {}).rate || 0) * 100)} % de vos cartes « ${esc(x.theme)} » se sont déjà vendues au moins une fois sur le marché : plus c’est haut, plus le thème se vend facilement.">${Math.round(((sell.themes[x.theme] || {}).rate || 0) * 100)} %</span>`
                 : ''
             }</td>
             <td class="num${x.seule || x.n < THIN_SALES ? ' thin' : ''}"${
@@ -13828,23 +14495,25 @@
             <td class="num">${x.med.toLocaleString('fr-FR')}</td>
             <td class="amp">${x.min.toLocaleString('fr-FR')} – ${x.max.toLocaleString('fr-FR')}</td>
             <td>${protegee
-              ? `<span class="protege" title="${doubleGarde
+              /*
+               * Le seul chemin par lequel une carte gardée part en vente, et il
+               * se fait en deux temps : le prix, puis la validation. Il
+               * n'apparaît que si vous en avez plusieurs — jamais sur le dernier
+               * exemplaire — et que si les relances sont cochées, sans quoi rien
+               * ne publierait.
+               */
+              ? (doubleGarde && prefs.relistUnsold && saisieFile && saisieFile.id === x.id
+                ? editeurPrix(`Vendre un double (${copies})`)
+                : `<span class="protege" title="${doubleGarde
                   ? `Vos ${copies} exemplaires sont gardés. En vendre un ne vous prive de rien : le bouton à côté met UNE copie en file, et vous gardez les autres.`
                   : 'Carte étiquetée : hors de portée de la revente. Retire l’étiquette sur le site pour pouvoir la vendre.'}">protégée</span>`
-                /*
-                 * Le seul chemin par lequel une carte gardée part en vente, et
-                 * il demande deux clics. Il n'apparaît que si vous en avez
-                 * plusieurs — jamais sur le dernier exemplaire — et que si les
-                 * relances sont cochées, sans quoi rien ne publierait.
-                 */
                 + (doubleGarde && prefs.relistUnsold
                   ? ` <button class="go" data-double="${esc(x.id)}" data-titre="${esc(x.t)}"`
-                    + ` data-prix="${x.q3 || x.med}"`
-                    + ` title="Met UNE de vos ${copies} copies en file, au prix visé.`
-                    + ' Les autres restent gardées. Deux clics : le premier demande confirmation.">'
-                    + (doubleArme === x.id ? 'Confirmer ?' : `Vendre un double (${copies})`)
-                    + '</button>'
-                  : '')
+                    + ` data-prix="${x.q3 || x.med}" data-copies="${copies}"`
+                    + ` title="Met UNE de vos ${copies} copies en file, au prix que vous choisissez.`
+                    + ' Les autres restent gardées.">'
+                    + `Vendre un double (${copies})</button>`
+                  : ''))
               : dejaEnVente
                 ? `<span class="encours" title="Votre enchère court déjà sur cette carte. Elle occupe un de vos emplacements de vente ; son échéance est dans l’onglet Marché, volet Ventes.">en vente</span>`
                 : enFile
@@ -13863,18 +14532,30 @@
                    * cochées : sans elles, rien ne publierait jamais et le
                    * bouton promettrait une file qui n'avance pas.
                    */
-                  : `<button class="go" data-sell="${esc(x.t)}" data-prix="${x.q3 || x.med}">Vendre</button>`
+                  : saisieFile && saisieFile.id === x.id && prefs.relistUnsold
+                    // Le prix de mise en file, choisi dans la ligne : le prix visé est proposé.
+                    ? editeurPrix('Mettre en file')
+                    : `<button class="go" data-sell="${esc(x.t)}" data-prix="${x.q3 || x.med}">Vendre</button>`
                     + (prefs.relistUnsold
                       ? ` <button class="go file" data-file="${esc(x.id)}" data-titre="${esc(x.t)}"`
                         + ` data-prix="${x.q3 || x.med}"`
-                        + ' title="Elle partira toute seule dès qu’un emplacement se libère, au prix visé,'
+                        + ' title="Choisissez le prix : elle partira ensuite toute seule dès qu’un emplacement se libère,'
                         + ' pour la durée minimale. Rien ne part tant qu’une place ne s’ouvre pas.">Mettre en file</button>'
                       : '')}</td>
           </tr>`;
           }
         )
-        .join(''); })() +
-      '</tbody></table>');
+        .join('')
+      + (rows.length > vue.length
+        ? `<tr class="plus"><td colspan="10"><button class="go" data-plus>`
+          + `Afficher ${Math.min(PAGE_REVENTE, rows.length - vue.length).toLocaleString('fr-FR')} de plus</button>`
+          + `<span>${vue.length.toLocaleString('fr-FR')} lignes sur ${rows.length.toLocaleString('fr-FR')}</span></td></tr>`
+        : '')
+      + '</tbody></table>');
+    if (tapait) {
+      const champ = sellUI.scroll.querySelector('[data-fprix]');
+      if (champ && sellUI.root.activeElement !== champ) champ.focus();
+    }
   }
 
   // ------------------------------------------------------------------ montage
@@ -14395,6 +15076,8 @@
      * `__wmAuto.cartesDistinctes(await __wmAuto.fetchCollection())`.
      */
     cartesDistinctes, fetchCollection,
+    // La cote d'un lot de cartes tirées : `__wmAuto.priceCards([{ id, t, r, tags }])`.
+    priceCards,
     // Pour éprouver que des conditions LUES n'écrasent pas celles que vous choisissez.
     enrolWatch,
     // Et que la pause se lève quand plus rien n'attend : `__wmAuto.reveillerAuRepos(ids)`.
