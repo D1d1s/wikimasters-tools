@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WikiMasters Tools
 // @namespace    https://www.wiki-masters.com/
-// @version      3.7.2
+// @version      3.7.3
 // @description  Boîte à outils WikiMasters : ouverture automatique des paquets, suivi des tirages, cote des cartes et revente.
 // @match        https://www.wiki-masters.com/*
 // @match        https://wiki-masters.com/*
@@ -41,7 +41,7 @@
    *
    * Il est lu par le garde juste en dessous, d'où sa place en tête.
    */
-  const VERSION = '3.7.2';
+  const VERSION = '3.7.3';
 
   /*
    * Une seule instance par page — et savoir laquelle
@@ -801,11 +801,11 @@
       /*
        * « on tourne sans mémoriser » : c'est vrai, et c'était muet.
        *
-       * Sur les gros comptes — N cartes, ~N lignes de cote — le quota
-       * du navigateur se remplit, et ce qui cesse d'être écrit ne se voit pas :
-       * on constate juste que « ça rescanne à chaque fois », ou qu'un réglage
-       * ne tient pas au rechargement, sans jamais savoir pourquoi. La cause est
-       * ici, et elle tient en une ligne à l'écran.
+       * Sur les grosses collections, le quota du navigateur se remplit, et ce
+       * qui cesse d'être écrit ne se voit pas : on constate juste que « ça
+       * rescanne à chaque fois », ou qu'un réglage ne tient pas au rechargement,
+       * sans jamais savoir pourquoi. La cause est ici, et elle tient en une
+       * ligne à l'écran.
        *
        * Seuil de 1 : le stockage ne se compte pas en tours. Il refuse tout de
        * suite ou jamais, et un deuxième essai ne dirait rien de plus.
@@ -1336,7 +1336,7 @@
   let valueFail = false;  // dernière lecture ratée : le bouton le dit dans son infobulle
 
   /**
-   * Classe la collection entière. La lecture coûte N requêtes (~15 s) : elle
+   * Classe la collection entière. La lecture coûte une requête par page : elle
    * est gardée le temps du `VALUE_TTL`, et refaite au prochain allumage du tri.
    *
    * @returns {Promise<boolean>} faux si la cote manque ou si la lecture échoue.
@@ -1368,7 +1368,7 @@
       });
       /*
        * Un classement partiel ferait DISPARAÎTRE des cartes : le site continue
-       * d'annoncer ses N pages, et les dernières se retrouveraient vides.
+       * d'annoncer toutes ses pages, et les dernières se retrouveraient vides.
        * Mieux vaut ne pas allumer le tri que d'amputer la collection.
        */
       if (!cartes.length || sell.tronque) return false;
@@ -1564,7 +1564,7 @@
     if (!row) return;
     /*
      * L'avertissement doit être là AVANT qu'on se fie au tri, pas après l'avoir
-     * allumé une fois. Une requête, gardée cinq minutes, et seulement s'il y a
+     * allumé une fois. Une requête, gardée deux minutes, et seulement s'il y a
      * une cote dont on puisse dire quelque chose.
      */
     if (sell.rows.length) refreshOwned();
@@ -1597,10 +1597,10 @@
       const pct = valueTotal ? Math.min(99, Math.round((valueRead / valueTotal) * 100)) : 0;
       b.textContent = `Prix ↓ · lecture ${pct} %`;
       /*
-       * Le nombre de pages venait d'une constante — « N pages » — c'est-à-dire
-       * de la collection de qui a écrit la ligne. Sur un compte qui débute, il
-       * y en a quatre ; sur celui-là, elles sont maintenant N. On annonce ce
-       * qu'on lit vraiment, et rien tant qu'on ne le sait pas encore.
+       * Le nombre de pages venait d'une constante, c'est-à-dire de la
+       * collection de qui a écrit la ligne. Sur un compte qui débute, il y en a
+       * quatre. On annonce ce qu'on lit vraiment, et rien tant qu'on ne le sait
+       * pas encore.
        */
       b.title = valueTotal
         ? `Lecture de la collection entière — ${Math.ceil(valueTotal / COLLECTION_PAGE)
@@ -2433,8 +2433,39 @@
     return tot * (have / state.owned.count);
   }
 
+  /*
+   * La taille de la collection, relue pour DEUX lecteurs : le palier de
+   * l'onglet Succès (`state.owned`, raretés et vitesse comprises) et la
+   * couverture de la cote dans la Revente (`sell.owned`).
+   *
+   * La 2.16.0 avait donné à la Revente sa propre `refreshOwned`, déclarée sous
+   * le même nom dans la même fonction. Rien ne le signale : la seconde remplace
+   * la première pour TOUS les appelants, sans une erreur. `state.owned` n'était
+   * donc plus écrit que par la restauration du stockage — l'onglet Succès
+   * annonçait la collection du jour de la mise à jour, et ni les paquets, ni
+   * les ventes, ni la défausse n'y changeaient plus rien. Une seule requête
+   * sert désormais les deux, et `verifier.js` refuse un nom déclaré deux fois.
+   *
+   * Deux gardes, venues de la Revente qui l'appelle à CHAQUE rendu de la page
+   * collection. `ownedEnCours` empêche la rafale : dix rendus dans la même
+   * seconde lanceraient dix requêtes. `ownedTry` horodate la TENTATIVE, pas le
+   * succès : sans lui, un serveur qui refuse laisse les relevés à leur vieille
+   * date, la garde de fraîcheur ne retient plus rien, et l'échec se rejoue à
+   * chaque rendu.
+   *
+   * La fraîcheur est celle du plus vieux des deux relevés : `sell.owned` n'est
+   * pas mémorisé, et `state.owned` restauré du stockage paraîtrait frais au
+   * rechargement alors que la Revente n'a encore rien.
+   */
+  let ownedEnCours = false;
+  let ownedTry = 0;
+
   async function refreshOwned() {
-    if (Date.now() - state.owned.at < OWNED_EVERY_MS) return;
+    if (ownedEnCours) return;
+    if (Date.now() - Math.min(state.owned.at, sell.owned.at) < OWNED_EVERY_MS) return;
+    if (Date.now() - ownedTry < OWNED_EVERY_MS) return;
+    ownedEnCours = true;
+    ownedTry = Date.now();
     try {
       const d = await api('/api/my-collection/stats');
       const n = d.data && d.data.total;
@@ -2444,16 +2475,21 @@
       state.owned = { count: n, rc, at };
       if (state.running) trackOwned(n, rc, at);
       saveStore({ owned: state.owned, ownedTrack: state.ownedTrack });
+      sell.owned = { n, at };
       render();
+      renderSell();
+      paintValueSort();
     } catch (_) {
-      /* réseau : on retentera au prochain cycle */
+      /* réseau : on retentera au prochain cycle, et la couverture se tait */
+    } finally {
+      ownedEnCours = false;
     }
   }
 
   /*
    * Les succès, relevés en entier.
    *
-   * On ne lisait que « N / 51 débloqués » — un ratio, donc rien d'actionnable.
+   * On ne lisait que le nombre de débloqués — un ratio, donc rien d'actionnable.
    * Or la page porte trois choses qui manquaient au panneau : ce que chaque
    * succès demande, ce qu'il paie, et **s'il attend d'être réclamé**. Les
    * récompenses ne se créditent pas seules : un succès débloqué garde un bouton
@@ -2639,10 +2675,11 @@
    * Les paliers encore à atteindre, **du plus proche au plus lointain**, chacun
    * avec ce qu'il reste et le temps qu'il demande au rythme courant.
    *
-   * Le classement se fait sur le temps, pas sur l'écart : N cartes à
-   * 100 cartes/h arrivent en sept heures, N Légendaires à 0,2/h en quatre
-   * jours. Trier sur « N < N » mettrait le second en tête. Un palier sans
-   * estimation passe derrière ceux qui en ont, départagé par sa part restante.
+   * Le classement se fait sur le temps, pas sur l'écart. Exemple inventé :
+   * 600 cartes à 100 cartes/h arrivent en six heures, 10 Légendaires à 0,1/h
+   * en quatre jours. Trier sur « 10 < 600 » mettrait le second en tête. Un
+   * palier sans estimation passe derrière ceux qui en ont, départagé par sa
+   * part restante.
    */
   function pendingGoals() {
     if (!state.owned.count) return [];
@@ -8694,7 +8731,7 @@
    * Le palier le plus proche en détail, puis les suivants en une ligne chacun.
    *
    * N'afficher que le premier revenait à cacher les récompenses : « 10 000
-   * cartes » paie 500 et arrive en sept heures, « 40 Légendaires » paie 1 500.
+   * cartes » paie 500 et arrive vite, « 40 Légendaires » paie 1 500.
    * Savoir que le second existe et ce qu'il coûte est précisément ce qui
    * permet d'arbitrer.
    */
@@ -8729,8 +8766,8 @@
      */
     /*
      * « à », et pas une espace. Les deux nombres se touchaient — « ~4,2 j
-     * 0,1/h » — et se lisaient comme une seule valeur, alors que le second
-     * est justement là pour qu'on puisse contester le premier.
+     * 0,1/h », par exemple — et se lisaient comme une seule valeur, alors
+     * que le second est justement là pour qu'on puisse contester le premier.
      */
     const eta = top.eta != null
       ? ` · ~${fmtSpan(top.eta)} <span class="rate">à ${fmtRate(top.rate)}/h</span>`
@@ -8757,7 +8794,7 @@
    * Les succès : la progression, et surtout ce qui attend d'être réclamé.
    *
    * Le relevé date de ton dernier passage sur la page — on affiche donc son
-   * âge. Un « N / 51 » sans fraîcheur ne dit pas s'il vaut encore.
+   * âge. Un ratio de succès sans fraîcheur ne dit pas s'il vaut encore.
    */
   function renderAchievements() {
     const a = state.achievements;
@@ -8840,7 +8877,7 @@
    * La phrase entière reste en infobulle.
    *
    * Mais `fmtSpan` rend « 24 h 25 » — la forme exacte d'une heure de la
-   * journée. Posé en coin, à droite de « Succès N / 51 », ça se lisait comme
+   * journée. Posé en coin, à droite du ratio des succès, ça se lisait comme
    * une horloge et non comme une ancienneté ; l'infobulle disait juste, encore
    * fallait-il survoler un chiffre qu'on croyait avoir compris.
    *
@@ -11821,11 +11858,11 @@
    * La pagination glisse pendant la lecture, et c'est la boucle qui la fait
    * glisser.
    *
-   * N pages, une vingtaine de secondes, et pendant ce temps des paquets
-   * s'ouvrent : cinq cartes de plus à chaque fois, insérées dans un ordre trié
-   * par rareté, donc n'importe où. Une insertion pousse tout ce qui suit d'un
-   * cran — une carte qui était en fin de page passe en tête de la suivante, et
-   * on la lit DEUX FOIS.
+   * Des centaines de pages, de longues secondes, et pendant ce temps des
+   * paquets s'ouvrent : cinq cartes de plus à chaque fois, insérées dans un
+   * ordre trié par rareté, donc n'importe où. Une insertion pousse tout ce qui
+   * suit d'un cran — une carte qui était en fin de page passe en tête de la
+   * suivante, et on la lit DEUX FOIS.
    *
    * Rien n'est sauté pour autant : sauter demanderait un déplacement vers
    * l'arrière, donc une suppression. Le défaut est unilatéral, et dédoublonner
@@ -11977,8 +12014,8 @@
     renderSell();
 
     /*
-     * La cotation ne peut commencer qu'une fois la collection lue — N pages,
-     * plus longtemps encore quand le serveur freine. Sans compteur pendant ce
+     * La cotation ne peut commencer qu'une fois la collection lue — des
+     * centaines de pages, plus longtemps encore quand le serveur freine. Sans compteur pendant ce
      * temps-là, le panneau affichait « cotation 0 / … » figé : impossible de
      * distinguer une lecture en cours d'un relevé en panne. On montre donc les
      * cartes lues au fil de l'eau.
@@ -12046,7 +12083,7 @@
     /*
      * La BASE d'abord. La table `auctions` porte les mêmes ventes closes que
      * l'API du marché, mais elle se lit avec la session du joueur : ni
-     * abonnement, ni N requêtes. C'est le seul chemin qui coter un
+     * abonnement, ni une requête par carte. C'est le seul chemin qui coter un
      * compte sans PRO, et sur un compte PRO il remplace des minutes de scan par
      * quelques secondes.
      */
@@ -12069,7 +12106,7 @@
     }
 
     /*
-     * UNE requête avant les N. Le marché d'une carte n'a pas la même
+     * UNE requête avant les milliers. Le marché d'une carte n'a pas la même
      * forme pour tout le monde : un compte PRO reçoit l'historique complet, un
      * compte gratuit voit la moyenne sur la page de vente — donc une charge
      * réduite — et un compte freiné se fait refuser. Ces trois cas rendaient le
@@ -12116,7 +12153,7 @@
           /*
            * Un refus ne ressemblait à rien : la réponse d'erreur se parse en
            * JSON, `sales` y est absent, et la carte sortait « sans historique »
-           * exactement comme une carte jamais vendue. N refus de
+           * exactement comme une carte jamais vendue. Des milliers de refus de
            * suite donnaient donc un tableau vide et aucun message — le relevé
            * « chargeait les cartes puis ne rendait rien ». On retient le statut.
            */
@@ -12127,7 +12164,7 @@
             /*
              * Un refus qui se répète n'est pas un accident de carte : c'est le
              * compte ou le serveur qui dit non. Continuer, c'était envoyer
-             * N requêtes refusées — sans rien apprendre de plus, et
+             * des milliers de requêtes refusées — sans rien apprendre de plus, et
              * en s'enfonçant si c'est une garde anti-automatisation qui répond.
              * On s'arrête au bout de vingt-cinq, tant qu'aucune n'a abouti.
              */
@@ -12580,7 +12617,7 @@
    * mêmes : ce sont les ventes closes du jeu.
    *
    * Le gain est double. Sans abonnement, le relevé devient possible ; avec, il
-   * passe de N requêtes à quelques centaines.
+   * passe d'une requête par carte à une par lot de cinquante.
    *
    * `limit` borne chaque réponse : un lot qui la touche est peut-être tronqué,
    * et une moyenne calculée sur une moitié de ventes serait fausse sans le
@@ -12899,52 +12936,16 @@
   }
 
   /*
-   * La taille de la collection, en UNE requête.
-   *
-   * `/api/my-collection/stats` porte `total` — c'est déjà lui que le tri par
-   * prix interroge pour afficher une progression honnête. Le relire ici coûte
-   * un aller-retour là où compter les cartes en coûte N, et c'est le
-   * seul chiffre qui manquait pour dire de quelle part de la collection la cote
-   * rend compte.
+   * La taille de la collection vient de `refreshOwned`, avec les objectifs :
+   * `/api/my-collection/stats` porte `total`, et la même requête sert le palier
+   * de l'onglet Succès. C'est le seul chiffre qui manquait pour dire de quelle
+   * part de la collection la cote rend compte — un aller-retour, là où compter
+   * les cartes en coûte un par page.
    *
    * Échec silencieux et assumé : sans ce nombre, la couverture ne s'affiche
    * pas. Une Revente qui refuserait de s'ouvrir parce qu'un compteur d'appoint
    * n'a pas répondu serait une régression pour une information de confort.
    */
-  const COUNT_TTL = 300000;   // 5 min : la collection ne bouge que par paquet ouvert
-
-  /*
-   * Deux gardes, et aucune n'est du zèle : ce relevé est appelé depuis
-   * `injectValueSort`, qui repasse à CHAQUE rendu de la page collection.
-   *
-   * `ownedEnCours` empêche la rafale — sans lui, dix rendus dans la même
-   * seconde lancent dix requêtes. `ownedTry` horodate la TENTATIVE, pas le
-   * succès : sans lui, un serveur qui refuse laisse `owned.at` à zéro, la garde
-   * de fraîcheur ne retient plus rien, et l'échec se rejoue à chaque rendu.
-   * C'est le même piège que le compteur figé de la Revente, du côté réseau.
-   */
-  let ownedEnCours = false;
-  let ownedTry = 0;
-
-  async function refreshOwned() {
-    if (ownedEnCours) return;
-    if (Date.now() - sell.owned.at < COUNT_TTL) return;
-    if (Date.now() - ownedTry < COUNT_TTL) return;
-    ownedEnCours = true;
-    ownedTry = Date.now();
-    try {
-      const { data } = await api('/api/my-collection/stats');
-      const n = data && data.total;
-      if (!Number.isFinite(n) || n <= 0) return;
-      sell.owned = { n, at: Date.now() };
-      renderSell();
-      paintValueSort();
-    } catch (_) {
-      /* réseau : on garde le compte précédent, et la couverture se tait */
-    } finally {
-      ownedEnCours = false;
-    }
-  }
 
   /**
    * Ce que la cote couvre, ou `null` quand on ne peut rien en dire.
