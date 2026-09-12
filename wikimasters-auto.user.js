@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WikiMasters Tools
 // @namespace    https://www.wiki-masters.com/
-// @version      3.8.0
+// @version      3.8.1
 // @description  Boîte à outils WikiMasters : ouverture automatique des paquets, suivi des tirages, cote des cartes et revente.
 // @match        https://www.wiki-masters.com/*
 // @match        https://wiki-masters.com/*
@@ -41,7 +41,7 @@
    *
    * Il est lu par le garde juste en dessous, d'où sa place en tête.
    */
-  const VERSION = '3.8.0';
+  const VERSION = '3.8.1';
 
   /*
    * Une seule instance par page — et savoir laquelle
@@ -957,7 +957,9 @@
     // le nombre de tirages observés qui lui donne sa valeur, pas leur continuité.
     if (Number.isFinite(s.pityMax)) state.pityMax = s.pityMax;
     if (typeof s.logRarity === 'string' || s.logRarity === null) prefs.logRarity = s.logRarity;
-    if (['paquets', 'marche', 'guilde', 'reglages'].includes(s.tab)) prefs.tab = s.tab;
+    // « succes » manquait depuis que les succès ont leur onglet : on y
+    // revenait sur Paquets à chaque rechargement.
+    if (['paquets', 'succes', 'marche', 'guilde', 'reglages'].includes(s.tab)) prefs.tab = s.tab;
     if (s.classement && Array.isArray(s.classement.lignes) && Number.isFinite(s.classement.at)) {
       state.classement = s.classement;
     }
@@ -1007,7 +1009,15 @@
          * jour, plutôt que l'éternité.
          */
         if (w.paused && !Number.isFinite(w.pausedAt)) w.pausedAt = Date.now();
-        if (w.paused && Date.now() - w.pausedAt > WATCH_PAUSE_TTL) continue;
+        /*
+         * L'oubli se compte depuis le DÉBUT de la série de pauses, pas depuis
+         * la dernière : la pause se lève seule toutes les trente minutes et se
+         * repose aussitôt, si bien que `pausedAt` n'avait jamais plus d'une
+         * demi-heure. Voir `perduDepuis` dans `reconcileWatch`. Une pause
+         * écrite avant elle commence sa série à sa propre date.
+         */
+        if (w.paused && !w.perduDepuis) w.perduDepuis = w.pausedAt;
+        if (w.perduDepuis && Date.now() - w.perduDepuis > WATCH_PAUSE_TTL) continue;
         state.watch[card] = w;
       }
     }
@@ -1089,6 +1099,15 @@
 
   // ---------------------------------------------------------------- utilitaires
 
+  /*
+   * L'attente de la BOUCLE D'OUVERTURE, et d'elle seule : elle se déclare dans
+   * `state.abort`, que Stop appelle. Il n'y a qu'une place, et la dernière
+   * attente venue la prend. La réclamation des succès, « Tout souhaiter » et
+   * « Tout repasser en » s'en servaient aussi : un Stop pendant l'une d'elles
+   * coupait CETTE opération au lieu de la boucle — « Tout repasser en »
+   * s'arrêtait après une annulation sur trois, sans compte rendu, sur une
+   * erreur que personne ne rattrapait. Tout le reste attend avec `delay`.
+   */
   const sleep = (ms) =>
     new Promise((resolve, reject) => {
       const id = setTimeout(resolve, ms);
@@ -1253,7 +1272,9 @@
   }
 
   function paintNewFilter(btn, count) {
-    btn.textContent = count ? `Nouveaux · ${count}` : 'Nouveaux';
+    const texte = count ? `Nouveaux · ${count}` : 'Nouveaux';
+    // Écrit seulement s'il change : voir « Pas d'écho » dans `watchCollection`.
+    if (btn.textContent !== texte) btn.textContent = texte;
     btn.disabled = !count;
     btn.title = count
       ? 'N’afficher que les cartes tirées pendant la session'
@@ -1590,6 +1611,7 @@
   function paintValueSort(btn) {
     const b = btn || document.querySelector('[data-wm-value-sort]');
     if (!b) return;
+    let texte;
 
     /*
      * « Prix », et non « Valeur ».
@@ -1601,7 +1623,7 @@
      */
     if (valueBusy) {
       const pct = valueTotal ? Math.min(99, Math.round((valueRead / valueTotal) * 100)) : 0;
-      b.textContent = `Prix ↓ · lecture ${pct} %`;
+      texte = `Prix ↓ · lecture ${pct} %`;
       /*
        * Le nombre de pages venait d'une constante, c'est-à-dire de la
        * collection de qui a écrit la ligne. Sur un compte qui débute, il y en a
@@ -1614,7 +1636,7 @@
         : 'Lecture de la collection entière — quelques secondes';
     } else if (sell.scanning) {
       const pct = sell.total ? Math.min(99, Math.round((sell.done / sell.total) * 100)) : 0;
-      b.textContent = `Prix ↓ · cote ${pct} %`;
+      texte = `Prix ↓ · cote ${pct} %`;
       b.title = 'Relevé des prix en cours dans la Revente — le tri s’allumera dès qu’il sera fini';
     } else if (sell.refusVentes === 403 && !sell.rows.length) {
       /*
@@ -1623,7 +1645,7 @@
        * n'y a alors aucun prix à classer, et proposer un relevé qui échouera
        * encore serait se moquer du monde.
        */
-      b.textContent = 'Prix ↓ · réservé aux comptes PRO';
+      texte = 'Prix ↓ · réservé aux comptes PRO';
       b.title = 'Le site réserve les prix aux comptes PRO. Cochez « Accès direct à '
         + 'la base » dans les réglages : les prix redeviennent lisibles sans abonnement, '
         + 'et ce tri avec eux.';
@@ -1635,12 +1657,12 @@
        * sans quoi il ouvre la Revente sans qu'on comprenne pourquoi : un
        * libellé identique à l'état qui trie promettait un tri, pas un relevé.
        */
-      b.textContent = 'Prix ↓ · à relever';
+      texte = 'Prix ↓ · à relever';
       b.title = 'Le classement a besoin du prix de vos cartes, et rien n’a encore été relevé sur '
         + 'ce navigateur. Le clic ouvre la Revente, qui lance le relevé — plusieurs minutes. '
         + 'Le tri s’allume ensuite.';
     } else {
-      b.textContent = 'Prix ↓';
+      texte = 'Prix ↓';
       /*
        * « les cartes jamais vendues passent derrière » était vrai et
        * insuffisant : il laissait croire que le reste, lui, est classé. Quand
@@ -1669,6 +1691,8 @@
           // « la plus chère en tête Attention : la cote… », relevé à l'écran.
           : 'Trier toute la collection par moyenne des ventes, la plus chère en tête.' + part;
     }
+    // Écrit seulement s'il change : voir « Pas d'écho » dans `watchCollection`.
+    if (b.textContent !== texte) b.textContent = texte;
 
     b.style.cssText = valueBusy || sell.scanning
       ? `color:${VALUE_COLOR};background:transparent;opacity:.6;cursor:default`
@@ -2266,7 +2290,8 @@
       : `Aucune vente conclue pour cette carte en ${nom} : il n’y a pas de prix courant, `
         + 'et la mise de départ ne se compare à rien.';
 
-    boite.innerHTML = `
+    // `paint` et pas `innerHTML` : voir « Pas d'écho » dans `watchCollection`.
+    paint(boite, `
       <div class="flex items-center justify-between">
         <span class="text-xs uppercase tracking-wide text-[var(--color-foreground)]/50"
           >Prix moyen${maigre ? ' ⚠' : ''}</span>
@@ -2275,7 +2300,7 @@
           >${moy == null ? '' : wbIcon('class="size-6"')}${moy == null ? '—' : esc(fmtWb(moy))}</span>
       </div>
       <div class="text-sm text-[var(--color-foreground)]/50"
-        ><span style="color:${RARITY_COLOR[rarete] || VALUE_COLOR}">◆</span> ${detail}</div>`;
+        ><span style="color:${RARITY_COLOR[rarete] || VALUE_COLOR}">◆</span> ${detail}</div>`);
   }
 
   function refreshCollection() {
@@ -2300,6 +2325,15 @@
    * Le guetteur s'installe quelle que soit la page : on arrive sur la
    * collection par navigation SPA, sans rechargement, donc sans nouvelle
    * exécution du script. C'est `refreshCollection` qui filtre sur l'URL.
+   *
+   * Pas d'écho. Le guetteur voit TOUT changement de la page, les nôtres
+   * compris : chaque passage qui réécrit un bouton, même à l'identique,
+   * relance donc le passage suivant 300 ms plus tard. Et `textContent` compte
+   * toujours comme un changement — il remplace le nœud de texte, même par le
+   * même texte. « Prix ↓ » sur la collection, « Tout souhaiter » sur le
+   * catalogue et l'encart de prix d'une enchère se réécrivaient ainsi trois
+   * fois par seconde, sans fin, page immobile. Tout ce que ce passage écrit
+   * dans la page ne l'écrit donc que si le texte change.
    */
   function watchCollection() {
     let pending = null;
@@ -2669,7 +2703,7 @@
         const btn = claimButton(box);
         faits.add(btn);
         btn.click();
-        await sleep(CLAIM_GAP_MS);
+        await delay(CLAIM_GAP_MS);
       }
     } finally {
       claiming = false;
@@ -3757,7 +3791,48 @@
    * le Marché par navigation SPA, sans réexécution du script, et l'option peut
    * être cochée à tout moment. C'est le tick qui décide s'il y a lieu d'agir.
    */
-  let lastReload = 0;
+
+  /*
+   * L'heure du dernier rechargement doit SURVIVRE au rechargement : c'est lui
+   * qu'elle espace. Elle vivait dans une variable, remise à zéro par le
+   * rechargement même qu'elle venait de dater — la garde des cinq minutes ne
+   * tenait donc jamais. Un onglet caché se rechargeait toutes les 75 s, jour
+   * et nuit : une minute d'absence, plus un tour de guetteur. Éprouvé au banc,
+   * deux chargements de suite : 75 s, puis 75 s encore.
+   *
+   * `sessionStorage` plutôt que le stockage principal : un rechargement le
+   * garde, et il est propre à l'onglet — celui qui vient de se recharger ne
+   * retient pas les autres.
+   */
+  const RECHARGE_KEY = 'wm-auto-recharge';
+  let lastReload = 0;   // repli, si le navigateur refuse `sessionStorage`
+
+  function dernierRechargement() {
+    try {
+      const at = Number(sessionStorage.getItem(RECHARGE_KEY));
+      // Une heure venue du futur — horloge reculée — ne bloque rien.
+      if (Number.isFinite(at) && at > 0 && at <= Date.now()) return Math.max(at, lastReload);
+    } catch (_) {
+      /* stockage refusé : la variable tient l'onglet tant qu'il vit */
+    }
+    return lastReload;
+  }
+
+  function noterRechargement() {
+    lastReload = Date.now();
+    try {
+      sessionStorage.setItem(RECHARGE_KEY, String(lastReload));
+    } catch (_) {
+      /* voir `dernierRechargement` */
+    }
+  }
+
+  /*
+   * La page du Marché elle-même, pas la fiche d'une enchère : c'est là que le
+   * site affiche « Mes enchères » et « Mes ventes », les deux listes que le
+   * guetteur relit à l'écran.
+   */
+  const surLaListeDuMarche = () => /^\/marketplace\/?$/.test(location.pathname);
 
   /*
    * Un aller-retour rapide vers un autre onglet ne doit pas déclencher un
@@ -3872,18 +3947,25 @@
      * condition portait sur la date du dernier relevé, qui vaut zéro tant
      * qu'aucun scan n'a réussi : l'onglet se serait rechargé sans fin.
      *
+     * Et SEULEMENT le Marché. La condition ne regardait pas la page : il
+     * suffisait d'avoir ouvert « Mes enchères » une fois pour que l'onglet des
+     * paquets, laissé derrière, se recharge lui aussi. Ailleurs, rien ne se lit
+     * à l'écran après le chargement, et recharger ne faisait que couper ce qui
+     * tournait — un relevé de cote, « Tout repasser en », une défausse.
+     *
      * Jamais pendant un envoi de demandes d'ami : il dure une demi-heure au
      * rythme d'une personne, et un rechargement l'arrêterait au milieu.
      */
     const dernier = state.bids.at;
     if (
       !amisEnvoiEnCours() &&
+      surLaListeDuMarche() &&
       awayLongEnough() &&
-      Date.now() - lastReload > BIDS.everyMs &&
+      Date.now() - dernierRechargement() > BIDS.everyMs &&
       dernier &&
       Date.now() - dernier > BIDS.everyMs
     ) {
-      lastReload = Date.now();
+      noterRechargement();
       location.reload();
     }
   }
@@ -4787,9 +4869,22 @@
   const HUMAN_WAIT_MS = 3600000;   // on veille une heure : au-delà, l'onglet est oublié
   const HUMAN_NAG_MS = 30000;      // rappel sonore tant que la case attend
 
+  /*
+   * On ne repart que sur une case VUE puis disparue.
+   *
+   * La reprise se déclenchait dès que la page ne montrait aucune case. Or la
+   * demande de vérification peut venir du SERVEUR, dans la réponse d'une
+   * ouverture, sans que la page affiche quoi que ce soit : « pas de case » se
+   * lisait alors « vérification passée », et la boucle redemandait un paquet
+   * deux secondes plus tard — pour recevoir la même demande. Éprouvé au banc :
+   * trente et une ouvertures par minute, sans fin, à la porte même qui
+   * soupçonne un robot. C'est le contraire exact de ce que promet l'en-tête
+   * de ce fichier.
+   */
   function awaitHuman() {
     const depuis = Date.now();
     let rappel = depuis;
+    let vue = false;   // la case a-t-elle paru dans la page ?
     const id = setInterval(() => {
       if (state.running) {          // relancé à la main entre-temps
         state.blockedAt = 0;
@@ -4800,7 +4895,9 @@
         return clearInterval(id);
       }
 
-      if (humanPromptPresent()) {
+      const presente = humanPromptPresent();
+      if (presente) vue = true;
+      if (presente || !vue) {
         /*
          * Un seul bip au moment du blocage ne sert à rien si tu n'es pas devant
          * l'écran : c'est précisément l'absence qui coûte la réserve. On répète
@@ -4812,7 +4909,12 @@
           if (CFG.alertSound) beep();
           notifyBid('Vérification humaine', humanCost());
         }
-        setStatus(`Vérification humaine — ${humanCost()}`, true);
+        // Demandée par le serveur, jamais montrée ici : on ne devine pas quand
+        // elle est faite, c'est Start qui le dira.
+        setStatus(presente
+          ? `Vérification humaine — ${humanCost()}`
+          : 'Vérification demandée par le site, sans case dans cette page : faites-la sur le '
+            + `site (au besoin en rechargeant), puis cliquez Start — ${humanCost()}`, true);
         return;
       }
 
@@ -4826,17 +4928,28 @@
     }, 2000);
   }
 
+  /*
+   * Un seul clignotement à la fois. Un second, lancé pendant le premier,
+   * lisait « ⚠️ ACTION REQUISE » comme le titre à rendre — une fois sur deux —
+   * et le reposait en dernier au retour sur l'onglet : le titre restait sur
+   * l'alerte. Éprouvé au banc avec deux vérifications de suite.
+   */
   function flashTitle() {
+    if (flashTitle.actif) return;
+    flashTitle.actif = true;
     const original = document.title;
     let on = false;
+    let fini = false;
     const id = setInterval(() => {
       document.title = (on = !on) ? '⚠️ ACTION REQUISE' : original;
     }, 700);
     const restore = () => {
-      if (document.visibilityState !== 'visible') return;
+      if (fini || document.visibilityState !== 'visible') return;
+      fini = true;
       clearInterval(id);
       document.title = original;
       document.removeEventListener('visibilitychange', restore);
+      flashTitle.actif = false;
     };
     document.addEventListener('visibilitychange', restore);
     setTimeout(restore, 120000);
@@ -7248,6 +7361,8 @@
           // les absences, sinon le premier non de l'API remettrait aussitôt
           // en pause ce qu'on vient de relancer à la main.
           w.refus = 0;
+          // Et l'oubli à sept jours repart : c'est vous qui dites qu'elle est là.
+          w.perduDepuis = 0;
           saveStore({ watch: state.watch });
         }
         return render();
@@ -7735,14 +7850,32 @@
    * minute. On ne touche donc au DOM que si le balisage a bougé, et on rend
    * alors sa position à l'ascenseur : celui du bloc comme ceux des listes
    * qu'il contient.
+   *
+   * « Le balisage a bougé » se juge sur le DERNIER GABARIT ÉCRIT, pas sur
+   * `innerHTML`. La comparaison se faisait avec `el.innerHTML`, c'est-à-dire
+   * avec ce que le navigateur RE-SÉRIALISE — et il ne rend jamais une balise
+   * écrite sur deux lignes telle qu'on l'a écrite : il remet un seul espace
+   * entre les attributs. Le journal des tirages, le volet Relances, les succès
+   * en ont : pour eux la garde échouait à tous les coups, et le bloc était
+   * refait en entier à chaque rendu. Mesuré dans Chrome, journal plein
+   * (1 000 tirages) : 80 à 97 ms par rendu, deux rendus par seconde pendant
+   * l'attente d'un paquet — un cinquième du fil que le jeu partage avec nous.
+   * Et le champ Prix du volet Relances était détruit chaque seconde, saisie
+   * comprise.
+   *
+   * Personne d'autre n'écrit dans ces blocs : le gabarit retenu reste donc
+   * vrai jusqu'au prochain `paint`.
    */
+  const peint = new WeakMap();   // élément → dernier gabarit écrit
+
   function paint(el, html) {
-    if (!el || el.innerHTML === html) return;
+    if (!el || peint.get(el) === html) return;
     const dedans = [...el.querySelectorAll('ul, table, .scroll')]
       .map((n, i) => [i, n.scrollTop])
       .filter(([, y]) => y);
     const haut = el.scrollTop;
     el.innerHTML = html;
+    peint.set(el, html);
     el.scrollTop = haut;
     if (dedans.length) {
       const apres = el.querySelectorAll('ul, table, .scroll');
@@ -8351,10 +8484,10 @@
     const lignes = t.lignes || [];
 
     if (!lignes.length) {
-      ui.troc.innerHTML = '<div class="h">Échanges</div>'
+      paint(ui.troc, '<div class="h">Échanges</div>'
         + '<div>Aucun de vos souhaits n’est détenu par un ami pour l’instant. '
         + 'La liste est relue avec vos souhaits, toutes les quinze minutes. Plus vous '
-        + 'avez d’amis, plus elle trouve : le bloc suivant ajoute les premiers du classement.</div>';
+        + 'avez d’amis, plus elle trouve : le bloc suivant ajoute les premiers du classement.</div>');
       return;
     }
 
@@ -8388,11 +8521,16 @@
       pied.push(`${t.enAttente} offre${t.enAttente > 1 ? 's' : ''} déjà en cours, écartée${t.enAttente > 1 ? 's' : ''}`);
     }
 
-    ui.troc.innerHTML =
+    /*
+     * `paint`, pas `innerHTML` : l'onglet Amis se redessine chaque seconde, et
+     * ce bloc était refait à chaque fois — un clic dont l'appui et le relâché
+     * encadrent un rendu visent deux boutons différents, et peuvent se perdre.
+     */
+    paint(ui.troc,
       `<div class="h">Échanges · <b>${lignes.length}</b> souhait${lignes.length > 1 ? 's' : ''}`
       + ` chez <b>${t.amis}</b> ami${t.amis > 1 ? 's' : ''}</div>`
       + rangs
-      + (pied.length ? `<div class="plus">${esc(pied.join(' · '))}</div>` : '');
+      + (pied.length ? `<div class="plus">${esc(pied.join(' · '))}</div>` : ''));
   }
 
   /*
@@ -9324,7 +9462,7 @@
     wishLitPourNous = true;   // nos pages ne sont pas ce que la page affiche
     try {
       for (let page = 0; page < WISH_Q_PAGES; page++) {
-        if (page) await sleep(WISH_PAGE_GAP);
+        if (page) await delay(WISH_PAGE_GAP);
         /*
          * `wishlist=1` se combine avec `q` côté serveur — vérifié. Un retrait
          * lit donc ta liste, pas le catalogue : « Beckham » y rend une carte
@@ -9684,7 +9822,8 @@
         + 's’affiche avant toute écriture.';
     }
 
-    b.textContent = texte;
+    // Écrit seulement s'il change : voir « Pas d'écho » dans `watchCollection`.
+    if (b.textContent !== texte) b.textContent = texte;
     b.title = titre;
     b.disabled = !actif;
     b.style.cssText = !actif
@@ -10106,6 +10245,16 @@
     // Le volet est masqué par `renderMarket` : inutile de peindre ce qu'on ne
     // regarde pas, et le battement à la seconde passe alors sur trois tests.
     if (prefs.mktSub !== 'rel' || !ui.relist || ui.relist.hidden) return;
+    /*
+     * Pas sous les doigts. Le volet porte des comptes à rebours — la prochaine
+     * relance, la fin de chaque vente — qui changent chaque seconde : son
+     * gabarit bouge donc même quand rien d'autre ne bouge, et le repeindre
+     * pendant qu'on tape un prix détruisait le champ avec la saisie. Tant que
+     * le champ Prix a la main, le volet attend ; il se remet à jour dès qu'on
+     * le quitte.
+     */
+    const actif = ui.root && ui.root.activeElement;
+    if (actif && ui.relist.contains(actif) && actif.matches('[data-fprix]')) return;
     const log = state.relistLog || [];
     const suivies = Object.entries(state.watch || {});
 
@@ -10659,7 +10808,7 @@
        * intervalle — 7 à 12 s, tiré au hasard comme elles.
        */
       const [bas, haut] = CFG.relistGapMs;
-      await sleep(bas + Math.random() * (haut - bas));
+      await delay(bas + Math.random() * (haut - bas));
     }
 
     saveStore({ watch: state.watch, relistLog: state.relistLog, lastListing: state.lastListing });
@@ -11081,7 +11230,7 @@
   }
 
   async function reconcileWatch() {
-    const ids = Object.keys(state.watch);
+    let ids = Object.keys(state.watch);
     if (!prefs.relistUnsold || !ids.length || reconcileWatch.busy) return;
     reconcileWatch.busy = true;
     try {
@@ -11126,6 +11275,8 @@
         // Les refus du serveur aussi : elle vient d'être acceptée en vente,
         // c'est la meilleure preuve possible que la demande était bonne.
         if (state.watch[c].refus) state.watch[c].refus = 0;
+        // Et elle n'est plus perdue : l'oubli à sept jours repart de zéro.
+        if (state.watch[c].perduDepuis) state.watch[c].perduDepuis = 0;
         /*
          * On note qu'on vient de la voir en ligne. C'est ce repère qui empêche
          * de la replacer dans la minute qui suit la clôture : à cet instant elle
@@ -11148,14 +11299,26 @@
        * La supprimer tout court ferait réessayer sans fin une carte réellement
        * partie. On garde donc le frein, mais on le desserre seul : après
        * `WATCH_PAUSE_RETRY`, les compteurs repartent à zéro et la carte
-       * retente. Une carte vraiment absente coûte alors deux tentatives par
-       * heure au lieu d'une toutes les quinze secondes — et plus personne n'a
-       * à cliquer.
+       * retente — et plus personne n'a à cliquer.
+       *
+       * Mais ce desserrage rendait l'OUBLI impossible. Chaque nouvelle pause
+       * reposait `pausedAt` à l'instant, et l'oubli à sept jours de `restore()`
+       * lisait cette date-là : une carte échangée, défaussée sur le site ou
+       * vendue sans qu'on voie la notification n'atteignait jamais sept jours
+       * de pause, et se cherchait pour toujours. D'où `perduDepuis`, posée à la
+       * première pause d'une série et effacée seulement quand la carte repart
+       * en vente : c'est elle que l'oubli regarde, ici comme au chargement.
        */
       let reveillees = 0;
+      let oubliees = 0;
       for (const c of ids) {
         const w = state.watch[c];
         if (w.paused && Date.now() - (w.pausedAt || 0) > WATCH_PAUSE_RETRY) {
+          if (w.perduDepuis && Date.now() - w.perduDepuis > WATCH_PAUSE_TTL) {
+            dropWatch(c, 'oubliée après 7 jours');
+            oubliees += 1;
+            continue;
+          }
           w.paused = false;
           w.fails = 0;
           w.refus = 0;
@@ -11171,6 +11334,8 @@
       // Écrit ici, et non par le drapeau du bas : ce tour peut rendre la main
       // avant lui — quand il n'y a rien à replacer — et le réveil serait perdu.
       if (reveillees) saveStore({ watch: state.watch });
+      // Une carte oubliée n'est plus suivie : la suite du tour ne la voit pas.
+      if (oubliees) ids = ids.filter((c) => state.watch[c]);
 
       const aReplacer = () => ids.filter(
         (c) => !dejaEnLigne(c, enVente) && !state.watch[c].paused
@@ -11207,6 +11372,8 @@
       let index = libres > 0 ? await ownedIndex(false) : owned.map;
       let rebati = false;
       let bouge = false;
+      let absente = false;   // une carte introuvable a été cherchée ce tour-ci
+      let tentee = false;    // une annonce est partie au serveur, acceptée ou non
 
       for (const card of manquantes) {
         if (libres <= 0) break;               // les autres attendront un emplacement
@@ -11235,7 +11402,18 @@
           continue;
         }
         let copie = index.get(card);
-        if (!copie && !rebati) {
+        /*
+         * La relecture forcée de l'index — quatre-vingts pages — ne sert qu'au
+         * PREMIER manque d'une série : c'est là qu'une carte revient d'une
+         * enchère close et que l'index, vieux de quelques minutes, ne la
+         * connaît pas encore. Aux manques suivants, la recherche par titre
+         * juste en dessous répond pour une requête. Relue à chaque manque, elle
+         * coûtait quatre-vingts pages toutes les trente secondes par carte
+         * partie : 7 600 pages en trois heures au banc, pour une seule carte.
+         * Seul un titre trop court pour la recherche la garde à chaque fois.
+         */
+        const premierManque = !w.fails && !w.perduDepuis;
+        if (!copie && !rebati && (premierManque || !cherchable(w.title))) {
           rebati = true;                      // une seule reconstruction par passage
           index = await ownedIndex(true);
           copie = index.get(card);
@@ -11316,13 +11494,22 @@
            * Espacé au rythme du marché, le budget devient trois minutes au
            * lieu de vingt secondes — le temps qu'il faut à un serveur lent,
            * sans rien perdre du filet.
+           *
+           * L'échec était espacé, la RECHERCHE ne l'était pas : le tour
+           * repassait chaque seconde et redemandait la carte au serveur à
+           * chaque fois — 2 955 recherches en trois heures au banc pour une
+           * seule carte partie. Le tour se reprogramme donc lui-même, plus
+           * bas, quand il n'a rien pu publier : une recherche par créneau.
            */
+          absente = true;
           if (Date.now() >= (w.failAt || 0) + CFG.relistGapMs[0]) {
             w.fails = (w.fails || 0) + 1;
             w.failAt = Date.now();
             if (w.fails >= WATCH_FAILS) {
               w.paused = true;
-              w.pausedAt = Date.now();   // au-delà de WATCH_PAUSE_TTL, on oublie
+              w.pausedAt = Date.now();   // pour le desserrage des trente minutes
+              // Et le début de la série, pour l'oubli à sept jours.
+              w.perduDepuis = w.perduDepuis || Date.now();
               logRelist(w.title, 'refus', w.price, 'introuvable en collection — suivi en pause');
             }
             bouge = true;
@@ -11349,6 +11536,7 @@
           state.slots.used += 1;
           w.fails = 0;
           w.refus = 0;
+          w.perduDepuis = 0;
           state.asks[w.title] = { prix: w.price, at: Date.now() };
           /*
            * On note l'instant de publication : c'est lui qui interdit une
@@ -11401,6 +11589,7 @@
             if (w.refus >= WATCH_REFUS) {
               w.paused = true;
               w.pausedAt = Date.now();
+              w.perduDepuis = w.perduDepuis || Date.now();
               logRelist(w.title, 'refus', w.price,
                 `${pourquoi} — suivi en pause après ${w.refus} refus`);
             } else {
@@ -11420,9 +11609,13 @@
          * restantes attendront leur tour : c'est ce qui désynchronise aussi les
          * fins d'enchère, et empêche le troupeau de se reformer.
          */
+        tentee = true;
         spaceRelist();
         break;
       }
+      // Rien de publié parce que la carte reste introuvable : prochain essai
+      // au prochain créneau, pas à la seconde. Voir « L'échec était espacé ».
+      if (absente && !tentee) spaceRelist();
       if (bouge) {
         saveStore({ watch: state.watch, asks: state.asks });
         render();
@@ -11790,6 +11983,7 @@
   const SELL_TRIES = 4;
   const SELL_RETRY_MS = 1500;
   const REFUS_MAX = 25;  // refus d'affilée au-delà desquels le relevé renonce
+  const FREIN_MAX_MS = 120000;  // freinage sans répit au-delà duquel le relevé des prix s'arrête
 
   /** Le marché d'une carte, tel que ce compte a le droit de le voir. */
   async function probeSales(cardId) {
@@ -12121,6 +12315,20 @@
 
     const queue = distinctes.slice();
     const rows = [];
+    /*
+     * Un frein qui ne se desserre pas arrête le relevé.
+     *
+     * Un 429 remettait la carte en file et attendait trois secondes, sans
+     * limite : c'est juste tant que le serveur finit par répondre. S'il ne
+     * répond plus que 429 — une limite du jour, un blocage —, les six
+     * ouvriers tournaient à deux requêtes par seconde pour toujours, et la
+     * Revente restait sur « Lecture de l'historique des ventes » sans que rien
+     * ne bouge. Mesuré au banc : 3 607 appels en trente minutes, zéro carte.
+     * Deux minutes de refus sans une seule réponse entre deux, et le relevé
+     * s'arrête en gardant les cotes déjà connues.
+     */
+    let freineDepuis = 0;
+    let interrompu = '';
 
     const worker = async () => {
       while (queue.length) {
@@ -12128,10 +12336,20 @@
         try {
           const r = await fetchBorne(`/api/marketplace/cards/${c.id}/sales`, { credentials: 'same-origin' });
           if (r.status === 429) {
+            sell.freinages += 1;
+            if (!freineDepuis) freineDepuis = Date.now();
+            if (Date.now() - freineDepuis > FREIN_MAX_MS) {
+              interrompu = `le serveur a freiné le relevé des prix : arrêté après ${sell.done.toLocaleString('fr-FR')} `
+                + `carte${sell.done > 1 ? 's' : ''} sur ${sell.total.toLocaleString('fr-FR')}, les cotes déjà `
+                + 'connues sont gardées — réessayez plus tard';
+              queue.length = 0;
+              continue;
+            }
             queue.push(c);
             await delay(3000);
             continue;
           }
+          freineDepuis = 0;
           /*
            * Un refus ne ressemblait à rien : la réponse d'erreur se parse en
            * JSON, `sales` y est absent, et la carte sortait « sans historique »
@@ -12172,7 +12390,7 @@
     };
 
     await Promise.all(Array.from({ length: SELL_POOL }, worker));
-    finirScan(distinctes, rows, cards.length);
+    finirScan(distinctes, rows, cards.length, interrompu);
   }
 
   /**
@@ -12187,8 +12405,12 @@
    *   `/api/my-collection/stats`, donc celle que la couverture doit comparer :
    *   mélanger les deux ferait apparaître un manque permanent égal au nombre
    *   de doublons.
+   * @param {string} [interrompu] Pourquoi le relevé des PRIX s'est arrêté en
+   *   route, collection lue en entier. Il se clôt alors comme une lecture
+   *   tronquée : ce qu'il a coté remplace, le reste des cotes survit.
    */
-  function finirScan(cards, rows, exemplaires) {
+  function finirScan(cards, rows, exemplaires, interrompu = '') {
+    const partiel = sell.tronque || !!interrompu;
     /*
      * Liquidité par thème : la part des cartes d'un thème qui ont déjà trouvé
      * preneur. Le dénominateur doit compter TOUTES les cartes possédées, pas
@@ -12219,13 +12441,14 @@
      * donc sur l'identifiant : le neuf remplace l'ancien, l'ancien survit là
      * où le neuf n'a rien à dire.
      */
-    if (sell.tronque) {
+    if (partiel) {
       const parId = new Map(sell.rows.map((r) => [r.id, r]));
       for (const r of rows) parId.set(r.id, r);
       sell.rows = [...parId.values()];
       if (sell.refus) console.warn('[WikiMasters Tools] lecture interrompue', sell.refus);
-      sell.note = `relevé partiel : lecture interrompue à ${cards.length.toLocaleString('fr-FR')} `
-        + 'cartes, les cotes déjà connues sont gardées';
+      sell.note = interrompu
+        || `relevé partiel : lecture interrompue à ${cards.length.toLocaleString('fr-FR')} `
+          + 'cartes, les cotes déjà connues sont gardées';
     } else if (!rows.length) {
       /*
        * Zéro ligne, trois causes possibles et un seul écran vide : le serveur
@@ -12259,14 +12482,16 @@
     sell.tags = [...new Set(cards.flatMap((c) => c.tags))];
     // Le relevé vient de lire la collection entière : inutile que la prochaine
     // ouverture de la Revente la relise pour savoir ce qui est encore possédé.
-    if (!sell.tronque) sell.prunedAt = Date.now();
+    // Sauf s'il a gardé d'anciennes cotes : c'est la relecture qui les trie.
+    if (!partiel) sell.prunedAt = Date.now();
     /*
      * L'ancre de la couverture. Une lecture tronquée n'en pose pas : elle n'a
      * pas vu la collection entière, et l'écrire ferait passer pour couvert ce
      * qu'elle n'a jamais lu — la faute même que `sell.tronque` évite deux blocs
-     * plus haut en fusionnant au lieu d'écraser.
+     * plus haut en fusionnant au lieu d'écraser. Un relevé des prix interrompu
+     * non plus : il a lu la collection, pas coté toutes ses cartes.
      */
-    if (!sell.tronque) {
+    if (!partiel) {
       sell.scanAt = Date.now();
       sell.scanTotal = exemplaires;
       sell.owned = { n: exemplaires, at: Date.now() };
