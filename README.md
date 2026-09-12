@@ -42,12 +42,13 @@ Rien envoyé nulle part.
 - Ceux dont la récompense **attend d'être réclamée** — elle ne se crédite pas
   toute seule, et rien ne le signale ailleurs.
 
-### 🏰 Guilde
+### 🤝 Amis
 
-- Les cartes que vous pouvez donner tout de suite, avec le karma de chacune.
-- Un lot de cinq, prêt à publier dans le tchat.
 - Vos souhaits déjà chez vos amis, Légendaires en tête, page d'échange ouverte
   au bon nom en un clic.
+- **Ajouter en amis** le top 200 du classement : ce sont eux qui ont le plus
+  de cartes. Une case par joueur montre où vous en êtes. Les demandes partent
+  au rythme d'une personne, et un joueur qui refuse n'est jamais redemandé.
 
 ### Et dans les pages du jeu
 
