@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WikiMasters Tools
 // @namespace    https://www.wiki-masters.com/
-// @version      3.7.3
+// @version      3.8.0
 // @description  Boîte à outils WikiMasters : ouverture automatique des paquets, suivi des tirages, cote des cartes et revente.
 // @match        https://www.wiki-masters.com/*
 // @match        https://wiki-masters.com/*
@@ -41,7 +41,7 @@
    *
    * Il est lu par le garde juste en dessous, d'où sa place en tête.
    */
-  const VERSION = '3.7.3';
+  const VERSION = '3.8.0';
 
   /*
    * Une seule instance par page — et savoir laquelle
@@ -403,12 +403,13 @@
    *   3  `debitCliquet`    — après le cliquet du plancher appris
    *   4  ce numéro lui-même : les migrations se comparent au lieu de se deviner
    *   5  la limite quotidienne, que la boucle prenait pour un mur de débit
+   *   6  la guilde retirée : `lot`, `publiees`, `watchGuild`, `karmaVu`, `guildSeen`
    *
    * À incrémenter quand une migration s'ajoute, et à traiter dans `restore()`.
    * Les trois marqueurs booléens restent lus une dernière fois, pour déduire
    * le numéro d'un stockage écrit avant lui — voir `restore()`.
    */
-  const SCHEMA = 5;
+  const SCHEMA = 6;
 
   const state = {
     running: false,
@@ -444,16 +445,6 @@
     pity: null,            // compteur de pitié courant, tel que le porte le profil
     pityMax: 0,            // plus haute valeur jamais vue — révèle le palier
     balance: null,         // wikibidous disponibles
-    guild: { at: 0 },      // relevé de guilde, voir refreshGuild
-    guildTenteA: 0,        // dernière TENTATIVE, réussie ou non — voir refreshGuild
-    karmaVu: {},           // karma réellement observé par rareté, mesuré
-    maCollection: null,    // { at, cartes } — lecture complète, gardée une heure
-    aSouhaiter: null,      // lot en cours, mémorisé — voir saveLot
-    publiees: [],          // cartes déjà publiées : le lot suivant en sort d'autres
-    guildSeen: {},         // souhaits déjà signalés : id -> horodatage
-    guildNote: '',         // dernier don signalé, affiché dans l'onglet Guilde
-    guildNoteAt: 0,        // ... et daté, pour ne pas laisser traîner une alerte périmée
-    guildSilence: false,   // premier tour après armement : enregistrer sans alerter
     bids: { at: 0, list: [] },
     slots: { used: 0, max: 10, at: 0 },  // emplacements de vente occupés
     journal: [],          // ventes closes : demandé, obtenu, issue
@@ -478,6 +469,14 @@
      * l'ignorer revenait à jeter la moitié de ce qu'on venait de payer.
      */
     troc: { at: 0, lignes: [], amis: 0, enAttente: 0 },
+    /*
+     * Le haut du classement, gardé un jour : il bouge lentement, et chaque
+     * page coûte une seconde et demie au serveur. `amis` est le dernier relevé
+     * de la liste d'amis — seulement sa date et le nombre de demandes reçues ;
+     * le reste vit dans la mémoire des demandes, voir `lireVus`.
+     */
+    classement: { at: 0, prof: 0, lignes: [] },
+    amis: { at: 0, recues: 0 },
     message: 'Prêt.',
     warn: false,
     /*
@@ -760,7 +759,6 @@
     bonus: true,
     autoclaim: true,     // réclamer les récompenses de succès en attente
     db: true,            // lire la base en direct là où l'API du site ne rend plus rien
-    watchGuild: true,    // signaler les souhaits de guilde que tu peux servir
     autoResume: true,    // repartir seul dès que la vérification humaine est passée
     watchBids: true,
     watchWish: false,     // signaler les cartes de la liste de souhaits mises en vente
@@ -943,18 +941,26 @@
        */
       state.delayMs = Math.max(floorMs(), CFG.startDelayMs);
     }
+    /*
+     * La guilde est retirée — le lot à publier, l'alerte, la table de karma :
+     * leurs clés n'ont plus de lecteur. La liste des cartes publiées pesait
+     * jusqu'à trois cents identifiants, le registre des souhaits vus jusqu'à
+     * quatre cents, dans un stockage qu'on sait proche du plafond sur les
+     * grosses collections. Une clé à `undefined` disparaît au `JSON.stringify`.
+     */
+    if (schemaLu < 6) {
+      saveStore({ lot: undefined, publiees: undefined, watchGuild: undefined,
+                  karmaVu: undefined, guildSeen: undefined });
+    }
     if (Number.isFinite(s.cadenceMs)) state.cadenceMs = s.cadenceMs;
     // Le maximum du compteur de pitié s'accumule d'une session à l'autre : c'est
     // le nombre de tirages observés qui lui donne sa valeur, pas leur continuité.
     if (Number.isFinite(s.pityMax)) state.pityMax = s.pityMax;
     if (typeof s.logRarity === 'string' || s.logRarity === null) prefs.logRarity = s.logRarity;
     if (['paquets', 'marche', 'guilde', 'reglages'].includes(s.tab)) prefs.tab = s.tab;
-    if (s.karmaVu && typeof s.karmaVu === 'object') state.karmaVu = s.karmaVu;
-    // Sans ce registre, un rechargement de page resignalerait tous les souhaits
-    // servables déjà vus — l'alerte perdrait son sens dès la deuxième ouverture.
-    if (s.guildSeen && typeof s.guildSeen === 'object') state.guildSeen = s.guildSeen;
-    if (Array.isArray(s.publiees)) state.publiees = s.publiees;
-    restoreLot(s.lot);
+    if (s.classement && Array.isArray(s.classement.lignes) && Number.isFinite(s.classement.at)) {
+      state.classement = s.classement;
+    }
     if (['ench', 'vent', 'rel', 'souh'].includes(s.mktSub)) prefs.mktSub = s.mktSub;
     if (typeof s.relistLogOuvert === 'boolean') prefs.relistLogOuvert = s.relistLogOuvert;
     // Reprise de l'ancien réglage à étiquette unique.
@@ -3010,321 +3016,15 @@
     };
   };
 
-  // ------------------------------------------------------------------ guilde
+  // ----------------------------------------------------------- registres « vu »
 
   /*
-   * Ce que la guilde marque, et où il reste du gras.
-   *
-   * Formule du score hebdomadaire, vérifiée au point près sur les totaux du
-   * serveur : `total = 500 × combats + wikibidous_encaissés + karma`. Les trois
-   * termes recomposent le `total_score` annoncé, à l'unité.
-   *
-   * Ce que ça dit : le karma pèse 2 % du score, alors que le plafond
-   * théorique — une réception par membre et par jour — vaut plusieurs fois le
-   * score entier. C'est le seul axe où presque rien n'est pris.
+   * La guilde vivait ici — score, karma par rareté, dons possibles, alerte
+   * sur les SR / UR demandées — et le lot à publier dans son tchat. Tout est
+   * retiré en 3.8.0, à la demande de l'utilisateur : l'onglet est devenu
+   * celui des amis. Le relevé de `/api/guilds/home` toutes les cinq minutes
+   * n'avait plus de lecteur, il est parti avec.
    */
-  const GUILD_FRESH_MS = 300000;  // le serveur ne recalcule son classement qu'à cette cadence
-
-  /*
-   * Karma par rareté. Ces valeurs viennent d'un relevé antérieur et **ne sont
-   * pas prouvées** : seul le 500 est corroboré (une contribution d'un don en
-   * valait 500). Elles servent donc de départ, et `apprendKarma` les remplace
-   * par ce que le serveur fait réellement.
-   */
-  const KARMA_SUPPOSE = { C: 100, PC: 200, R: 300, SR: 500, UR: 1000, L: 2000 };
-  const karmaDe = (r) => (Number.isFinite(state.karmaVu[r]) ? state.karmaVu[r] : KARMA_SUPPOSE[r] || 0);
-
-  /*
-   * La table se mesure toute seule, sur l'activité de la guilde.
-   *
-   * Entre deux relevés, si le compteur de dons a bougé d'EXACTEMENT un et que
-   * le karma a bougé de X, alors ce don valait X — et `recent_donations` dit
-   * quelle rareté il portait. Deux dons dans l'intervalle et on ne conclut
-   * rien : c'est la condition qui rend la mesure honnête plutôt que moyennée.
-   *
-   * Quarante-huit dons par semaine dans la guilde suffisent à remplir la table
-   * sans qu'on ait à donner quoi que ce soit pour l'établir.
-   */
-  function apprendKarma(avant, apres, dernier) {
-    if (!avant || !avant.at) return;
-    const dDons = apres.dons - avant.dons;
-    const dKarma = apres.karma - avant.karma;
-    if (dDons !== 1 || dKarma <= 0 || !dernier || !dernier.rarete) return;
-    if (state.karmaVu[dernier.rarete] === dKarma) return;
-    state.karmaVu[dernier.rarete] = dKarma;
-    saveStore({ karmaVu: state.karmaVu });
-  }
-
-  /*
-   * Les seules raretés que le panneau propose et signale.
-   *
-   * Décidé, mesures à l'appui, puis clos : au-dessus on ne donne pas, en
-   * dessous ça ne rapporte pas assez par rencontre. Ce qui est rare n'est pas
-   * la place — une grande guilde en ouvre des milliers par semaine, dont
-   * moins de 0,5 % sont utilisés — mais qu'un souhait tombe sur une carte
-   * détenue. Chaque rencontre doit donc rapporter le plus possible, et la SR
-   * est le point d'équilibre : 500 karma pour une carte qui vaut 21
-   * wikibidous à la revente.
-   *
-   * Le panneau ne réargumente pas ce choix à chaque affichage : il s'y tient.
-   */
-  const RARETES_UTILES = ['SR', 'UR'];
-
-  /*
-   * Cinq cartes par annonce, pas quarante.
-   *
-   * Quarante titres publiés d'un coup, c'est quarante réservations à suivre
-   * dans un fil de discussion et autant de dons à honorer sans savoir où on en
-   * est. Cinq tiennent dans un message, se réservent en quelques échanges, et
-   * se donnent dans la foulée — après quoi on republie. Le rythme vient du
-   * cycle, pas du volume.
-   */
-  const LOT_SOUHAITS = 5;
-  const PUBLIEES_MAX = 300;   // ~60 lots avant recyclage des plus anciens titres
-
-  /*
-   * Le message, écrit pour ce que le tchat accepte vraiment.
-   *
-   * Relevé sur la page : le champ est un `<input type="text" maxlength="1000">`,
-   * donc une seule ligne — la touche Entrée envoie, elle ne saute pas de ligne.
-   * Les bulles se rendent en `white-space: normal`, si bien qu'un saut de ligne
-   * passé par l'API serait écrasé à l'affichage, et le contenu est inséré comme
-   * texte : aucune syntaxe n'est interprétée. Sur 200 messages lus, aucun ne
-   * contenait de retour à la ligne — ce n'est pas l'usage, c'est la contrainte.
-   *
-   * D'où une ligne unique, la ponctuation pour toute mise en page, et un
-   * plafond à 1 000 caractères qu'on vérifie avant de copier.
-   */
-  const CHAT_MAX = 1000;
-
-  /*
-   * Deux messages, parce qu'ils n'ont pas la même durée de vie.
-   *
-   * La marche à suivre ne change jamais : elle se poste une fois, et la
-   * republier à chaque lot serait du bruit dans un fil où le message moyen fait
-   * quarante caractères. Le lot, lui, change à chaque cycle et doit rester
-   * court — c'est celui qu'on relira le plus souvent.
-   *
-   * Les cartes sont numérotées : réserver « la 3 » se tape sans faute, là où
-   * « Nuno Mendes (football, 2002) » se recopie mal. Et l'exemple vaut mieux
-   * qu'une consigne — personne ne lit une règle, tout le monde imite un modèle.
-   */
-  function messageGuildeTuto() {
-    return `Points de guilde : je poste régulièrement des cartes que je possède ` +
-      `et peux donner. Dites ici le numéro de celle que vous prenez ` +
-      `(ex. « je prends la 3 »), mettez-la en souhait de guilde, et je vous la ` +
-      `donne. Une seule carte reçue par membre et par jour, alors prenez-en ` +
-      `chacun une différente.`;
-  }
-
-  function messageGuildeLot(lot) {
-    return `Nouveau lot : ` +
-      lot.map((c, i) => `${i + 1}) ${c.rarete} ${c.titre}`).join(' · ');
-  }
-
-  /*
-   * Ce que tu peux réellement offrir, lu dans ta collection.
-   *
-   * Mesuré : une poignée de doublons pour une collection entière — à l'échelle
-   * de ce catalogue (2,77 M de cartes), le surplus n'existe pas. Donner puise
-   * donc dans la collection elle-même, et le jeu l'autorise : les sept souhaits
-   * servables du jour portaient tous sur des exemplaires uniques.
-   *
-   * Le coût d'un don est donc le prix de la carte plus une unité de collection.
-   * À 11 wikibidous la Rare, c'est le prix le plus bas pour 300 karma.
-   *
-   * Une lecture complète coûte une dizaine de requêtes ; elle est donc gardée
-   * une heure. Les étiquettes voyagent dans la même requête (`user_card_tags`
-   * embarqué), parce que ce sont elles qui disent ce qu'il ne faut pas proposer.
-   */
-  const COLLECTION_TTL_MS = 3600000;
-
-  /**
-   * @param {boolean} force  Ignorer le cache. Indispensable après un étiquetage :
-   *   protéger une carte doit se voir tout de suite, pas dans une heure.
-   */
-  async function dbMyCards(force) {
-    const c = state.maCollection;
-    if (!force && c && Date.now() - c.at < COLLECTION_TTL_MS) return c.cartes;
-    const moi = await fetchMyId();
-    if (!moi) return null;
-
-    const cartes = [];
-    for (let page = 0; page < 20; page++) {
-      const lot = await sbGet(
-        `user_cards?user_id=eq.${moi}` +
-        `&select=card_id,snapshot_rarity,snapshot_title,starred,user_card_tags(tag_id),` +
-        `cards(rarity,wikipedia_title)` +
-        `&limit=1000&offset=${page * 1000}`
-      );
-      if (!Array.isArray(lot)) return null;
-      /*
-       * La rareté COURANTE, pas celle figée à l'obtention.
-       *
-       * `snapshot_rarity` date du tirage ; le jeu recalcule ensuite les raretés
-       * et l'écart est réel — mesuré sur 1 000 cartes : 17 divergences, dont
-       * trois cartes annoncées SR qui sont en fait R ou PC. Publier l'une
-       * d'elles, c'était promettre une Super Rare et livrer une Rare.
-       *
-       * Le titre suit la même règle : c'est celui du catalogue que les membres
-       * chercheront pour poser leur souhait, pas celui d'il y a six mois.
-       */
-      for (const c of lot) {
-        c.rarete = (c.cards && c.cards.rarity) || c.snapshot_rarity;
-        c.titre = (c.cards && c.cards.wikipedia_title) || c.snapshot_title;
-      }
-      cartes.push(...lot);
-      if (lot.length < 1000) break;
-    }
-    state.maCollection = { at: Date.now(), cartes };
-    return cartes;
-  }
-
-  /**
-   * La liste à faire souhaiter par la guilde.
-   *
-   * Le levier n'est pas de donner plus, c'est de rendre le don POSSIBLE : sur
-   * 697 souhaits, sept seulement portaient sur une carte que tu détiens. Tant
-   * que la demande vise des Légendaires que personne n'a, les créneaux restent
-   * vides. Publier des titres que tu possèdes vraiment, dans les raretés au
-   * meilleur rendement, suffit à débloquer autant de dons qu'il y a de membres
-   * pour les souhaiter — sans que personne n'installe quoi que ce soit.
-   */
-  async function suggestWishes(combien, force) {
-    const cartes = await dbMyCards(force);
-    if (!cartes) return null;
-
-    /*
-     * Un message qu'on republie ne doit pas être le même.
-     *
-     * Le levier n'est pas une annonce unique : les souhaits se réalisent, les
-     * membres changent, il faut y revenir. Republier les quarante mêmes titres
-     * ne servirait qu'à ceux qui n'avaient pas lu la première fois — et les
-     * cartes déjà souhaitées par quelqu'un n'ont aucun besoin d'être réclamées
-     * une seconde fois. Chaque préparation sort donc un lot neuf, et ne recycle
-     * qu'une fois le stock épuisé.
-     */
-    const dejaPubliees = new Set(state.publiees || []);
-    const dejaSouhaitees = new Set(state.guild.cartesSouhaitees || []);
-
-    const vus = new Set();
-    const out = [];
-    let ecartees = 0;
-    let recyclees = 0;
-    for (const r of RARETES_UTILES) {
-      for (const c of cartes) {
-        if (c.rarete !== r) continue;
-        if (!c.titre || vus.has(c.card_id)) continue;
-        if (dejaSouhaitees.has(c.card_id)) continue;   // quelqu'un la réclame déjà
-        if (dejaPubliees.has(c.card_id)) { recyclees += 1; continue; }
-        /*
-         * Étiquetée ou en favori : on ne la propose pas.
-         *
-         * Le script traite déjà l'étiquette comme un « je garde » côté revente ;
-         * un don étant irréversible, la règle y est au moins aussi ferme. Toute
-         * étiquette compte, pas seulement celles filtrées dans la Revente : une
-         * étiquette posée après le dernier réglage doit protéger la carte
-         * immédiatement, sans qu'on ait à y penser.
-         */
-        if (c.starred || (c.user_card_tags && c.user_card_tags.length)) {
-          ecartees += 1;
-          continue;
-        }
-        vus.add(c.card_id);
-        out.push({ id: c.card_id, titre: c.titre, rarete: r });
-        if (out.length >= combien) break;
-      }
-      if (out.length >= combien) break;
-    }
-
-    /*
-     * Stock épuisé : on repart du début plutôt que de rendre une liste vide.
-     * Republier d'anciens titres a du sens — les membres arrivés depuis n'en
-     * ont jamais entendu parler.
-     */
-    if (!out.length && recyclees) {
-      state.publiees = [];
-      saveStore({ publiees: [] });
-      return suggestWishes(combien, false);
-    }
-
-    out.ecartees = ecartees;
-    return out;
-  }
-
-  /*
-   * Le lot survit au rechargement de page — et il le faut.
-   *
-   * Il ne vivait qu'en mémoire, alors que `publiees` — les cartes déjà
-   * annoncées — est mémorisé. Au rechargement, le panneau affichait donc
-   * « Aucun lot en cours » au-dessus de cinq titres déjà postés dans le tchat,
-   * en proposait cinq AUTRES, et `suivreLot` n'avait plus rien à marquer : le
-   * lot suivant ne s'enchaînait jamais. Et ce n'est pas un cas de bord — le
-   * guetteur recharge la page de lui-même toutes les cinq minutes dès que
-   * l'onglet passe en arrière-plan.
-   *
-   * `ecartees` voyage à part : c'est une propriété posée sur le tableau, et
-   * `JSON.stringify` n'en garde que les indices.
-   */
-  function saveLot() {
-    saveStore({
-      lot: state.aSouhaiter && state.aSouhaiter.length
-        ? { cartes: state.aSouhaiter, ecartees: state.aSouhaiter.ecartees || 0 }
-        : null,
-    });
-  }
-
-  function restoreLot(l) {
-    if (!l || !Array.isArray(l.cartes) || !l.cartes.length) return;
-    const lot = l.cartes.filter((c) => c && c.id && c.titre);
-    if (!lot.length) return;
-    lot.ecartees = Number.isFinite(l.ecartees) ? l.ecartees : 0;
-    state.aSouhaiter = lot;
-  }
-
-  /**
-   * Les cartes protégées parmi celles passées, relues à l'instant.
-   *
-   * Une étiquette veut dire « je ne la donne pas », quelle que soit la rareté
-   * et sans délai. S'appuyer sur la collection en cache — une heure — laissait
-   * une carte étiquetée il y a dix minutes déclencher une alerte ou apparaître
-   * dans une liste. On ne relit pas pour autant toute la collection : une requête
-   * bornée aux identifiants concernés suffit, et elle part à chaque relevé.
-   *
-   * En cas d'échec réseau, on rend `null` : l'appelant doit alors s'abstenir
-   * plutôt que de supposer la carte libre.
-   */
-  async function protegeesDe(ids) {
-    if (!ids.length) return new Set();
-    const moi = await fetchMyId();
-    if (!moi) return null;
-    const lignes = await sbGet(
-      `user_cards?user_id=eq.${moi}&card_id=in.(${ids.join(',')})` +
-      `&select=card_id,starred,user_card_tags(tag_id)&limit=200`
-    );
-    if (!Array.isArray(lignes)) return null;
-    return new Set(
-      lignes
-        .filter((c) => c.starred || (c.user_card_tags && c.user_card_tags.length))
-        .map((c) => c.card_id)
-    );
-  }
-
-  /*
-   * Prévenir quand un souhait tombe sur une carte que tu peux servir.
-   *
-   * Publier la liste ne sert à rien si le souhait qu'elle déclenche passe
-   * inaperçu : le destinataire ne peut recevoir qu'une carte par jour, et la
-   * fenêtre se referme. C'est donc l'alerte qui ferme la boucle.
-   *
-   * Deux filtres, et ils comptent autant que l'alerte elle-même :
-   *   - `RARETES_UTILES` seulement. Signaler une Légendaire servable serait
-   *     signaler ce que tu as décidé de ne pas donner — du bruit, et le genre
-   *     de bruit qui fait couper l'option.
-   *   - jamais une carte étiquetée ou en favori, même règle que la liste
-   *     proposée : ce que tu gardes ne se signale pas comme donnable.
-   */
-  const GUILD_SEEN_MAX = 400;
 
   /**
    * Un registre « déjà vu » ne doit pas gonfler indéfiniment : on garde les
@@ -3339,223 +3039,6 @@
     const frais = {};
     for (const id of gardes) frais[id] = registre[id];
     return frais;
-  }
-
-  /**
-   * La dernière chose signalée par la guilde, datée. Elle n'était écrite nulle
-   * part de visible : sans notification bureau — décochée par défaut — un lot
-   * qui s'enchaînait tout seul ne se voyait pas. L'onglet Guilde l'affiche
-   * maintenant, et l'oublie une fois périmée.
-   */
-  const GUILD_NOTE_TTL = 600000;   // même fenêtre que la note du Marché
-
-  function noteGuilde(texte) {
-    state.guildNote = texte;
-    state.guildNoteAt = Date.now();
-  }
-
-  async function signalerDons(servables) {
-    if (!prefs.watchGuild) return;
-
-    /*
-     * Premier tour après l'armement : on enregistre l'existant sans rien dire.
-     * Cocher la case ne doit pas déclencher une volée d'alertes sur des
-     * souhaits posés il y a trois jours — l'alerte porte sur ce qui arrive,
-     * pas sur ce qui était déjà là.
-     *
-     * Le drapeau se lève AVANT le test de liste vide. Sinon, cocher la case à
-     * un moment où rien n'est servable le laissait armé, et c'est le premier
-     * souhait réel — celui qu'on attendait — qui passait sous silence.
-     */
-    if (state.guildSilence) {
-      state.guildSilence = false;
-      for (const s of servables) state.guildSeen[s.id] = Date.now();
-      saveStore({ guildSeen: state.guildSeen });
-      return;
-    }
-
-    if (!servables.length) return;
-
-    /*
-     * Protection relue à l'instant, jamais depuis le cache : une étiquette
-     * posée il y a dix minutes doit déjà faire taire l'alerte. Si la lecture
-     * échoue, on ne signale rien ce tour-ci — mieux vaut une alerte en retard
-     * qu'une alerte sur une carte que tu gardes.
-     */
-    const protegees = state.guild.protegees;
-    if (!protegees) return;
-
-    const neufs = servables.filter((s) =>
-      RARETES_UTILES.includes(s.rarete) &&
-      !protegees.has(s.carte) &&
-      !state.guildSeen[s.id]
-    );
-    // Tout souhait servable est marqué vu, y compris ceux qu'on ne signale pas :
-    // sans ça, une Légendaire écartée reviendrait à chaque tour de veille.
-    for (const s of servables) state.guildSeen[s.id] = Date.now();
-
-    state.guildSeen = bornerVus(state.guildSeen, GUILD_SEEN_MAX);
-    saveStore({ guildSeen: state.guildSeen });
-
-    if (!neufs.length) return;
-    const premier = neufs[0];
-    const titre = neufs.length === 1
-      ? `Don possible : ${premier.rarete}`
-      : `${neufs.length} dons possibles`;
-    const corps = neufs.length === 1
-      ? `${premier.titre} → ${premier.pour} · +${karmaDe(premier.rarete)} karma`
-      : neufs.slice(0, 3).map((s) => `${s.rarete} ${s.titre}`).join(' · ');
-    noteGuilde(`${titre} — ${corps}`);
-    notifyBid(titre, corps);
-    render();
-  }
-
-  /*
-   * Le lot avance tout seul, sans troisième bouton.
-   *
-   * « Une fois donné, je reposte » : le panneau peut le savoir sans qu'on le
-   * lui dise. Une carte donnée quitte la collection — il suffit donc de relire
-   * celle-ci pour marquer ce qui est parti. Encore faut-il ne pas la relire
-   * pour rien : la lecture complète coûte une dizaine de requêtes.
-   *
-   * D'où le déclencheur : le compteur de dons de TA contribution. Tant qu'il
-   * ne bouge pas, rien n'a été donné et il n'y a rien à vérifier. Quand il
-   * bouge, on relit une fois, on marque, et si le lot est épuisé on prépare le
-   * suivant — prêt à copier.
-   */
-  async function suivreLot(avant, apres) {
-    if (!state.aSouhaiter || !state.aSouhaiter.length) return;
-    const donsAvant = avant && avant.moi ? avant.moi.donations_this_week : null;
-    const donsApres = apres.moi ? apres.moi.donations_this_week : null;
-    if (!Number.isFinite(donsAvant) || !Number.isFinite(donsApres) || donsApres <= donsAvant) return;
-
-    const cartes = await dbMyCards(true);
-    if (!cartes) return;
-    const possedees = new Set(cartes.map((c) => c.card_id));
-    for (const c of state.aSouhaiter) {
-      if (!possedees.has(c.id)) c.donnee = true;
-    }
-
-    // Lot épuisé : on enchaîne, c'est le moment de republier.
-    if (state.aSouhaiter.every((c) => c.donnee)) {
-      const suivant = await suggestWishes(LOT_SOUHAITS, false);
-      if (suivant && suivant.length) {
-        state.aSouhaiter = suivant;
-        noteGuilde('Lot épuisé — le suivant est prêt à publier.');
-        notifyBid('Lot donné', 'Le lot suivant est prêt à copier.');
-      }
-    }
-    saveLot();
-    render();
-  }
-
-  async function refreshGuild(force) {
-    /*
-     * La fraîcheur se compte sur la dernière TENTATIVE, pas sur le dernier
-     * succès.
-     *
-     * `state.guild.at` n'est écrit qu'en cas de réussite : un serveur qui
-     * cesse de répondre comme attendu laissait donc l'horodatage à zéro, et ce
-     * relevé — appelé par un tour d'une minute — repartait toutes les soixante
-     * secondes au lieu de toutes les cinq minutes. Mesuré au banc : 59 appels
-     * par heure au lieu de 12, sur un onglet qui ne fait rien d'autre.
-     *
-     * C'est la même famille que les tours secondaires du lot 1 : ce qui échoue
-     * en silence finit par coûter plus cher que ce qui marche.
-     */
-    const derniereTentative = Math.max(state.guild.at || 0, state.guildTenteA || 0);
-    if (!force && Date.now() - derniereTentative < GUILD_FRESH_MS) return;
-    state.guildTenteA = Date.now();
-
-    /*
-     * Un seul appel. Le classement des guildes partait aussi, toutes les cinq
-     * minutes, pour remplir `rang`, `membres`, `total`, `batailles`, `wb`,
-     * `chef` et `chefTotal` — sept champs dont AUCUN n'avait de lecteur depuis
-     * que le tableau de bord de guilde a été retiré. La collecte avait survécu
-     * à son affichage. Sur un outil qu'on surveille pour son nombre de
-     * requêtes, c'était une requête sur deux, pour rien.
-     */
-    let home;
-    try {
-      home = await api('/api/guilds/home');
-    } catch (_) {
-      return;   // réseau : le relevé précédent reste affiché, avec son âge
-    }
-    const h = home.status === 200 ? home.data : null;
-    if (!h || !h.guild) return;
-
-    const souhaits = Array.isArray(h.wishlist) ? h.wishlist : [];
-
-    /*
-     * Ce que je peux servir maintenant. `can_donate` est calculé par le serveur
-     * chez le donateur — c'est lui qui fait autorité, pas notre lecture de la
-     * collection. On écarte son propre souhait et ceux déjà servis aujourd'hui :
-     * un membre ne reçoit qu'une carte par jour, insister ne sert à rien.
-     */
-    const servables = souhaits
-      .filter((w) => w.can_donate && !w.is_self && !w.recipient_received_today)
-      .map((w) => ({
-        id: w.id,
-        carte: w.card && w.card.id,
-        titre: (w.card && w.card.wikipedia_title) || '',
-        rarete: (w.card && w.card.rarity) || '?',
-        pour: w.username || '',
-        copies: (w.owned_copy_ids || []).length,
-      }));
-
-    const avant = state.guild;
-    const dernier = (h.recent_donations || [])[0];
-    /*
-     * Le relevé ne porte plus que ce qui est lu quelque part. Il transportait
-     * neuf champs de plus — nom de la guilde, répartition des souhaits par
-     * rareté, leur nombre, rang, membres, score total, score de batailles,
-     * wikibidous, nom et score de la guilde de tête — dont pas un n'avait de
-     * lecteur depuis le retrait du tableau de bord.
-     *
-     * Ce qui reste n'est pas affiché non plus, mais se mesure : `karma` et
-     * `dons` alimentent `apprendKarma`, qui déduit ce que vaut un don de chaque
-     * rareté ; `moi` sert à `suivreLot` pour savoir qu'un don est parti.
-     */
-    const apres = {
-      at: Date.now(),
-      karma: h.guild.karma_this_week || 0,
-      dons: h.guild.donations_this_week || 0,
-      moi: h.my_contribution || null,
-      servables,
-      // Les cartes déjà réclamées par quelqu'un : inutile de les faire souhaiter
-      // une seconde fois, elles sont couvertes.
-      cartesSouhaitees: souhaits.map((w) => w.card && w.card.id).filter(Boolean),
-    };
-
-    // Le relevé lui-même n'est pas mémorisé : il périme en cinq minutes, et un
-    // tableau de bord ressorti périmé au rechargement induit en erreur.
-    apprendKarma(avant, apres, dernier && { rarete: dernier.card && dernier.card.rarity });
-    state.guild = apres;
-    noterSucces('guilde');
-
-    /*
-     * Une seule requête, à chaque relevé : lesquelles de ces cartes sont
-     * étiquetées ou en favori. Elle couvre les souhaits servables ET le lot
-     * publié — une carte étiquetée après sa publication doit se voir dans le
-     * lot aussi, sinon on la donne sans y penser.
-     */
-    const aVerifier = [...new Set([
-      ...servables.map((s) => s.carte),
-      ...((state.aSouhaiter || []).map((c) => c.id)),
-    ].filter(Boolean))];
-    apres.protegees = await protegeesDe(aVerifier);
-
-    await suivreLot(avant, apres);
-    await signalerDons(servables);
-
-    /*
-     * Le relevé des prix médians a disparu avec l'arbitrage qu'il servait.
-     * Il tranchait « donner ou vendre ? » carte par carte — question qui ne se
-     * pose plus depuis qu'on s'en tient aux SR et UR : à 21 wikibidous la SR
-     * contre 500 karma, la réponse est toujours la même. Une requête de moins
-     * à chaque relevé.
-     */
-    render();
   }
 
   /*
@@ -4388,9 +3871,13 @@
      * mais seulement en arrière-plan, et pas avant l'intervalle prévu — la
      * condition portait sur la date du dernier relevé, qui vaut zéro tant
      * qu'aucun scan n'a réussi : l'onglet se serait rechargé sans fin.
+     *
+     * Jamais pendant un envoi de demandes d'ami : il dure une demi-heure au
+     * rythme d'une personne, et un rechargement l'arrêterait au milieu.
      */
     const dernier = state.bids.at;
     if (
+      !amisEnvoiEnCours() &&
       awayLongEnough() &&
       Date.now() - lastReload > BIDS.everyMs &&
       dernier &&
@@ -6302,7 +5789,7 @@
    * Le panneau est dense à dessein — 300 px de large, il tient de l'outil, pas
    * de la page — et 10 à 12 px y sont la bonne échelle. Mais cinq règles
    * descendaient à 9 px : les pastilles de compte des volets, les étiquettes du
-   * Marché, la numérotation du lot de guilde et sa ligne de méta. C'est en
+   * Marché, la numérotation de l'ancien lot de guilde et sa ligne de méta. C'est en
    * dessous de ce qui se lit, et ces mêmes règles portaient le ton le plus
    * faible de la palette — les deux difficultés cumulées au même endroit.
    *
@@ -6747,51 +6234,11 @@
       color: var(--dim); font-size: 11px; line-height: 1.5;
     }
     .mkoff b { color: var(--muted); font-weight: 600; }
-    /*
-     * Guilde. Le résumé porte les chiffres qui décident — score, écart au
-     * premier, taux d'exploitation — et doit rester lisible d'un coup d'œil :
-     * une ligne par idée, la valeur en gras, le reste en sourdine.
-     */
-    /*
-     * L'onglet répond à une question — « y a-t-il un don à faire, et lequel ».
-     * Toute la hiérarchie découle de là : l'action d'abord, en grand ; le
-     * contexte de guilde ensuite, en sourdine ; les cartes qu'il vaut mieux
-     * vendre réduites à une ligne, parce qu'une non-action n'est pas une ligne
-     * de liste. La première version alignait les seize à égalité et enterrait
-     * le seul don utile au milieu.
-     *
-     * Deux lignes par carte, jamais une : dans 190 px, titre + destinataire +
-     * chiffres sur un seul rang écrasait le titre à un caractère.
-     */
-    .gdon { display: grid; gap: 2px; padding: 8px 10px; margin-bottom: 6px;
-            border: 1px solid color-mix(in srgb, var(--live) 35%, transparent);
-            border-radius: var(--r-lg); background: color-mix(in srgb, var(--live) 7%, transparent); }
-    .gdon .t { display: flex; align-items: baseline; gap: 6px; font-size: 12px; color: var(--text); }
-    .gdon .t i { flex: none; font-style: normal; font-size: 10px; font-weight: 700; color: var(--c); }
-    .gdon .t b { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis;
-                 white-space: nowrap; font-weight: 600; }
-    .gdon .m { font-size: 10px; color: var(--muted); font-variant-numeric: tabular-nums; }
-    .gdon .m b { color: var(--live); font-weight: 600; }
-
-    .gskip { padding: 7px 10px; border: 1px dashed var(--line); border-radius: var(--r-lg);
-             font-size: 10px; line-height: 1.5; color: var(--dim); }
-    .gskip b { color: var(--muted); font-weight: 600; }
-
-    /* Le dernier événement signalé. Il vaut ce que vaut une notification qu'on
-       aurait ratée : présent, discret, et il s'efface de lui-même. */
-    .gnote { margin-bottom: 7px; padding: 6px 9px; border-radius: var(--r-md);
-             background: color-mix(in srgb, var(--live) 9%, transparent);
-             color: var(--live); font-size: 10px; line-height: 1.45; }
 
     /*
-     * Le bloc qui porte le levier : ce n'est pas une statistique, c'est un
-     * geste — copier une liste et la coller dans le canal de la guilde. Il est
-     * donc en tête, et c'est le seul endroit de l'onglet avec un bouton.
-     */
-    /*
-     * Le volet Échanges emprunte la boîte des souhaits de guilde : c'est la
-     * même famille — ce que les autres joueurs peuvent pour toi — et deux
-     * cadres différents dans un même onglet se seraient disputés l'attention.
+     * Échanges et Amis du classement partagent la même boîte : c'est la même
+     * famille — ce que les autres joueurs peuvent pour toi — et deux cadres
+     * différents dans un même onglet se seraient disputé l'attention.
      */
     .troc { padding: 9px 10px; margin-bottom: 8px; border: 1px solid var(--line);
             border-radius: var(--r-lg); font-size: 10px; line-height: 1.55; color: var(--dim); }
@@ -6812,70 +6259,70 @@
                   overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     .troc .plus { margin-top: 6px; color: var(--muted); }
 
-    .gwish { padding: 9px 10px; margin-bottom: 8px; border: 1px solid var(--line);
-             border-radius: var(--r-lg); font-size: 10px; line-height: 1.55; color: var(--dim); }
-    .gwish .h { display: flex; align-items: baseline; gap: 6px;
-                font-size: 11px; color: var(--text); font-weight: 600; margin-bottom: 3px; }
     /*
-     * Rafraîchir n'est pas un troisième bouton : c'est une reprise, pas une
-     * action du cycle. Une poignée discrète en bout de titre, à la même place
-     * que celle du Marché — on la trouve quand on la cherche, elle ne dispute
-     * rien aux deux boutons de copie.
+     * Le top 200 du classement. Même boîte que les Échanges, juste en
+     * dessous : l'un fait venir des amis, l'autre montre ce qu'ils ont.
      */
-    /*
-     * 20 px, pas 11.
-     *
-     * Mesurée dans le panneau, cette poignée faisait 11 × 11 : la plus petite
-     * cible de tout l'outil, plus petite que le ✕ des relances qu'on a déjà
-     * élargi à 20 px pour cette raison, et plus petite que la poignée de
-     * redimensionnement. Un glyphe de 11 px n'est pas une cible — c'est un
-     * dessin qu'on vise.
-     *
-     * La surface grandit, le glyphe non : « width/height » portent le clic,
-     * « place-items » recentre le ↻ dedans. Et « align-self » parce que la
-     * ligne de titre aligne ses enfants sur la ligne de base — une boîte de
-     * 20 px y pendrait sous le texte.
-     */
-    .gwish .h .rf {
-      margin: 0 0 0 auto; padding: 0; width: 20px; height: 20px; align-self: center;
-      display: grid; place-items: center; border: 0; border-radius: var(--r-sm); background: none;
-      color: var(--dim); font-size: 11px; line-height: 1; cursor: pointer; transition: .14s;
-    }
-    .gwish .h .rf:hover { color: var(--live); background: var(--raise); }
-    .gwish b { color: var(--muted); font-weight: 600; font-variant-numeric: tabular-nums; }
-    .gwish em { font-style: normal; color: var(--live); font-weight: 600; }
-    .gwish button {
-      margin-top: 7px; width: 100%; padding: 6px 8px; border: 1px solid var(--line);
-      border-radius: var(--r-md); background: color-mix(in srgb, var(--live) 10%, transparent);
-      color: var(--live); font: inherit; font-size: 11px; font-weight: 600;
-      cursor: pointer; transition: .14s;
-    }
-    .gwish button:hover { background: color-mix(in srgb, var(--live) 18%, transparent); }
-    .gwish button:disabled { opacity: .5; cursor: default; }
-    /* Le second geste est occasionnel : même place, moins de poids. */
-    .gwish button[data-gtuto] {
-      margin-top: 4px; background: none; color: var(--dim); font-weight: 500; font-size: 10px;
-    }
-    .gwish button[data-gtuto]:hover { background: none; color: var(--muted); }
+    .amis { padding: 9px 10px; margin-bottom: 8px; border: 1px solid var(--line);
+            border-radius: var(--r-lg); font-size: 10px; line-height: 1.55; color: var(--dim); }
+    .amis .h { display: flex; align-items: baseline; gap: 6px;
+               font-size: 11px; color: var(--text); font-weight: 600; margin-bottom: 6px; }
+    .amis .h .age { margin-left: auto; color: var(--dim); font-size: 10px; font-weight: 500; }
 
     /*
-     * Le lot publié, avec l'état de chaque carte. Les numéros sont ceux du
-     * message posté dans le tchat : c'est par eux que les membres réservent,
-     * donc ils doivent se lire ici à l'identique.
+     * La grille : une case par joueur du top, dans l'ordre du classement,
+     * vingt par ligne. C'est ce qui dit où l'on en est d'un coup d'œil — le
+     * vert qui gagne sur le vide à mesure que les demandes sont acceptées.
+     * Chaque état a SA couleur, et la légende en dessous les compte.
      */
-    .glot { list-style: none; margin: 6px 0 0; padding: 0; display: grid; gap: 3px; }
-    .glot li { display: flex; align-items: baseline; gap: 6px; font-size: 11px; color: var(--muted); }
-    .glot .num {
-      flex: none; width: 14px; font-style: normal; font-size: 10px; text-align: center;
-      color: var(--dim); font-variant-numeric: tabular-nums;
+    .amis .grille:empty { display: none; }
+    .amis .cases { display: grid; grid-template-columns: repeat(20, 1fr); gap: 2px; }
+    .amis .cases i {
+      aspect-ratio: 1; border-radius: 2px; background: rgba(255,255,255,.04);
+      box-shadow: inset 0 0 0 1px rgba(255,255,255,.14);
     }
-    .glot b { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis;
-              white-space: nowrap; font-weight: 500; color: var(--text); }
-    .glot span { flex: none; font-size: 10px; color: var(--dim); }
-    .glot .prete b { color: var(--c); }
-    .glot .prete span { color: var(--live); }
-    .glot .fait b { color: var(--dim); text-decoration: line-through; }
-    .gmeta { margin-top: 6px; font-size: 10px; color: var(--dim); }
+    .amis .cases i.ami { background: var(--live); box-shadow: none; }
+    .amis .cases i.att { background: var(--warn); box-shadow: none; }
+    /* Reçue : c'est à vous d'agir, sur la page Amis — un bleu, qui ne se confond avec rien. */
+    .amis .cases i.rec { background: #6FA8FF; box-shadow: none; }
+    /* Refusée : présente, mais éteinte. Un rouge franc crierait pour une affaire close. */
+    .amis .cases i.ref { background: color-mix(in srgb, #E5646A 45%, transparent); box-shadow: none; }
+    .amis .cases i.moi { background: none; box-shadow: inset 0 0 0 2px var(--text); }
+    /* La prochaine demande de l'envoi en cours : elle bat, le temps du compte à rebours. */
+    .amis .cases i.suiv { box-shadow: inset 0 0 0 2px var(--warn); animation: amis-pouls 1.2s ease-in-out infinite; }
+    @keyframes amis-pouls { 50% { opacity: .3; } }
+    @media (prefers-reduced-motion: reduce) { .amis .cases i.suiv { animation: none; } }
+
+    .amis .legende { display: flex; flex-wrap: wrap; gap: 2px 9px; margin: 6px 0 7px; }
+    .amis .legende:empty { display: none; }
+    .amis .legende span { display: inline-flex; align-items: center; gap: 4px; white-space: nowrap; }
+    .amis .legende span::before {
+      content: ''; flex: none; width: 7px; height: 7px; border-radius: 2px;
+      background: var(--k, transparent); box-shadow: var(--o, none);
+    }
+    .amis .legende b { color: var(--text); font-weight: 600; font-variant-numeric: tabular-nums; }
+
+    /* La progression de l'envoi en cours, sous le bouton qui l'arrête. */
+    .amis .prog { height: 4px; margin: 1px 0 5px; border-radius: 2px; background: var(--raise); overflow: hidden; }
+    .amis .prog i { display: block; height: 100%; border-radius: 2px; background: var(--warn); transition: width .4s; }
+    .amis .lance {
+      display: block; width: 100%; padding: 6px 8px; border: 1px solid var(--line);
+      border-radius: var(--r-md); background: color-mix(in srgb, var(--live) 10%, transparent);
+      color: var(--live); font: inherit; font-size: 11px; font-weight: 600; cursor: pointer;
+      transition: .14s; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    }
+    .amis .lance:hover { background: color-mix(in srgb, var(--live) 18%, transparent); }
+    .amis .lance:disabled { opacity: .5; cursor: default; }
+    /* Armé : la même couleur que « Tout souhaiter » armé — c'est le même geste. */
+    .amis .lance.arme { background: var(--warn); border-color: var(--warn); color: #1A1206; }
+    /* En cours d'envoi, le bouton ne fait plus qu'arrêter : il perd sa couleur d'action. */
+    .amis .lance.stop { background: none; color: var(--muted); }
+    .amis .lance.stop:hover { color: var(--text); background: var(--raise); }
+    .amis .etat { margin-top: 6px; }
+    .amis .etat:empty { display: none; }
+    .amis .etat div + div { margin-top: 2px; }
+    .amis .etat b { color: var(--muted); font-weight: 600; font-variant-numeric: tabular-nums; }
+    .amis .etat .lien { color: var(--live); cursor: pointer; text-decoration: none; }
 
 
     .mkfoot { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 8px;
@@ -7366,7 +6813,12 @@
         <nav class="tabs" data-tabs>
           <button data-tab-btn="paquets">Paquets</button>
           <button data-tab-btn="marche">Marché<i class="badge" data-badge hidden></i></button>
-          <button data-tab-btn="guilde">Guilde</button>
+          <!--
+            L'onglet s'appelle Amis, mais sa clé reste « guilde » : c'est elle
+            qui est mémorisée comme onglet ouvert, et la changer aurait renvoyé
+            chacun sur Paquets à la mise à jour.
+          -->
+          <button data-tab-btn="guilde">Amis</button>
           <button data-tab-btn="succes">Succès</button>
           <button data-tab-btn="reglages">Réglages</button>
         </nav>
@@ -7459,12 +6911,21 @@
             </div>
           </section>
 
+          <!--
+            Dans l'ordre où l'on s'en sert : ce que les amis détiennent, puis le
+            moyen d'en avoir davantage. Le bloc du classement est posé ici une
+            fois pour toutes ; seuls le texte du bouton, la grille et la ligne
+            d'état changent ensuite. Réécrire le bouton à chaque seconde du
+            compte à rebours avalerait le clic qui veut l'arrêter.
+          -->
           <section class="tab" data-tab="guilde">
-            <label class="opt" title="Relève les souhaits de la guilde toutes les 5 minutes, même hors de cet onglet, et vous prévient dès qu'un souhait porte sur une de vos Super Rares ou Ultra Rares. Les cartes étiquetées et les favoris ne déclenchent jamais d'alerte.">
-              <input type="checkbox" data-opt-gwatch> Alerter sur mes SR / UR demandées</label>
-            <div class="gwish" data-gwish></div>
-            <div data-gdons></div>
             <div class="troc" data-troc></div>
+            <div class="amis" data-amis>
+              <div class="h" title="Les 200 premiers du classement général, qui trie les joueurs sur le nombre de cartes possédées.">Top 200 du classement <span class="age" data-amis-age></span></div>
+              <div class="grille" data-amis-grille></div>
+              <button class="lance" data-amis-go>Ajouter en amis</button>
+              <div class="etat" data-amis-etat></div>
+            </div>
           </section>
 
           <section class="tab" data-tab="reglages">
@@ -7535,10 +6996,11 @@
       dbnote: q('[data-dbnote]'),
       notifnote: q('[data-notifnote]'),
       diag: q('[data-diag]'),
-      gwish: q('[data-gwish]'),
       troc: q('[data-troc]'),
-      optGwatch: q('[data-opt-gwatch]'),
-      gdons: q('[data-gdons]'),
+      amisAge: q('[data-amis-age]'),
+      amisGrille: q('[data-amis-grille]'),
+      amisGo: q('[data-amis-go]'),
+      amisEtat: q('[data-amis-etat]'),
       optDb: q('[data-opt-db]'),
       optAutostart: q('[data-opt-autostart]'),
       optNotify: q('[data-opt-notify]'),
@@ -7587,7 +7049,6 @@
     ui.optWish.checked = prefs.watchWish;
     ui.optAutoclaim.checked = prefs.autoclaim;
     ui.optDb.checked = prefs.db;
-    ui.optGwatch.checked = prefs.watchGuild;
     ui.optAutoresume.checked = prefs.autoResume;
     ui.optBids.checked = prefs.watchBids;
     ui.optRelist.checked = prefs.relistUnsold;
@@ -7961,106 +7422,31 @@
   }
 
   /*
-   * L'onglet Guilde : le lot à publier, les échanges, et l'alerte sur les
-   * souhaits que vous pouvez servir.
+   * L'onglet Amis (clé « guilde ») : les échanges, et le top 200 du classement
+   * à demander en ami.
    */
   function wireGuildeTab() {
-    ui.optGwatch.addEventListener('change', (e) => {
-      prefs.watchGuild = e.target.checked;
-      saveStore({ watchGuild: prefs.watchGuild });
-      /*
-       * Premier armement : on relève tout de suite, mais sans rien signaler du
-       * passé. Cocher la case ne doit pas déclencher une volée d'alertes sur
-       * des souhaits posés il y a trois jours — seul ce qui arrive ensuite
-       * mérite qu'on te dérange.
-       */
-      if (prefs.watchGuild) {
-        state.guildSilence = true;
-        refreshGuild(true);
-      }
-    });
-
-    /*
-     * Préparer, puis copier. Deux temps volontairement : la première lecture
-     * de la collection coûte une dizaine de requêtes, on ne la déclenche pas
-     * en ouvrant l'onglet. Le texte copié se colle tel quel dans le canal de la
-     * guilde — c'est le livrable, le panneau n'écrit nulle part à ta place.
-     */
     ui.troc.addEventListener('click', (e) => {
       const b = e.target.closest('[data-troc-qui]');
       if (b) goTroc(b.dataset.trocQui);
     });
 
-    ui.gwish.addEventListener('click', async (e) => {
-      const tuto = e.target.closest('[data-gtuto]');
-      const refaire = e.target.closest('[data-gnext]');
-      const bouton = tuto || refaire || e.target.closest('[data-gcopy]');
-      if (!bouton) return;
-      bouton.disabled = true;
-      try {
-        /*
-         * Refaire le lot : relecture sans cache. Une carte étiquetée il y a
-         * deux minutes doit en sortir maintenant, pas à l'expiration du cache
-         * d'une heure — et c'est justement après un étiquetage qu'on clique.
-         */
-        if (refaire) {
-          bouton.textContent = '…';
-          const neuf = await suggestWishes(LOT_SOUHAITS, true);
-          if (neuf && neuf.length) {
-            state.aSouhaiter = neuf;
-            saveLot();
-          }
-          renderGuild();
-          return;
-        }
-        /*
-         * Le mode d'emploi ne marque rien comme publié : il ne consomme aucune
-         * carte, et on peut vouloir le reposter quand de nouveaux membres
-         * arrivent.
-         */
-        if (tuto) {
-          await navigator.clipboard.writeText(messageGuildeTuto());
-          bouton.textContent = 'Copié — à poster une fois';
-          return;
-        }
-        /*
-         * Pas de lot en cours : on en prépare un, en relisant la collection
-         * sans passer par le cache. Une carte étiquetée il y a deux minutes
-         * doit en être absente maintenant, pas à l'expiration du cache.
-         */
-        if (!state.aSouhaiter || !state.aSouhaiter.length) {
-          bouton.textContent = 'Lecture de votre collection…';
-          state.aSouhaiter = await suggestWishes(LOT_SOUHAITS, true);
-          if (!state.aSouhaiter) {
-            bouton.textContent = 'Collection illisible — active la lecture de la base';
-            return;
-          }
-          saveLot();
-          renderGuild();
-          return;
-        }
-        const texte = messageGuildeLot(state.aSouhaiter);
-        await navigator.clipboard.writeText(texte);
-        /*
-         * Copié vaut publié : le lot suivant en sortira d'autres. Sans ce
-         * marquage, republier une semaine plus tard recollerait exactement les
-         * mêmes quarante titres.
-         */
-        /*
-         * Borné comme le registre des souhaits vus : sans plafond, la liste
-         * grossirait d'un lot par publication et finirait par occuper le
-         * stockage pour rien. Au-delà, les plus anciennes cartes redeviennent
-         * publiables — ce qui est exactement le recyclage voulu.
-         */
-        state.publiees = [...new Set([...(state.publiees || []), ...state.aSouhaiter.map((c) => c.id)])]
-          .slice(-PUBLIEES_MAX);
-        saveStore({ publiees: state.publiees });
-        bouton.textContent = 'Copié — à coller dans le canal de la guilde';
-      } catch (_) {
-        bouton.textContent = 'Copie refusée par le navigateur';
-      } finally {
-        setTimeout(() => { bouton.disabled = false; renderGuild(); }, 2500);
-      }
+    /*
+     * Le top 200. Le bouton est le SEUL chemin vers l'envoi : il lit, arme,
+     * puis envoie au second clic — ou arrête, pendant l'envoi. Voir
+     * `amisClick`.
+     */
+    ui.amisGo.addEventListener('click', amisClick);
+    /*
+     * Pas `data-goto` : son gestionnaire général retombe sur une navigation
+     * classique quand la barre du site n'a pas le lien, et un rechargement
+     * couperait un envoi en cours. `goPath` passe par le routeur du site.
+     */
+    ui.amisEtat.addEventListener('click', (e) => {
+      const lien = e.target.closest('[data-amis-lien]');
+      if (!lien) return;
+      e.preventDefault();
+      goPath(lien.dataset.amisLien);
     });
   }
 
@@ -8296,8 +7682,12 @@
     // Ouvrir le Marché suffit à le rendre juste : une liste vieille d'une heure
     // affichée telle quelle est ce qui lui donnait son air d'inachevé.
     if (nom === 'marche') freshenMarket();
-    // Même principe pour la Guilde, à la cadence que le serveur tolère.
-    if (nom === 'guilde') refreshGuild();
+    // Même principe pour l'onglet Amis : la liste d'amis se relit — c'est elle
+    // qui dit qui a accepté ou refusé —, et le classement s'il a vieilli.
+    if (nom === 'guilde') {
+      refreshAmis(false).then(renderAmis, () => {});
+      amisLireAuto();
+    }
   }
 
   /** Le panneau se déplace au doigt comme à la souris ; sa position est mémorisée. */
@@ -8577,154 +7967,13 @@
   }
 
   /*
-   * L'onglet Guilde répond à une seule question : où sont les points qu'on ne
-   * prend pas, et que puis-je faire là, maintenant.
-   *
-   * Il ne donne jamais à ta place. Un exemplaire donné ne revient pas, et le
-   * bon destinataire dépend de choses que le script ne sait pas — il classe,
-   * chiffre l'arbitrage, et te mène à la page.
+   * L'onglet Amis (clé « guilde », d'où le nom) : ce que les amis détiennent,
+   * puis le top 200 du classement à demander en ami. La partie guilde — les
+   * dons possibles et leur alerte — est retirée en 3.8.0.
    */
   function renderGuild() {
-    /*
-     * Avant le retour anticipé qui suit : les échanges ne dépendent pas du
-     * relevé de la guilde, ils viennent de la liste de souhaits. Les laisser
-     * derrière ce garde les aurait rendus invisibles tant que la guilde se
-     * tait — c'est-à-dire au tout premier affichage, celui qui compte.
-     */
     renderTroc();
-
-    const g = state.guild;
-    if (!g || !g.at) {
-      paint(ui.gdons, `<div class="gskip">Relevé de la guilde en cours…</div>`);
-      paint(ui.gwish, '');
-      return;
-    }
-
-    /*
-     * L'onglet suit le cycle, dans son ordre : le lot publié et son état, puis
-     * ce qu'il y a à donner tout de suite, puis le contexte de guilde.
-     *
-     * Chaque carte du lot porte son état — en attente, réclamée par quelqu'un,
-     * donnée. C'est ce qui remplace le bouton « lot suivant » : on voit où en
-     * est le cycle au lieu de devoir s'en souvenir.
-     */
-    const lot = state.aSouhaiter;
-    const reclamees = new Set(g.cartesSouhaitees || []);
-    const parCarte = new Map((g.servables || []).map((s) => [s.carte, s.pour]));
-
-    /*
-     * Protection inconnue — la lecture a échoué — : on n'affiche aucune carte
-     * comme donnable. La même prudence que l'alerte, pour la même raison :
-     * mieux vaut une liste vide qu'une carte étiquetée présentée comme libre.
-     */
-    const protegees = g.protegees;
-    const etatCarte = (c, i) => {
-      const num = `<i class="num">${i + 1}</i>`;
-      const nom = `<b>${esc(c.titre)}</b>`;
-      if (c.donnee) return `<li class="fait">${num}${nom}<span>donnée</span></li>`;
-      /*
-       * Étiquetée après la publication : le numéro reste, pour que le message
-       * déjà posté garde son sens, mais la carte est barrée. À toi de refaire
-       * le lot avec ↻ — le script ne republie pas à ta place.
-       */
-      if (protegees && protegees.has(c.id)) {
-        return `<li class="fait">${num}${nom}<span>étiquetée — ne pas donner</span></li>`;
-      }
-      if (parCarte.has(c.id)) {
-        return `<li class="prete" style="--c:${RARITY_COLOR[c.rarete]}">${num}${nom}
-          <span>à donner → ${esc(parCarte.get(c.id))}</span></li>`;
-      }
-      // « pas encore servable » : le mot n'existe ni dans le jeu ni ailleurs.
-      // Ce qui se passe est que quelqu'un l'a demandée et que le site n'ouvre
-      // pas encore le don — c'est cela qu'il faut écrire.
-      if (reclamees.has(c.id)) return `<li>${num}${nom}<span>demandée, don pas encore ouvert</span></li>`;
-      return `<li>${num}${nom}<span>en attente</span></li>`;
-    };
-
-    const restantes = lot ? lot.filter((c) => !c.donnee).length : 0;
-    paint(ui.gwish, lot && lot.length
-      ? `<div class="h">Lot en cours · ${restantes}/${lot.length} à placer
-           <button class="rf" data-gnext title="Relit votre collection et refait le lot — à faire après avoir étiqueté des cartes, ou pour changer de sélection">↻</button></div>
-         <ol class="glot">${lot.map(etatCarte).join('')}</ol>
-         <div class="gmeta"><b>${lot.reduce((s, c) => s + (c.donnee ? 0 : karmaDe(c.rarete)), 0).toLocaleString('fr-FR')}</b>
-           karma restant à prendre${lot.ecartees
-             ? ` · <span title="Une carte étiquetée ou mise en favori sur le site ne part jamais dans un lot : c'est ainsi qu'on garde une carte.">${lot.ecartees} carte${lot.ecartees > 1 ? 's' : ''} gardée${lot.ecartees > 1 ? 's' : ''}</span>`
-             : ''}${
-           /*
-            * Le compteur de caractères s'affichait en permanence — « 212/1000 »
-            * — pour une limite qu'un lot de cinq titres n'approche jamais. Il ne
-            * gardait d'ailleurs rien : la constante n'était lue que là. Il ne
-            * paraît plus que le jour où il aurait quelque chose à empêcher.
-            */
-           messageGuildeLot(lot).length > CHAT_MAX
-             ? ` · <span class="hot">message trop long pour le tchat (${messageGuildeLot(lot).length} signes sur ${CHAT_MAX})</span>`
-             : ''}</div>
-         <button data-gcopy>Copier le lot</button>
-         <button data-gtuto title="La marche à suivre ne change pas d'un lot à l'autre : une fois suffit, ou quand de nouveaux membres arrivent">Copier le mode d'emploi</button>`
-      : `<div class="h">Aucun lot en cours</div>
-         Cinq de vos Super Rares et Ultra Rares, à publier dans le tchat. Le lot suivant se
-         prépare seul une fois celles-ci données.
-         <button data-gcopy>Préparer le premier lot</button>
-         <button data-gtuto>Copier le mode d'emploi</button>`);
-
-    /*
-     * Sous les boutons : rien, sauf ce qui appelle un geste.
-     *
-     * Il y avait ici un tableau de bord de guilde, une liste des cartes qu'il
-     * valait mieux vendre, et une ligne de diagnostic. Le premier motive une
-     * fois puis devient du papier peint ; la deuxième énumère des non-actions ;
-     * la troisième ne parle qu'au script. Trois blocs relus chaque jour sans
-     * que rien n'en découle jamais.
-     *
-     * Ne reste que la file : les souhaits servables qui ne sont PAS dans le lot
-     * en cours — celui-ci porte déjà leur état. Mêmes filtres que l'alerte, pour
-     * qu'un souhait ne soit jamais montré ici et tu par là : SR et UR seulement,
-     * jamais une carte étiquetée ou en favori.
-     */
-    const dansLeLot = new Set((lot || []).map((c) => c.id));
-    const file = new Map();
-    for (const s of protegees ? g.servables || [] : []) {
-      if (dansLeLot.has(s.carte) || protegees.has(s.carte)) continue;
-      if (!RARETES_UTILES.includes(s.rarete)) continue;
-      if (!file.has(s.carte)) file.set(s.carte, { ...s, pours: [] });
-      file.get(s.carte).pours.push(s.pour);
-    }
-
-    /*
-     * Le dernier événement signalé, tant qu'il est d'actualité. Il n'était
-     * écrit nulle part de visible : sans notification bureau — décochée par
-     * défaut — un lot qui s'enchaînait tout seul ne se voyait pas, et la
-     * variable qui le portait n'avait aucun lecteur. Même traitement que la
-     * note du Marché : datée, donc elle s'efface au lieu de vieillir à l'écran.
-     */
-    const note = state.guildNote && Date.now() - state.guildNoteAt < GUILD_NOTE_TTL
-      ? `<div class="gnote">${esc(state.guildNote)}</div>`
-      : '';
-
-    paint(ui.gdons, note + (file.size
-      /*
-       * « sect suite », et non « rh sub ».
-       *
-       * Ce titre empruntait les classes de l'en-tête des relances, qui ne
-       * vivent que sous « .relist » — le même balisage, dans le volet
-       * Relances, est bien à l'intérieur et fonctionne. Ici il est dans
-       * l'onglet Guilde : aucune des deux règles ne l'atteignait, et il
-       * s'affichait à la taille par défaut du navigateur, 13 px sans graisse,
-       * au milieu d'un panneau dont tous les intertitres font 11 px en 600.
-       *
-       * « .sect.suite » est l'intertitre séparé du panneau, celui des
-       * Réglages. C'est exactement ce rôle-ci.
-       */
-      ? `<div class="sect suite">Hors lot, à donner aussi</div>` +
-        [...file.values()].map((s) => `
-          <div class="gdon" style="--c:${RARITY_COLOR[s.rarete] || '#8C8275'}"
-               title="${esc(s.pours.join(', '))}">
-            <div class="t"><i>${s.rarete}</i><b>${esc(s.titre)}</b></div>
-            <div class="m">${s.pours.length === 1
-              ? `→ ${esc(s.pours[0])}`
-              : `${s.pours.length} demandeurs`} · <b>+${karmaDe(s.rarete)} karma</b></div>
-          </div>`).join('')
-      : ''));
+    renderAmis();
   }
 
   /**
@@ -9044,11 +8293,17 @@
     for (const [id, proprios] of Object.entries(chezAmis)) {
       const carte = cartes[id];
       if (!carte) continue;
-      const qui = proprios
-        .filter((a) => !engages.has(`${a.id}:${id}`))
-        .map((a) => a.username);
+      const libres = proprios.filter((a) => !engages.has(`${a.id}:${id}`));
+      const qui = libres.map((a) => a.username);
       if (!qui.length) continue;
-      lignes.push({ id, t: carte.t, r: carte.r, qui: [...new Set(qui)] });
+      /*
+       * Les identifiants voyagent avec les pseudos : ce sont eux que retient
+       * la mémoire des demandes d'ami, et c'est par eux que le bloc du
+       * classement compte les souhaits trouvés chez les amis qu'il a ajoutés.
+       * Un pseudo change ; l'identifiant, non.
+       */
+      lignes.push({ id, t: carte.t, r: carte.r, qui: [...new Set(qui)],
+                    ids: [...new Set(libres.map((a) => a.id).filter(Boolean))] });
       for (const u of qui) amis.add(u);
     }
     const rang = (r) => {
@@ -9073,16 +8328,15 @@
    * Le volet Échanges
    * -----------------
    * `friendOwners` répond à la question que le marché ne sait pas traiter :
-   * non pas « qui vend cette carte », mais « qui l'a ». Sur la liste de
-   * souhaits, mesuré au moment de l'écriture : 37 souhaits sur 71 détenus par
-   * au moins un ami, 26 amis distincts. Plus de la moitié de ce qu'on cherche
-   * est à portée de conversation, et rien ne le disait.
+   * non pas « qui vend cette carte », mais « qui l'a ». Sur une liste de
+   * souhaits ordinaire, une bonne part de ce qu'on cherche est à portée de
+   * conversation, et rien ne le disait.
    *
-   * Il vit dans l'onglet Guilde, pas dans un cinquième onglet : la barre en
-   * porte quatre à 11,5 px, et un cinquième déborderait à 260 px de large — la
-   * borne basse de la poignée de redimensionnement. Guilde est d'ailleurs déjà
-   * l'onglet des autres joueurs : ce qu'ils demandent, ce qu'on peut leur
-   * donner, et maintenant ce qu'ils détiennent.
+   * Il vit dans l'onglet Amis (clé « guilde »), pas dans un onglet à lui : la
+   * barre en porte déjà cinq à 11,5 px, et un de plus déborderait à 260 px de
+   * large — la borne basse de la poignée de redimensionnement. C'est l'onglet
+   * des autres joueurs : ce qu'ils détiennent, comment en faire des amis, et
+   * ce que la guilde demande.
    *
    * Ce que le volet NE fait pas : proposer. Une proposition engage une de tes
    * cartes et un autre joueur ; c'est de la même famille que vendre ou donner,
@@ -9099,7 +8353,8 @@
     if (!lignes.length) {
       ui.troc.innerHTML = '<div class="h">Échanges</div>'
         + '<div>Aucun de vos souhaits n’est détenu par un ami pour l’instant. '
-        + 'La liste est relue avec vos souhaits, toutes les quinze minutes.</div>';
+        + 'La liste est relue avec vos souhaits, toutes les quinze minutes. Plus vous '
+        + 'avez d’amis, plus elle trouve : le bloc suivant ajoute les premiers du classement.</div>';
       return;
     }
 
@@ -9182,6 +8437,733 @@
         clearInterval(id);
       }
     }, 250);
+  }
+
+  /*
+   * Amis du classement
+   * ------------------
+   * Le volet Échanges ne voit que les cartes de vos AMIS : `friendOwners` ne
+   * dit rien des autres joueurs, et aucune route ne dit qui possède une carte.
+   * Plus le cercle est large, plus il trouve. Et ceux qui ont le plus de
+   * chances d'avoir une carte donnée sont ceux qui en ont le plus : le haut du
+   * classement général, trié sur le nombre de cartes possédées.
+   *
+   * Relevé en lecture seule le 12 septembre 2026 :
+   *   - `GET /api/leaderboard?period=all&page=N` : 25 joueurs par page, fixe
+   *     (`limit` est ignoré), pages comptées à partir de 1, une seconde et
+   *     demie chacune côté serveur. `weekly` répond 500, `daily` s'arrête à
+   *     25 joueurs : aucun moyen de ne garder que les joueurs actifs ;
+   *   - `GET /api/friends` rend amis et demandes en un appel, statuts
+   *     `accepted` et `pending` ;
+   *   - `POST /api/friends {addressee_id}` : l'identifiant du classement suffit.
+   *
+   * Trois règles, qui valent plus que le bouton :
+   *
+   * 1. Au rythme d'une personne. Une demande toutes les 8 à 45 secondes,
+   *    tirées au hasard, et une pause d'une à trois minutes toutes les six à
+   *    douze demandes. Jamais de rafale : chaque demande arrive chez un vrai
+   *    joueur, et le jeu permet de signaler un envoi pour « Spam ».
+   *
+   * 2. On ne redemande JAMAIS. Une demande refusée disparaît de la liste
+   *    d'amis sans laisser de trace : pour le site, un joueur qui a dit non
+   *    ressemble à un joueur jamais demandé. Le panneau tient donc sa propre
+   *    mémoire (`lireVus`), où entre tout joueur croisé dans la liste d'amis —
+   *    ami, demande envoyée, demande reçue — et tout joueur à qui le bouton a
+   *    écrit. Rien n'en sort, sauf un envoi que le serveur a explicitement
+   *    refusé : là, on sait qu'aucune demande n'a été créée.
+   *
+   * 3. Rien ne part sans deux clics : le premier lit et annonce le compte, le
+   *    second envoie. Le panneau ne retire, n'accepte ni ne refuse aucune
+   *    demande : ces gestes restent sur la page Amis du site.
+   */
+  /*
+   * Deux cents, fixe. Il y avait un choix Top 50 / 100 / 200 : à l'usage, le
+   * 200 faisait le travail et les deux autres ne servaient à rien.
+   */
+  const AMIS_PROF = 200;
+  const CLASSEMENT_PAGE = 25;              // fixé par le serveur
+  const CLASSEMENT_TTL_MS = 86400000;      // un jour : le haut du classement bouge lentement
+  const CLASSEMENT_GAP_MS = 600;           // souffle entre deux pages lues
+  const AMIS_TTL_MS = 600000;              // la liste d'amis, relue au plus toutes les dix minutes
+  const AMIS_KEY = 'wm-auto-amis';         // la mémoire des demandes, à part du stockage principal
+  const AMIS_ENVOI_KEY = 'wm-auto-amis-envoi';   // un seul onglet envoie à la fois
+  const AMIS_ENVOI_TTL = 150000;           // un onglet d'arrière-plan ne bat qu'une fois par minute
+  const AMIS_NOTE_MS = 20000;              // même tenue que les comptes rendus de « Tout souhaiter »
+  /*
+   * Le rythme. Un intervalle = un minimum + une part exponentielle : beaucoup
+   * d'écarts courts, quelques longs — la façon dont on enchaîne vraiment des
+   * gestes à la main. Plafonné pour qu'un tirage malchanceux ne fige pas
+   * l'envoi. Moyenne autour de 17 secondes.
+   */
+  const AMIS_PAS_MIN_MS = 8000;
+  const AMIS_PAS_TYPE_MS = 9000;
+  const AMIS_PAS_MAX_MS = 45000;
+  const AMIS_PAUSE_APRES = [6, 12];        // demandes entre deux pauses
+  const AMIS_PAUSE_MS = [60000, 180000];
+  const AMIS_REPRISES = 2;                 // nouveaux essais après un « ralentissez »
+  // Même raison que `WISH_ARME_MIN_MS` : un double-clic n'a rien lu.
+  const AMIS_ARME_MIN_MS = 500;
+
+  let amisBusy = '';        // '' | 'lecture' | 'lecture i/n' | 'envoi'
+  let amisArme = 0;         // fin d'armement
+  let amisArmeA = 0;        // début d'armement
+  let amisLot = null;       // ce que le second clic enverra
+  let amisStop = false;     // demandé par le bouton, pendant l'envoi
+  let amisEnvoi = null;     // { fait, total, prochaine, pause } pendant l'envoi
+  let amisMinuteur = 0;     // compte à rebours et battement du verrou, pendant l'envoi
+  let amisNote = '';
+  let amisNoteTitre = '';
+  let amisNoteAt = 0;
+  let amisTenteA = 0;       // dernière lecture de la liste d'amis TENTÉE, réussie ou non
+
+  function amisEnvoiEnCours() {
+    return amisBusy === 'envoi';
+  }
+
+  function amisDire(note, titre) {
+    amisNote = note;
+    amisNoteTitre = titre || '';
+    amisNoteAt = Date.now();
+  }
+
+  function amisDesarmer() {
+    amisArme = 0;
+    amisLot = null;
+  }
+
+  const amisTirage = ([a, b]) => Math.round(a + Math.random() * (b - a));
+
+  function amisPas() {
+    const x = AMIS_PAS_MIN_MS - Math.log(1 - Math.random()) * AMIS_PAS_TYPE_MS;
+    return Math.round(Math.min(AMIS_PAS_MAX_MS, x));
+  }
+
+  /** Durée attendue pour n demandes, pauses comprises — pour l'annoncer, pas pour la tenir. */
+  function amisEstime(n) {
+    const serie = (AMIS_PAUSE_APRES[0] + AMIS_PAUSE_APRES[1]) / 2;
+    const pause = (AMIS_PAUSE_MS[0] + AMIS_PAUSE_MS[1]) / 2;
+    return n * (AMIS_PAS_MIN_MS + AMIS_PAS_TYPE_MS) + Math.floor(n / serie) * pause;
+  }
+
+  const amisDuree = (ms) => (ms < 60000 ? 'moins d’une minute' : fmtSpan(ms));
+  const rangFr = (r) => (r === 1 ? '1er' : `${r}e`);
+
+  /*
+   * La mémoire des demandes. Une clé à part, hors de `saveStore` : le
+   * stockage principal se réécrit en entier à chaque réglage, et on le sait
+   * proche du plafond sur les grosses collections. Celle-ci doit tenir — c'est
+   * elle qui empêche de redemander quelqu'un qui a dit non.
+   *
+   * `null` veut dire illisible, et alors on n'envoie RIEN. Rendre `{}` sur
+   * une mémoire corrompue ferait redemander tout le monde.
+   *
+   * Une entrée par joueur, sous son identifiant — un pseudo change, pas lui :
+   * { n: pseudo, e: état, at: première rencontre, m: dernier changement,
+   *   o: 1 si c'est le panneau qui a demandé, r: son rang à ce moment-là }.
+   * États : envoyee, attente, recue, ami, refusee, retire, close.
+   */
+  function lireVus() {
+    let brut;
+    try {
+      brut = localStorage.getItem(AMIS_KEY);
+    } catch (_) {
+      return null;
+    }
+    if (brut == null) return {};
+    try {
+      const v = JSON.parse(brut);
+      return v && typeof v === 'object' && !Array.isArray(v) ? v : null;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  /** Écrit, puis relit : une écriture qu'on ne peut pas relire n'a pas eu lieu. */
+  function ecrireVus(vus, id) {
+    try {
+      localStorage.setItem(AMIS_KEY, JSON.stringify(vus));
+    } catch (_) {
+      return false;
+    }
+    const relu = lireVus();
+    return !!relu && (!id || !!relu[id]);
+  }
+
+  /*
+   * Relit la liste d'amis et met la mémoire à jour. Un joueur qui sort de la
+   * liste dit ce qu'il était la dernière fois qu'on l'a vu : une demande en
+   * attente qui s'en va a été refusée, un ami qui s'en va vous a retiré.
+   *
+   * Une entrée écrite PENDANT la lecture n'est pas jugée : la demande est
+   * peut-être partie après que le serveur a préparé sa réponse. La croire
+   * refusée ne changerait rien à l'envoi — elle reste en mémoire — mais
+   * l'écran mentirait.
+   *
+   * @returns {Promise<object|null>} la mémoire à jour, ou `null` si la liste
+   *   n'a pas pu être lue : l'appelant n'envoie alors rien.
+   */
+  async function refreshAmis(force) {
+    /*
+     * La fraîcheur se compte sur la dernière TENTATIVE, comme pour la guilde :
+     * appelée par un tour d'une seconde, une lecture qui échoue repartirait
+     * sinon à chaque seconde.
+     */
+    if (!force && Date.now() - Math.max(state.amis.at, amisTenteA) < AMIS_TTL_MS) return lireVus();
+    amisTenteA = Date.now();
+    const moi = await fetchMyId();
+    if (!moi) return null;
+    const debut = Date.now();
+    let d;
+    try {
+      d = await api('/api/friends');
+    } catch (_) {
+      return null;
+    }
+    const liste = d.status === 200 && d.data && Array.isArray(d.data.friendships)
+      ? d.data.friendships
+      : null;
+    if (!liste) return null;
+    const vus = lireVus();
+    if (!vus) return null;
+
+    const presents = new Set();
+    let recues = 0;
+    for (const f of liste) {
+      if (!f) continue;
+      const sortant = f.requester_id === moi;
+      const id = sortant ? f.addressee_id : f.requester_id;
+      if (!id || id === moi) continue;
+      const autre = (sortant ? f.addressee : f.requester) || {};
+      /*
+       * Un statut inconnu n'est pas une porte ouverte : le joueur entre en
+       * mémoire comme les autres, et ne sera donc jamais demandé.
+       */
+      const e = f.status === 'accepted' ? 'ami'
+        : f.status === 'pending' ? (sortant ? 'attente' : 'recue')
+          : (sortant ? 'refusee' : 'close');
+      if (e === 'recue') recues += 1;
+      presents.add(id);
+      const v = vus[id];
+      const n = autre.username || (v && v.n) || '';
+      if (!v) vus[id] = { n, e, at: Date.now(), m: Date.now() };
+      else if (v.e !== e || v.n !== n) vus[id] = { ...v, n, e, m: v.e !== e ? Date.now() : v.m };
+    }
+    const suite = { envoyee: 'refusee', attente: 'refusee', ami: 'retire', recue: 'close' };
+    for (const [id, v] of Object.entries(vus)) {
+      if (!v || presents.has(id) || !suite[v.e] || v.m > debut) continue;
+      vus[id] = { ...v, e: suite[v.e], m: Date.now() };
+    }
+    if (!ecrireVus(vus)) return null;
+    state.amis = { at: Date.now(), recues };
+    return vus;
+  }
+
+  /**
+   * Les N premiers du classement général. Gardés un jour ; un classement lu
+   * plus profond sert aussi pour moins profond.
+   *
+   * @returns {Promise<Array|null>} `null` si une page a manqué : armer sur un
+   *   classement troué annoncerait un compte faux.
+   */
+  async function lireClassement(prof) {
+    const c = state.classement;
+    if (c && c.prof >= prof && Date.now() - c.at < CLASSEMENT_TTL_MS) return c.lignes.slice(0, prof);
+    const pages = Math.ceil(prof / CLASSEMENT_PAGE);
+    const lignes = new Map();
+    for (let p = 1; p <= pages; p++) {
+      if (p > 1) await new Promise((r) => setTimeout(r, CLASSEMENT_GAP_MS));
+      amisBusy = `lecture ${p}/${pages}`;
+      renderAmis();
+      let d;
+      try {
+        d = await api(`/api/leaderboard?period=all&page=${p}`);
+      } catch (_) {
+        return null;
+      }
+      const lot = d.status === 200 && d.data && Array.isArray(d.data.entries) ? d.data.entries : null;
+      if (!lot) return null;
+      for (const e of lot) {
+        // Un joueur qui change de page pendant la lecture passerait deux fois.
+        if (e && e.user_id && !lignes.has(e.user_id)) {
+          lignes.set(e.user_id, { u: e.user_id, n: String(e.username || ''), r: Number(e.rank) || 0 });
+        }
+      }
+      if (lot.length < CLASSEMENT_PAGE) break;
+    }
+    const tout = [...lignes.values()].sort((a, b) => a.r - b.r);
+    state.classement = { at: Date.now(), prof, lignes: tout };
+    saveStore({ classement: state.classement });
+    return tout.slice(0, prof);
+  }
+
+  // ---- un seul onglet envoie à la fois : même principe que le verrou de la boucle
+
+  function amisVerrouTenu() {
+    try {
+      const l = JSON.parse(localStorage.getItem(AMIS_ENVOI_KEY) || 'null');
+      if (l && Date.now() - l.at < AMIS_ENVOI_TTL) return l.id;
+    } catch (_) {
+      /* stockage illisible : verrou libre */
+    }
+    return null;
+  }
+
+  function amisPrendreVerrou() {
+    const t = amisVerrouTenu();
+    if (t && t !== instanceId) return false;
+    try {
+      localStorage.setItem(AMIS_ENVOI_KEY, JSON.stringify({ id: instanceId, at: Date.now() }));
+    } catch (_) {
+      /* sans stockage, la mémoire des demandes ne s'écrira pas non plus : l'envoi s'arrêtera */
+    }
+    return true;
+  }
+
+  function amisRendreVerrou() {
+    if (amisVerrouTenu() !== instanceId) return;
+    try {
+      localStorage.removeItem(AMIS_ENVOI_KEY);
+    } catch (_) {}
+  }
+
+  /*
+   * Premier clic : lire le classement et la liste d'amis, écarter, armer.
+   * Second clic dans les six secondes : envoyer. Pendant l'envoi : arrêter.
+   */
+  async function amisClick() {
+    if (amisBusy === 'envoi') {
+      amisStop = true;
+      renderAmis();
+      return;
+    }
+    if (amisBusy) return;
+
+    if (Date.now() < amisArme && amisLot) {
+      if (Date.now() - amisArmeA < AMIS_ARME_MIN_MS) return;
+      const lot = amisLot;
+      amisDesarmer();
+      await amisEnvoyer(lot);
+      return;
+    }
+
+    const tenu = amisVerrouTenu();
+    if (tenu && tenu !== instanceId) {
+      amisDire('Déjà en cours dans un autre onglet',
+        'Un autre onglet envoie des demandes en ce moment. Attendez qu’il ait fini.');
+      renderAmis();
+      return;
+    }
+
+    amisBusy = 'lecture';
+    amisNote = '';
+    renderAmis();
+    try {
+      if (!lireVus()) {
+        amisDire('Mémoire illisible', 'La liste des joueurs déjà demandés n’a pas pu être lue. '
+          + 'Sans elle, le bouton risquerait de redemander quelqu’un qui a refusé : il n’envoie rien.');
+        return;
+      }
+      const moi = await fetchMyId();
+      if (!moi) {
+        amisDire('Session illisible', 'Votre session n’a pas pu être lue dans cet onglet. '
+          + 'Rechargez la page ; si ça persiste, reconnectez-vous au site.');
+        return;
+      }
+      const lignes = await lireClassement(AMIS_PROF);
+      if (!lignes) {
+        amisDire('Classement illisible', 'Le serveur n’a pas rendu le classement en entier. '
+          + 'Rien n’a été envoyé. Réessayez dans une minute.');
+        return;
+      }
+      // Toujours relue : c'est elle qui écarte vos amis et les demandes en cours.
+      const vus = await refreshAmis(true);
+      if (!vus) {
+        amisDire('Liste d’amis illisible', 'Sans elle, le bouton ne peut écarter ni vos amis ni '
+          + 'vos demandes en attente. Rien n’a été envoyé. Réessayez dans une minute.');
+        return;
+      }
+      const lot = lignes.filter((l) => l.u !== moi && !vus[l.u]);
+      if (!lot.length) {
+        amisDire(`Tout le top ${AMIS_PROF} est déjà ami ou demandé`,
+          'Vos amis, vos demandes en attente et les joueurs déjà demandés sont écartés. '
+            + 'Le classement bouge : de nouveaux joueurs y entreront.');
+        return;
+      }
+      amisLot = lot;
+      amisArmeA = Date.now();
+      amisArme = Date.now() + ARME_MS;
+      setTimeout(() => {
+        if (Date.now() < amisArme) return;
+        amisDesarmer();
+        renderAmis();
+      }, ARME_MS + 100);
+    } finally {
+      amisBusy = '';
+      renderAmis();
+    }
+  }
+
+  /** Attendre, en rendant la main dès qu'on demande l'arrêt. */
+  function amisAttendre(ms) {
+    if (amisEnvoi) amisEnvoi.prochaine = Date.now() + ms;
+    return new Promise((ok) => {
+      const fin = Date.now() + ms;
+      const id = setInterval(() => {
+        if (amisStop || Date.now() >= fin) {
+          clearInterval(id);
+          ok();
+        }
+      }, 500);
+    });
+  }
+
+  /** Retire un joueur de la mémoire, si et seulement si c'est le panneau qui venait de l'y mettre. */
+  function amisOublier(id) {
+    const vus = lireVus();
+    if (!vus || !vus[id] || vus[id].e !== 'envoyee') return;
+    delete vus[id];
+    ecrireVus(vus);
+  }
+
+  /*
+   * Une demande, et ce que la réponse dit de la mémoire.
+   *
+   * Le joueur est noté AVANT l'envoi : si l'onglet se ferme pendant la
+   * requête, on ne sait pas si elle est partie, et dans le doute on ne la
+   * refera pas. Il n'en ressort que sur un refus explicite du serveur — un
+   * « ralentissez », une vérification demandée, une autre erreur 4xx : là, on
+   * sait qu'aucune demande n'a été créée, et le garder l'écarterait pour rien.
+   * Une erreur 5xx ne dit pas si la demande est passée : il reste noté.
+   *
+   * @returns {Promise<{echec?: {note, titre}, stop?: boolean}>}
+   */
+  async function amisDemander(j) {
+    for (let essai = 0; ; essai++) {
+      const vus = lireVus();
+      if (!vus) {
+        return { echec: { note: 'Mémoire illisible', titre: 'La liste des joueurs déjà demandés '
+          + 'n’a pas pu être relue. Sans elle, le bouton risquerait de redemander quelqu’un qui a '
+          + 'refusé : il s’arrête.' } };
+      }
+      vus[j.u] = { n: j.n, e: 'envoyee', at: Date.now(), m: Date.now(), o: 1, r: j.r };
+      if (!ecrireVus(vus, j.u)) {
+        return { echec: { note: 'Stockage plein', titre: 'Le navigateur n’a pas pu noter le '
+          + 'joueur avant l’envoi. Sa demande n’est pas partie, et l’envoi s’arrête là.' } };
+      }
+
+      let d;
+      try {
+        d = await api('/api/friends', 'POST', { addressee_id: j.u });
+      } catch (_) {
+        return { echec: { note: 'Réseau coupé', titre: 'La dernière demande est peut-être '
+          + 'partie, peut-être pas. Son joueur reste noté : il ne sera pas redemandé.' } };
+      }
+      if (d.status >= 200 && d.status < 300) return {};
+
+      const message = errorText(d.data);
+      // Déjà amis, ou demande déjà faite : il n'y a rien à refaire.
+      if (d.status === 409 || /déjà|already|exist/i.test(message)) return {};
+      if (d.status >= 500) {
+        // Le code va en console, comme partout : à l'écran, il ne dit pas quoi faire.
+        console.warn('[WikiMasters Tools] demande d’ami : erreur du serveur', { statut: d.status, message });
+        return { echec: { note: 'Erreur du serveur', titre: 'On ne sait pas si la '
+          + 'dernière demande est partie : son joueur reste noté. Réessayez plus tard.' } };
+      }
+
+      amisOublier(j.u);
+      if (needsHuman(d.status, d.data)) {
+        return { echec: { note: 'Vérification humaine demandée', titre: 'Le site demande de '
+          + 'prouver que vous êtes humain. Faites-la dans l’onglet, puis recliquez : les joueurs '
+          + 'déjà demandés sont écartés d’office.' } };
+      }
+      if (d.status === 429 && essai < AMIS_REPRISES) {
+        await amisAttendre(Math.max(d.retryMs || 0, 60000) + amisTirage([2000, 15000]));
+        if (amisStop) return { stop: true };
+        continue;
+      }
+      console.warn('[WikiMasters Tools] demande d’ami refusée', { statut: d.status, message });
+      return { echec: { note: 'Refusé par le serveur',
+        titre: (message ? `Le serveur dit : « ${message} ». ` : 'Le serveur n’a pas dit pourquoi. ')
+          + 'L’envoi s’arrête là ; les demandes déjà parties restent parties.' } };
+    }
+  }
+
+  /*
+   * L'envoi. Seul endroit du panneau qui écrit une demande d'ami, et le
+   * second clic est seul à l'appeler — `verifier.js` le garde.
+   */
+  async function amisEnvoyer(lot) {
+    if (!amisPrendreVerrou()) {
+      amisDire('Déjà en cours dans un autre onglet',
+        'Un autre onglet envoie des demandes en ce moment. Attendez qu’il ait fini.');
+      renderAmis();
+      return;
+    }
+    amisBusy = 'envoi';
+    amisStop = false;
+    amisNote = '';
+    amisEnvoi = { fait: 0, total: lot.length, prochaine: 0, pause: false, suivant: lot[0] || null };
+    amisMinuteur = setInterval(() => {
+      amisPrendreVerrou();   // le battement : un onglet mort libère la place en deux minutes et demie
+      renderAmis();
+    }, 1000);
+    renderAmis();
+
+    let envoyees = 0;
+    let echec = null;
+    let avantPause = amisTirage(AMIS_PAUSE_APRES);
+    try {
+      for (let i = 0; i < lot.length && !amisStop; i++) {
+        const j = lot[i];
+        const vus = lireVus();
+        if (!vus) {
+          echec = { note: 'Mémoire illisible', titre: 'La liste des joueurs déjà demandés n’a pas '
+            + 'pu être relue : l’envoi s’arrête plutôt que de risquer un doublon.' };
+          break;
+        }
+        // Demandé entre-temps — par un autre onglet, ou par la relecture de la liste.
+        if (vus[j.u]) {
+          amisEnvoi.fait = i + 1;
+          continue;
+        }
+        const r = await amisDemander(j);
+        if (r.echec) {
+          echec = r.echec;
+          break;
+        }
+        if (r.stop) break;
+        envoyees += 1;
+        amisEnvoi.fait = i + 1;
+        // Le prochain à qui l'on écrira : celui que la grille fait battre pendant l'attente.
+        const reste = lireVus() || {};
+        amisEnvoi.suivant = lot.slice(i + 1).find((l) => !reste[l.u]) || null;
+        renderAmis();
+        if (i === lot.length - 1 || amisStop || !amisEnvoi.suivant) break;
+
+        let attente = amisPas();
+        amisEnvoi.pause = false;
+        if (--avantPause <= 0) {
+          attente = amisTirage(AMIS_PAUSE_MS);
+          amisEnvoi.pause = true;
+          avantPause = amisTirage(AMIS_PAUSE_APRES);
+        }
+        await amisAttendre(attente);
+      }
+    } finally {
+      clearInterval(amisMinuteur);
+      amisMinuteur = 0;
+      const interrompu = amisStop || echec;
+      const fait = amisEnvoi ? amisEnvoi.fait : 0;
+      amisEnvoi = null;
+      amisBusy = '';
+      amisStop = false;
+      amisRendreVerrou();
+      const s = envoyees > 1 ? 's' : '';
+      if (echec) {
+        amisDire(`${envoyees} demande${s} envoyée${s} · ${echec.note}`, echec.titre);
+      } else if (interrompu) {
+        amisDire(`${envoyees} demande${s} envoyée${s} · arrêté à ${fait} / ${lot.length}`,
+          'Recliquer reprend avec les joueurs restants : ceux déjà demandés sont écartés.');
+      } else {
+        amisDire(`${envoyees} demande${s} envoyée${s}`,
+          'Ceux qui acceptent apparaissent dans Échanges au prochain relevé de vos souhaits.');
+      }
+      refreshAmis(true).then(renderAmis, () => {});
+      renderAmis();
+    }
+  }
+
+  /*
+   * Le classement se lit tout seul quand l'onglet s'ouvre — c'est ce qui
+   * donne la grille et le compte « à demander » AVANT le premier clic. Lecture seule, gardée un jour ; après un échec, pas de
+   * nouvel essai avant une minute, sinon le tour d'une seconde relancerait
+   * la lecture en boucle.
+   */
+  let amisLuA = 0;
+
+  function amisLireAuto() {
+    if (amisBusy) return;
+    const c = state.classement;
+    if (c && c.prof >= AMIS_PROF && Date.now() - c.at < CLASSEMENT_TTL_MS) return;
+    if (Date.now() - amisLuA < 60000) return;
+    amisLuA = Date.now();
+    lireClassement(AMIS_PROF)
+      .catch(() => null)
+      .then(() => {
+        amisBusy = '';
+        renderAmis();
+      });
+  }
+
+  /**
+   * L'état de chacun des joueurs du top choisi : la matière de la grille, de
+   * sa légende et du compte du bouton. Rien ne se lit ici — le classement
+   * vient du cache, les états de la mémoire des demandes.
+   */
+  function amisTop(vus) {
+    const c = state.classement;
+    const top = c && c.lignes ? c.lignes.slice(0, AMIS_PROF) : [];
+    const par = { ami: [], att: [], rec: [], ref: [], vide: [] };
+    const cases = top.map((l) => {
+      const v = vus[l.u];
+      const k = l.u === myId ? 'moi'
+        : !v ? 'vide'
+          : ({ ami: 'ami', attente: 'att', envoyee: 'att', recue: 'rec' })[v.e] || 'ref';
+      if (par[k]) par[k].push(`${rangFr(l.r)} ${l.n}`);
+      const mot = {
+        moi: 'vous', vide: 'à demander', ami: 'ami', att: 'demande en attente',
+        rec: 'vous a demandé en ami', ref: v && v.e === 'retire' ? 'vous a retiré' : 'a refusé',
+      }[k];
+      return { l, k, mot };
+    });
+    return { top, par, cases };
+  }
+
+  function amisGrilleHtml(t) {
+    if (!t.top.length) return '';
+    const suivant = amisEnvoi && amisEnvoi.suivant ? amisEnvoi.suivant.u : '';
+    const cases = t.cases.map(({ l, k, mot }) => {
+      const cls = [k === 'vide' ? '' : k, l.u === suivant ? 'suiv' : ''].filter(Boolean).join(' ');
+      const dit = l.u === suivant ? 'prochaine demande' : mot;
+      return `<i${cls ? ` class="${cls}"` : ''} title="${esc(`${rangFr(l.r)} · ${l.n} — ${dit}`)}"></i>`;
+    }).join('');
+    const puce = (liste, un, plusieurs, style) => (liste.length
+      ? `<span style="${style}" title="${esc(liste.join(', '))}"><b>${liste.length}</b> `
+        + `${liste.length > 1 ? plusieurs : un}</span>`
+      : '');
+    const p = t.par;
+    const legende = [
+      puce(p.ami, 'ami', 'amis', '--k:var(--live)'),
+      puce(p.att, 'en attente', 'en attente', '--k:var(--warn)'),
+      puce(p.rec, 'vous a demandé', 'vous ont demandé', '--k:#6FA8FF'),
+      puce(p.ref, 'a refusé', 'ont refusé', '--k:color-mix(in srgb, #E5646A 45%, transparent)'),
+      puce(p.vide, 'à demander', 'à demander', '--o:inset 0 0 0 1px rgba(255,255,255,.3)'),
+    ].join('');
+    return `<div class="cases">${cases}</div><div class="legende">${legende}</div>`;
+  }
+
+  /** Sous le bouton : l'envoi en cours, le dernier compte rendu, ce que les demandes ont rapporté. */
+  function amisEtatHtml(vus) {
+    const lignes = [];
+    if (amisBusy === 'envoi' && amisEnvoi) {
+      const e = amisEnvoi;
+      const reste = Math.max(0, (e.prochaine || 0) - Date.now());
+      const restantes = e.total - e.fait;
+      const pct = e.total ? Math.round((e.fait / e.total) * 100) : 0;
+      lignes.push(`<div class="prog"><i style="width:${pct}%"></i></div>`);
+      lignes.push(`<div>Envoi <b>${e.fait}</b> / ${e.total}`
+        + (restantes > 0 && !amisStop ? ` · reste environ ${amisDuree(amisEstime(restantes))}` : '')
+        + '</div>');
+      const qui = e.suivant ? `${esc(e.suivant.n)} (${rangFr(e.suivant.r)})` : '';
+      if (amisStop) lignes.push('<div>Arrêt demandé : plus rien ne part.</div>');
+      else if (qui && e.pause && reste) lignes.push(`<div>Pause · ${qui} dans ${fmtClock(reste)}</div>`);
+      else if (qui && reste) lignes.push(`<div>Prochaine : ${qui} dans ${Math.ceil(reste / 1000)} s</div>`);
+      else lignes.push('<div>Envoi…</div>');
+    } else if (amisNote && Date.now() - amisNoteAt < AMIS_NOTE_MS) {
+      lignes.push(`<div><span title="${esc(amisNoteTitre)}">${esc(amisNote)}</span></div>`);
+    }
+
+    /*
+     * Ce que ça rapporte : les souhaits du volet Échanges détenus par un ami
+     * que le panneau a fait venir. Aucune requête : les deux listes sont là.
+     */
+    const venus = new Set(Object.keys(vus).filter((id) => vus[id] && vus[id].o && vus[id].e === 'ami'));
+    if (venus.size && amisBusy !== 'envoi') {
+      const n = ((state.troc && state.troc.lignes) || [])
+        .filter((l) => (l.ids || []).some((id) => venus.has(id))).length;
+      lignes.push(n
+        ? `<div><b>${n}</b> de vos souhaits chez les amis ajoutés ici</div>`
+        : '<div>Aucun de vos souhaits chez les amis ajoutés ici, pour l’instant</div>');
+    }
+
+    if (state.amis.recues) {
+      const n = state.amis.recues;
+      lignes.push(`<div><a class="lien" href="/friends" data-amis-lien="/friends">${n} demande${n > 1 ? 's' : ''} `
+        + `reçue${n > 1 ? 's' : ''}</a> : à accepter sur la page Amis</div>`);
+    }
+    if (!lignes.length && !(state.classement && state.classement.lignes.length)) {
+      lignes.push('<div>Les gros collectionneurs ont le plus de chances d’avoir vos souhaits. '
+        + 'Ceux qui acceptent apparaissent dans Échanges.</div>');
+    }
+    return lignes.join('');
+  }
+
+  /*
+   * Le bouton vit dans le gabarit : on ne change
+   * ici que leurs propriétés, jamais les nœuds. Réécrire le bouton à chaque
+   * seconde du compte à rebours avalerait le clic qui veut l'arrêter. La
+   * grille, elle, ne se réécrit que lorsqu'un état change : son HTML ne porte
+   * pas le compte à rebours, et une infobulle ouverte reste ouverte.
+   */
+  function renderAmis() {
+    if (!ui || !ui.amisGo) return;
+
+    const vus = lireVus();
+    if (!vus) {
+      // La raison tient en une ligne, et elle vaut mieux qu'une grille fausse.
+      paint(ui.amisGrille, '');
+      paint(ui.amisEtat, '<div>Mémoire des demandes illisible : rien ne partira tant qu’elle le restera.</div>');
+    }
+    const t = amisTop(vus || {});
+    if (vus) {
+      paint(ui.amisGrille, amisGrilleHtml(t));
+      paint(ui.amisEtat, amisEtatHtml(vus));
+    }
+
+    const c = state.classement;
+    const age = c && c.at && c.lignes.length ? fmtAge(c.at) : '';
+    if (ui.amisAge.textContent !== age) ui.amisAge.textContent = age;
+    ui.amisAge.title = age ? `${ageTitle(c.at)}. Le classement se relit chaque jour.` : '';
+
+    let texte;
+    let titre;
+    let etat = '';
+    let actif = true;
+    if (amisBusy === 'envoi' && amisEnvoi) {
+      texte = amisStop ? 'Arrêt…' : `Arrêter · ${amisEnvoi.fait} / ${amisEnvoi.total}`;
+      titre = 'Arrête après la demande en cours. Celles déjà parties restent parties : '
+        + 'elles se retirent sur la page Amis du site.';
+      etat = 'stop';
+      actif = !amisStop;
+    } else if (amisBusy) {
+      const p = amisBusy.split(' ')[1];
+      texte = p ? `Lecture du classement · ${p}` : 'Lecture…';
+      titre = 'Le classement se lit par pages de 25 joueurs.';
+      actif = false;
+    } else if (amisArme && amisLot) {
+      const n = amisLot.length;
+      const premier = amisLot[0];
+      const dernier = amisLot[n - 1];
+      texte = `Envoyer ${n} demande${n > 1 ? 's' : ''} ?`;
+      titre = (n > 1
+        ? `De ${premier.n} (${rangFr(premier.r)}) à ${dernier.n} (${rangFr(dernier.r)}). `
+        : `${premier.n} (${rangFr(premier.r)}). `)
+        + 'Vous-même, vos amis, les demandes en attente et les joueurs déjà demandés sont '
+        + `écartés. Au rythme d’une personne : environ ${amisDuree(amisEstime(n))}. `
+        + 'Recliquez pour confirmer. Le bouton se désarme tout seul en six secondes.';
+      etat = 'arme';
+    } else if (!vus) {
+      texte = 'Ajouter en amis';
+      titre = 'La liste des joueurs déjà demandés est illisible. Sans elle, le bouton risquerait '
+        + 'de redemander quelqu’un qui a refusé : il reste éteint.';
+      actif = false;
+    } else {
+      /*
+       * Le compte vient de la grille, donc du dernier relevé : le premier clic
+       * relit tout et annonce le compte exact avant que rien ne parte.
+       */
+      const n = t.par.vide.length;
+      texte = t.top.length && n ? `Ajouter ${n} joueur${n > 1 ? 's' : ''} en amis` : 'Ajouter en amis';
+      titre = `Relit le top ${AMIS_PROF} du classement et votre liste d’amis, écarte vos amis et `
+        + 'les joueurs déjà demandés, puis annonce le compte. Rien ne part avant votre second clic. '
+        + 'Un joueur qui refuse n’est jamais redemandé.';
+    }
+    const go = ui.amisGo;
+    if (go.textContent !== texte) go.textContent = texte;
+    go.title = titre;
+    go.disabled = !actif;
+    go.classList.toggle('arme', etat === 'arme');
+    go.classList.toggle('stop', etat === 'stop');
   }
 
   /*
@@ -15065,16 +15047,6 @@
     if (!location.pathname.startsWith('/achievements')) readAchievementsFromDb();
   }, ACHV_EVERY_MS);
 
-  /*
-   * Veille de guilde : elle doit tourner même quand l'onglet Guilde n'est pas
-   * ouvert, sinon l'alerte ne sert qu'à ceux qui regardaient déjà. Le tour
-   * passe chaque minute, mais `refreshGuild` ne touche au réseau qu'au-delà de
-   * sa fraîcheur — la cadence réelle reste celle que le serveur tolère.
-   */
-  setInterval(() => {
-    if (prefs.watchGuild) refreshGuild();
-  }, 60000);
-
   // Le compte à rebours doit rester juste même quand la boucle dort longtemps,
   // et le verrou doit rester frais tant que cet onglet travaille.
   let beat = 0;
@@ -15110,9 +15082,12 @@
       renderMarket();
       renderRelist();
     } else if (prefs.tab === 'guilde') {
-      // Le relevé réseau est borné par sa propre fraîcheur (5 min) ; ce tour-ci
-      // ne fait que garder l'âge affiché honnête entre deux.
-      refreshGuild();
+      // Chaque relevé est borné par sa propre fraîcheur : la liste d'amis à
+      // dix minutes — c'est elle qui fait passer une demande de « en attente »
+      // à « acceptée » —, le classement à un jour. Ce tour-ci ne fait que
+      // garder l'onglet juste entre deux.
+      refreshAmis(false).catch(() => {});
+      amisLireAuto();
       renderGuild();
     }
   }, 1000);
@@ -15315,7 +15290,6 @@
       ['paquets bonus', prefs.bonus],
       ['succès auto', prefs.autoclaim],
       ['base directe', prefs.db],
-      ['veille guilde', prefs.watchGuild],
       ['reprise auto', prefs.autoResume],
       ['marché', prefs.watchBids],
       ['notifications', prefs.notify],
@@ -15354,7 +15328,8 @@
     const succes = [
       ['boucle', (state.sains.boucle || {}).ok],
       ['marché', state.sales.at],
-      ['guilde', state.guild.at],
+      ['amis', state.amis.at],
+      ['classement', state.classement.at],
       ['souhaits', state.wishHits.at],
       ['revente', sell.at],
     ]
