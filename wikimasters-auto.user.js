@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WikiMasters Tools
 // @namespace    https://www.wiki-masters.com/
-// @version      3.7.0
+// @version      3.7.2
 // @description  Boîte à outils WikiMasters : ouverture automatique des paquets, suivi des tirages, cote des cartes et revente.
 // @match        https://www.wiki-masters.com/*
 // @match        https://wiki-masters.com/*
@@ -41,7 +41,7 @@
    *
    * Il est lu par le garde juste en dessous, d'où sa place en tête.
    */
-  const VERSION = '3.7.0';
+  const VERSION = '3.7.2';
 
   /*
    * Une seule instance par page — et savoir laquelle
@@ -402,12 +402,13 @@
    *   2  `debitVerrou`     — après le correctif du verrou inter-onglets
    *   3  `debitCliquet`    — après le cliquet du plancher appris
    *   4  ce numéro lui-même : les migrations se comparent au lieu de se deviner
+   *   5  la limite quotidienne, que la boucle prenait pour un mur de débit
    *
    * À incrémenter quand une migration s'ajoute, et à traiter dans `restore()`.
    * Les trois marqueurs booléens restent lus une dernière fois, pour déduire
    * le numéro d'un stockage écrit avant lui — voir `restore()`.
    */
-  const SCHEMA = 4;
+  const SCHEMA = 5;
 
   const state = {
     running: false,
@@ -888,8 +889,8 @@
      * Chaque migration coûtait plus cher que la précédente.
      *
      * Un numéro règle ça une bonne fois : une migration se compare, elle ne se
-     * devine plus. La quatrième s'écrira `if (schema < 4)`, et le marqueur de
-     * la troisième n'aura pas à être inventé.
+     * devine plus. La suivante s'écrit `if (schemaLu < 5)` — juste en
+     * dessous —, sans qu'aucun marqueur ait eu à être inventé.
      *
      * Le numéro est DÉDUIT des anciens marqueurs quand il manque, et c'est le
      * point délicat : traiter « pas de numéro » comme « schéma 0 » rejouerait
@@ -900,7 +901,18 @@
       ? s.schema
       : (s.debitCliquet ? 3 : s.debitVerrou ? 2 : s.debitRecalibre ? 1 : 0);
 
-    if (schemaLu < 3) {
+    /*
+     * Quatrième remise à zéro — la première qui se compare au lieu de se
+     * deviner. Le serveur a désormais une limite QUOTIDIENNE : relevé sur un
+     * compte réel le 12 septembre 2026, un 429 « Limite quotidienne de paquets
+     * atteinte » à chaque régénération, deux minutes après l'appel précédent.
+     * La boucle le prenait pour un mur de débit, et chaque cycle de trois
+     * minutes relevait le plancher de 300 ms : plancher et délai étaient au
+     * plafond de 60 s. Un plancher appris avant `surLimiteQuotidienne` a pu
+     * l'être ainsi, et rien ne permet de distinguer le vrai du faux : il part,
+     * et le prochain refus de débit — un vrai — le réapprendra.
+     */
+    if (schemaLu < 5) {
       saveStore({ debitCliquet: true, probeFloorMs: 0, delayMs: CFG.startDelayMs });
     } else {
       if (Number.isFinite(s.probeFloorMs)) {
@@ -5905,6 +5917,32 @@
     return SUITE;
   }
 
+  /*
+   * La limite QUOTIDIENNE, qui n'est pas un débit.
+   *
+   * Relevé sur un compte réel le 12 septembre 2026, appel par appel : à
+   * chaque régénération, le premier essai reçoit un 429 « Limite quotidienne
+   * de paquets atteinte », avec `rate_limit_daily: true`, un paquet pourtant
+   * disponible, et un `retry_after` une quinzaine de secondes plus loin — que
+   * le serveur tient : l'essai fait à l'heure dite passe. Le compte est au
+   * plafond de sa journée, et chaque paquet attend son tour.
+   *
+   * Ce refus ne dit RIEN de l'espacement des ouvertures : il tombe après une
+   * attente de régénération, deux minutes après l'appel précédent. La branche
+   * du débit le prenait pourtant pour un mur touché — plancher relevé de
+   * 300 ms, délai multiplié de 60 % — à chaque cycle de trois minutes, et le
+   * cliquet avait porté les deux au plafond de 60 s.
+   *
+   * On attend donc l'heure annoncée, sans rien apprendre ni rien compter :
+   * ni plancher, ni délai, ni refus d'affilée — une journée pleine ne doit
+   * pas finir en « Toujours limité ». Sans heure annoncée, la cadence mesurée
+   * sert de repli, comme pour une réserve vide.
+   */
+  async function surLimiteQuotidienne(retryMs, mine) {
+    await waitUntil(Date.now() + (retryMs || state.cadenceMs), 'Limite quotidienne — reprise dans', mine);
+    return SUITE;
+  }
+
   /** Tout le reste : on ne devine pas, on s'arrête. */
   function surReponseInattendue(status, data) {
   /*
@@ -6049,9 +6087,11 @@
           ? await surReserveVide(data, mine, tour)
           : status === 401
             ? surSessionExpiree()
-            : status === 429
-              ? await surDebitLimite(retryMs, mine)
-              : surReponseInattendue(status, data);
+            : status === 429 && data && data.rate_limit_daily === true
+              ? await surLimiteQuotidienne(retryMs, mine)
+              : status === 429
+                ? await surDebitLimite(retryMs, mine)
+                : surReponseInattendue(status, data);
       /*
        * `!== SUITE`, et non `=== FIN`. Une branche qui oublierait de rendre
        * son verdict rendrait `undefined` : comparé à FIN, ça vaut « continue »,
@@ -7807,6 +7847,16 @@
         return;
       }
     });
+
+    /*
+     * La Revente reste ouverte sous le panneau quand on vient par « en file » :
+     * ce qu'on change ici doit s'y voir aussitôt. Une carte retirée de la file
+     * y reprend ses boutons, sans fermer ni rouvrir la page. Posés APRÈS les
+     * écouteurs des gestes, ils passent une fois l'état écrit.
+     */
+    const suivreRevente = () => { if (sell.open) renderSell(); };
+    ui.relist.addEventListener('click', suivreRevente);
+    ui.relist.addEventListener('change', suivreRevente);
 
     ui.subs.addEventListener('click', (e) => {
       const b = e.target.closest('[data-sub]');
@@ -13202,6 +13252,26 @@
     + '<button class="go" data-fnon>Annuler</button></span>';
 
   /**
+   * « en vente » ou « en file » : les deux états d'une ligne qui renvoient au
+   * panneau, là où la vente et la file se suivent déjà — voir `ouvrirVolet`.
+   * `protegee` n'arrive ici, pour la file, que sur UNE copie d'un double
+   * gardé : voir `fileAffichee` dans `etatLigne`.
+   */
+  function renvoiAuPanneau(x, enVente, protegee, copies) {
+    if (enVente) {
+      return '<button class="encours" data-volet="vent" title="Votre enchère court déjà sur cette carte :'
+        + ' elle occupe un de vos emplacements de vente. Cliquez pour ouvrir le volet Ventes du panneau,'
+        + ' avec son échéance.">en vente</button>';
+    }
+    const prix = fmtWb(state.watch[x.id].price);
+    const dit = protegee
+      ? `Une de vos ${copies} copies gardées est dans la file, à ${prix} wb — les autres restent gardées.`
+      : `Dans la file, à ${prix} wb : elle partira dès qu’un de vos dix emplacements se libère.`;
+    return `<button class="encours file" data-volet="rel" data-carte="${esc(x.id)}" title="${dit}`
+      + ' Cliquez pour l’ouvrir dans le volet Relances du panneau : prix, durée, ou la retirer de la file.">en file</button>';
+  }
+
+  /**
    * Inscrit en file la carte dont on vient de choisir le prix — une carte
    * libre, ou UNE copie d'un double gardé (`saisieFile.double`).
    */
@@ -13597,9 +13667,16 @@
      * n'y a rien à faire de plus. Le tiret de « protégée » dirait le
      * contraire — qu'on est bloqué.
      */
-    .encours { display: inline-block; padding: 4px 9px; border-radius: 8px;
+    /*
+     * Un bouton, depuis qu'il mène au panneau — volet Ventes, ou Relances
+     * pour « en file ». Il garde son air d'étiquette : la teinte dit l'état,
+     * le survol seul dit qu'on peut cliquer.
+     */
+    .encours { display: inline-block; padding: 4px 9px; border: 0; border-radius: 8px;
                background: color-mix(in srgb, var(--live) 12%, transparent); color: var(--live);
-               font: 500 11px ui-sans-serif, system-ui, sans-serif; }
+               font: 500 11px ui-sans-serif, system-ui, sans-serif; cursor: pointer;
+               transition: background .14s; }
+    .encours:hover { background: color-mix(in srgb, var(--live) 22%, transparent); }
     /*
      * En file : la carte attend son tour, elle n'est pas encore au marché.
      * Le lavande la distingue du vert de « en vente » — c'est une promesse,
@@ -13607,6 +13684,7 @@
      * palette qui ne soit prise ni par l'action ni par l'alerte.
      */
     .encours.file { background: color-mix(in srgb, ${RARITY_COLOR.R} 14%, transparent); color: ${RARITY_COLOR.R}; }
+    .encours.file:hover { background: color-mix(in srgb, ${RARITY_COLOR.R} 24%, transparent); }
     /* Le second geste de la ligne : il pèse moins que « Vendre », qui
        passe par le formulaire du site et vous laisse valider. */
     .go.file { color: var(--dim); }
@@ -13760,7 +13838,9 @@
             vous-même. « Mettre en file » vous demande un prix — le prix visé
             est proposé — puis inscrit la carte : elle partira seule, sans
             vous, dès qu'un de vos dix emplacements se libère. Rien ne part
-            d'ici sans l'un de ces deux gestes.</p>
+            d'ici sans l'un de ces deux gestes. « en file » et « en vente »
+            ouvrent la carte dans le panneau, volet Relances ou Ventes : c'est
+            là que la file se modifie.</p>
             <p>Les cases à gauche servent à défausser d'un coup les cartes
             dont vous ne voulez pas. Seules leurs copies libres partent —
             jamais une copie étiquetée ou en favori, ni une carte en vente, en
@@ -13874,13 +13954,44 @@
     sellUI.scroll.addEventListener('click', clicTableau);
   }
 
+  /*
+   * « en vente » et « en file » mènent au panneau. La file se voyait et se
+   * modifiait déjà dans le volet Relances, les ventes dans le volet Ventes ;
+   * la Revente ne faisait que le dire, dans une infobulle — « retirez-la
+   * depuis Marché, volet Relances » —, et c'était à vous de fermer la page
+   * pour aller l'y chercher.
+   *
+   * Le panneau passe au-dessus de la Revente : elle reste ouverte derrière,
+   * et on y revient sans rien avoir perdu. Pour une carte en file, son
+   * édition s'ouvre d'office — c'est pour elle qu'on a cliqué.
+   */
+  function ouvrirVolet(sub, carte) {
+    prefs.mktSub = sub;
+    saveStore({ mktSub: sub });
+    if (carte) fileEdit = carte;
+    // La classe et non `prefs.folded` : sur écran étroit, le panneau se replie sans le retenir.
+    if (ui.panel.classList.contains('folded')) setFolded(false);
+    if (prefs.tab !== 'marche') setTab('marche');
+    else {
+      ui.body.scrollTop = 0;
+      render();
+      requestAnimationFrame(clampPanel);
+    }
+    const crayon = carte && [...ui.relist.querySelectorAll('[data-edit]')].find((b) => b.dataset.edit === carte);
+    const ligne = crayon && crayon.closest('li');
+    if (ligne && ligne.scrollIntoView) ligne.scrollIntoView({ block: 'nearest' });
+  }
+
   /**
    * Les clics dans le tableau de la Revente : le tri par colonne, la suite de
-   * la liste, la sortie de secours du tableau vide, et les trois gestes par
-   * ligne. Sorti de `buildSellUI`, qui ne garde que son gabarit et ses
-   * références — un contrôle de `verifier.js` y veille.
+   * la liste, la sortie de secours du tableau vide, les trois gestes par
+   * ligne, et les deux états qui renvoient au panneau. Sorti de
+   * `buildSellUI`, qui ne garde que son gabarit et ses références — un
+   * contrôle de `verifier.js` y veille.
    */
   function clicTableau(e) {
+    const volet = e.target.closest('[data-volet]');
+    if (volet) { ouvrirVolet(volet.dataset.volet, volet.dataset.carte || null); return; }
     // Cocher une carte à défausser, ou toutes celles affichées. Toute
     // modification désarme une défausse déjà armée : son compte a changé.
     const cb = e.target.closest('[data-sel]');
@@ -14143,7 +14254,16 @@
      * ce bouton demande une confirmation.
      */
     const doubleGarde = protegee && copies > 1 && !dejaEnVente && !enFile;
-    return { protegee, dejaEnVente, enFile, listable, doubleGarde, copies,
+    /*
+     * « en file » se montre aussi sur une carte gardée, quand c'est UNE copie
+     * d'un double que vous avez demandé à vendre. La ligne affichait
+     * « protégée » — hors de portée de la revente, disait l'infobulle — alors
+     * que la copie partait bel et bien. Une carte étiquetée APRÈS sa mise en
+     * file reste « protégée » : la barrière la retirera au lieu de la vendre.
+     */
+    const suivie = enFile ? state.watch[x.id] : null;
+    const fileAffichee = enFile && (!protegee || (!!suivie.voulu && copies > 1));
+    return { protegee, dejaEnVente, enFile, fileAffichee, listable, doubleGarde, copies,
              libresDeLaCarte, aLister: listable && restants > 0 };
   }
 
@@ -14462,7 +14582,7 @@
       vue
         .map(
           (x) => {
-            const { protegee, dejaEnVente, enFile, doubleGarde, copies } = etatLigne(x, mesVentes, 0);
+            const { protegee, dejaEnVente, enFile, fileAffichee, doubleGarde, copies } = etatLigne(x, mesVentes, 0);
             const aLister = aListerIds.has(x.id);
             const cochable = !protegee && !dejaEnVente && !enFile;
             return `<tr class="${aLister ? 'next' : ''}">
@@ -14494,7 +14614,9 @@
             <td class="num med">${(x.q3 || x.med).toLocaleString('fr-FR')}</td>
             <td class="num">${x.med.toLocaleString('fr-FR')}</td>
             <td class="amp">${x.min.toLocaleString('fr-FR')} – ${x.max.toLocaleString('fr-FR')}</td>
-            <td>${protegee
+            <td>${dejaEnVente || fileAffichee
+              ? renvoiAuPanneau(x, dejaEnVente, protegee, copies)
+              : protegee
               /*
                * Le seul chemin par lequel une carte gardée part en vente, et il
                * se fait en deux temps : le prix, puis la validation. Il
@@ -14514,34 +14636,30 @@
                     + ' Les autres restent gardées.">'
                     + `Vendre un double (${copies})</button>`
                   : ''))
-              : dejaEnVente
-                ? `<span class="encours" title="Votre enchère court déjà sur cette carte. Elle occupe un de vos emplacements de vente ; son échéance est dans l’onglet Marché, volet Ventes.">en vente</span>`
-                : enFile
-                  ? `<span class="encours file" title="Dans la file : elle partira dès qu’un de vos dix emplacements se libère, au prix visé. Retirez-la depuis Marché, volet Relances.">en file</span>`
-                  /*
-                   * Deux gestes, et ils ne font pas la même chose.
-                   *
-                   * « Vendre » ouvre le formulaire du site, prix pré-rempli :
-                   * vous voyez et vous validez. Il échoue quand les dix
-                   * emplacements sont pris, et c'est le seul chemin quand les
-                   * relances automatiques sont décochées.
-                   *
-                   * « Mettre en file » inscrit la carte et la laisse partir
-                   * seule dès qu'une place se libère — donc sans vous, au
-                   * moment venu. Il n'apparaît que si les relances sont
-                   * cochées : sans elles, rien ne publierait jamais et le
-                   * bouton promettrait une file qui n'avance pas.
-                   */
-                  : saisieFile && saisieFile.id === x.id && prefs.relistUnsold
-                    // Le prix de mise en file, choisi dans la ligne : le prix visé est proposé.
-                    ? editeurPrix('Mettre en file')
-                    : `<button class="go" data-sell="${esc(x.t)}" data-prix="${x.q3 || x.med}">Vendre</button>`
-                    + (prefs.relistUnsold
-                      ? ` <button class="go file" data-file="${esc(x.id)}" data-titre="${esc(x.t)}"`
-                        + ` data-prix="${x.q3 || x.med}"`
-                        + ' title="Choisissez le prix : elle partira ensuite toute seule dès qu’un emplacement se libère,'
-                        + ' pour la durée minimale. Rien ne part tant qu’une place ne s’ouvre pas.">Mettre en file</button>'
-                      : '')}</td>
+              /*
+               * Deux gestes, et ils ne font pas la même chose.
+               *
+               * « Vendre » ouvre le formulaire du site, prix pré-rempli :
+               * vous voyez et vous validez. Il échoue quand les dix
+               * emplacements sont pris, et c'est le seul chemin quand les
+               * relances automatiques sont décochées.
+               *
+               * « Mettre en file » inscrit la carte et la laisse partir
+               * seule dès qu'une place se libère — donc sans vous, au
+               * moment venu. Il n'apparaît que si les relances sont
+               * cochées : sans elles, rien ne publierait jamais et le
+               * bouton promettrait une file qui n'avance pas.
+               */
+              : saisieFile && saisieFile.id === x.id && prefs.relistUnsold
+                // Le prix de mise en file, choisi dans la ligne : le prix visé est proposé.
+                ? editeurPrix('Mettre en file')
+                : `<button class="go" data-sell="${esc(x.t)}" data-prix="${x.q3 || x.med}">Vendre</button>`
+                + (prefs.relistUnsold
+                  ? ` <button class="go file" data-file="${esc(x.id)}" data-titre="${esc(x.t)}"`
+                    + ` data-prix="${x.q3 || x.med}"`
+                    + ' title="Choisissez le prix : elle partira ensuite toute seule dès qu’un emplacement se libère,'
+                    + ' pour la durée minimale. Rien ne part tant qu’une place ne s’ouvre pas.">Mettre en file</button>'
+                  : '')}</td>
           </tr>`;
           }
         )
@@ -14556,6 +14674,273 @@
       const champ = sellUI.scroll.querySelector('[data-fprix]');
       if (champ && sellUI.root.activeElement !== champ) champ.focus();
     }
+  }
+
+  // ------------------------------------------------- quand le jeu ne répond plus
+
+  /*
+   * « Parfois le jeu plante, plus moyen de cliquer sur rien. » Rare mais
+   * régulier, quelques minutes après l'ouverture de l'onglet, et seul un
+   * rechargement en sort. Trois faits relevés le 11 septembre 2026 écartent
+   * l'essentiel des causes :
+   *
+   * - le panneau répond encore : la page n'est pas gelée, le JavaScript tourne ;
+   * - la page a l'air normale : ni voile sombre, ni fenêtre ouverte ;
+   * - le survol ne s'allume plus sur les boutons du jeu.
+   *
+   * Le survol ne doit rien au JavaScript : c'est le navigateur qui le pose sur
+   * l'élément qu'il trouve sous la souris. S'il s'éteint pendant que le
+   * panneau vit, c'est qu'autre chose que le jeu est sous la souris — un
+   * calque invisible, glissé sous le panneau qui trône en haut de la pile —
+   * ou que la page du jeu a cessé de recevoir la souris.
+   *
+   * Lire le code n'a rien trouvé. Tous les voiles du site sont sombres
+   * (`bg-black/70` et consorts) : un voile resté ouvert se VERRAIT. Son seul
+   * calque transparent plein écran, le feu d'artifice des révélations, porte
+   * `pointer-events-none`. Le site ne pose ni `inert` ni `pointer-events` sur
+   * sa page. Et nos calques à nous se voient : le panneau est petit, la Revente
+   * assombrit tout à 94 %. Reste ce que la lecture n'atteint pas — une
+   * extension, un script tiers, un état du site qu'on ne sait pas reproduire.
+   *
+   * Il faut donc le voir quand ça arrive. Le panneau restant cliquable pendant
+   * le blocage, c'est lui qui peut le relever : « Copier le diagnostic » y
+   * ajoute ce qui est sous la souris au centre de l'écran et au dernier clic
+   * donné au jeu, les calques plein écran posés à la racine de la page, et les
+   * dernières erreurs. Tout ce que le F5 efface.
+   *
+   * Aucun texte de la page n'y entre, par la règle du diagnostic : un nom de
+   * carte ou de joueur collé dans un salon public désignerait le compte. Des
+   * balises, des classes, des tailles et des styles, rien d'autre.
+   */
+  const RELEVE_MAX = 6;
+  const clicsJeu = [];      // les derniers `pointerdown` qui ne visaient pas l'outil
+  const erreursPage = [];   // les dernières erreurs de la page, les nôtres comprises
+
+  const NOS_HOTES = new Set(['wm-auto-panel', 'wm-sell-page', 'wm-doublon']);
+
+  /** L'élément appartient-il à l'outil ? Un clic sur le panneau n'est pas un clic au jeu. */
+  function estANous(el) {
+    for (let n = el, i = 0; n && i < 8; n = n.parentElement, i++) {
+      if (n.id && NOS_HOTES.has(n.id)) return true;
+    }
+    return false;
+  }
+
+  function garderAuPlus(liste, entree) {
+    liste.push(entree);
+    if (liste.length > RELEVE_MAX) liste.shift();
+  }
+
+  /*
+   * Un message d'erreur peut citer l'adresse d'une enchère ou d'un profil :
+   * les identifiants sautent, et les longues suites de chiffres avec eux.
+   */
+  const caviarder = (s) => String(s == null ? '' : s)
+    .replace(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi, '<id>')
+    .replace(/\d{4,}/g, '<n>')
+    .slice(0, 160);
+
+  const nomDeFichier = (url) => String(url || '').split(/[?#]/)[0].split('/').pop();
+
+  function noterErreur(texte, ou = '') {
+    garderAuPlus(erreursPage, { at: Date.now(), texte: caviarder(texte), ou });
+  }
+
+  /*
+   * Posé au démarrage, avant le premier script du site : une erreur levée
+   * pendant son chargement doit déjà trouver quelqu'un pour l'entendre.
+   * Les trois écouteurs regardent et ne touchent à rien — ni `preventDefault`,
+   * ni arrêt de propagation : le clic et l'erreur continuent leur chemin.
+   */
+  function installerReleveBlocage() {
+    addEventListener('pointerdown', (e) => {
+      try {
+        if (estANous(e.target)) return;
+        garderAuPlus(clicsJeu, { at: Date.now(), x: e.clientX, y: e.clientY, cible: e.target });
+      } catch (_) {
+        /* relever ne doit jamais coûter le clic relevé */
+      }
+    }, { capture: true, passive: true });
+
+    addEventListener('error', (e) => {
+      try {
+        const el = e.target;
+        // Une balise qui ne charge pas arrive ici aussi, en `Event` nu : seules
+        // comptent celles qui portent du code — une image manquante, non.
+        if (el && el.tagName) {
+          if (/^(SCRIPT|LINK)$/.test(el.tagName)) {
+            noterErreur(`${el.tagName.toLowerCase()} non chargé`, nomDeFichier(el.src || el.href));
+          }
+          return;
+        }
+        /*
+         * Un script EN LIGNE a pour fichier l'adresse de la page, qui peut
+         * porter l'identifiant d'une enchère : le nom passe au caviardage. La
+         * ligne et la colonne, non — sur un fichier minifié d'une seule ligne,
+         * la colonne est tout ce qui situe l'erreur.
+         */
+        noterErreur(e.message || (e.error && e.error.message) || 'erreur sans message',
+          e.filename
+            ? `${caviarder(nomDeFichier(e.filename) || 'page')}:${e.lineno || 0}:${e.colno || 0}`
+            : '');
+      } catch (_) {
+        /* relever ne doit jamais coûter l'erreur relevée */
+      }
+    }, true);
+
+    addEventListener('unhandledrejection', (e) => {
+      try {
+        const r = e.reason;
+        // Une requête annulée n'est pas une panne : le site en annule à chaque navigation.
+        if (r && r.name === 'AbortError') return;
+        noterErreur(`promesse rejetée : ${(r && (r.message || r.name)) || String(r)}`);
+      } catch (_) {
+        /* idem */
+      }
+    });
+  }
+
+  /** Une ligne par élément : ce que le navigateur voit, jamais ce que la page écrit. */
+  function decrireElement(el) {
+    if (!el || !el.tagName) return 'rien';
+    if (estANous(el)) return `[WikiMasters Tools] #${el.id || el.tagName.toLowerCase()}`;
+    let nom = el.tagName.toLowerCase();
+    if (el.id) nom += `#${String(el.id).slice(0, 30)}`;
+    // `className` est un objet sur un SVG : l'attribut, lui, est toujours du texte.
+    const classes = String((typeof el.className === 'string' ? el.className
+      : el.getAttribute && el.getAttribute('class')) || '').trim().split(/\s+/).filter(Boolean);
+    if (classes.length) nom += `.${classes.slice(0, 6).join('.')}${classes.length > 6 ? '…' : ''}`;
+
+    const traits = [];
+    try {
+      const r = el.getBoundingClientRect();
+      // L'écran sans sa barre de défilement : un calque plein écran doit lire 100 %, pas 99.
+      const racine = document.documentElement;
+      const larg = (racine && racine.clientWidth) || innerWidth;
+      const haut = (racine && racine.clientHeight) || innerHeight;
+      traits.push(`${Math.round((100 * r.width) / larg)} × ${Math.round((100 * r.height) / haut)} % de l’écran`);
+      const cs = getComputedStyle(el);
+      if (cs.position && cs.position !== 'static') traits.push(cs.position);
+      if (cs.zIndex && cs.zIndex !== 'auto') traits.push(`z ${cs.zIndex}`);
+      if (cs.opacity && cs.opacity !== '1') traits.push(`opacité ${cs.opacity}`);
+      if (cs.visibility && cs.visibility !== 'visible') traits.push(cs.visibility);
+      if (cs.pointerEvents && cs.pointerEvents !== 'auto') traits.push(`pointer-events ${cs.pointerEvents}`);
+      if (/^(transparent|rgba\(0, 0, 0, 0\))$/.test(cs.backgroundColor || '')
+          && (cs.backgroundImage || 'none') === 'none') traits.push('fond transparent');
+      if (el.inert) traits.push('inert');
+      if (el.tagName === 'IFRAME') traits.push(`cadre de ${new URL(el.src, location.href).hostname || '?'}`);
+    } catch (_) {
+      /* un élément sans boîte se décrit par son nom */
+    }
+    return traits.length ? `${nom} (${traits.join(', ')})` : nom;
+  }
+
+  /** Ce que la souris trouve à un point de l'écran, de haut en bas. */
+  function sousLePoint(x, y) {
+    if (typeof document.elementsFromPoint !== 'function') return null;
+    try {
+      return [...document.elementsFromPoint(x, y)].slice(0, 4).map(decrireElement);
+    } catch (_) {
+      return null;
+    }
+  }
+
+  /*
+   * Les calques posés à la racine — enfants de `<html>` hors tête et corps, où
+   * les extensions s'installent volontiers, et enfants de `<body>`, où le site
+   * ouvre ses fenêtres. Seuls ceux qui couvrent la moitié de l'écran au moins
+   * et flottent au-dessus de la page ont le moyen de tout recouvrir.
+   */
+  function calquesRacine() {
+    const racine = document.documentElement;
+    const candidats = [
+      ...(racine && racine.children ? [...racine.children] : [])
+        .filter((n) => !/^(HEAD|BODY)$/.test(n.tagName)),
+      ...(document.body && document.body.children ? [...document.body.children] : []),
+    ];
+    return candidats.filter((n) => {
+      try {
+        const r = n.getBoundingClientRect();
+        const pos = getComputedStyle(n).position;
+        return (pos === 'fixed' || pos === 'absolute')
+          && r.width >= innerWidth / 2 && r.height >= innerHeight / 2;
+      } catch (_) {
+        return false;
+      }
+    }).slice(0, 8).map(decrireElement);
+  }
+
+  /** Ce qui coupe la souris à toute la page d'un coup, s'il y a quelque chose. */
+  function sourisCoupee() {
+    const faits = [];
+    for (const [nom, el] of [['html', document.documentElement], ['body', document.body]]) {
+      try {
+        const pe = el && getComputedStyle(el).pointerEvents;
+        if (pe && pe !== 'auto') faits.push(`${nom} en pointer-events ${pe}`);
+      } catch (_) {
+        /* pas de style lisible : rien à en dire */
+      }
+    }
+    try {
+      const n = document.querySelectorAll('[inert]').length;
+      if (n) faits.push(`${n} élément(s) inert`);
+    } catch (_) {
+      /* idem */
+    }
+    try {
+      // Une `<dialog>` modale rend inerte tout le reste — y compris nous.
+      const m = document.querySelector(':modal');
+      if (m) faits.push(`fenêtre modale native : ${decrireElement(m)}`);
+    } catch (_) {
+      /* `:modal` inconnu du navigateur */
+    }
+    return faits;
+  }
+
+  /**
+   * La section que « Copier le diagnostic » ajoute à la fin du relevé. Sous
+   * garde, comme tout le diagnostic : il ne doit rien pouvoir refuser.
+   */
+  function releveBlocage() {
+    try {
+      return lignesBlocage();
+    } catch (err) {
+      return [`Si le jeu ne répond plus aux clics : relevé impossible (${caviarder(raison(err))})`];
+    }
+  }
+
+  function lignesBlocage() {
+    const ilYA = (at) => {
+      const ms = Math.max(0, Date.now() - at);
+      return ms < 60000 ? `${Math.round(ms / 1000)} s` : fmtSpan(ms);
+    };
+    const pile = (quoi, liste) => [`  ${quoi} :`, ...liste.map((d) => `    ${d}`)];
+    const lignes = ['Si le jeu ne répond plus aux clics, ce qui est sous la souris :'];
+
+    const centre = sousLePoint(innerWidth / 2, innerHeight / 2);
+    if (centre) lignes.push(...pile('au centre de l’écran, de haut en bas', centre));
+
+    const dernier = clicsJeu[clicsJeu.length - 1];
+    if (dernier) {
+      lignes.push(`  le dernier clic donné au jeu, il y a ${ilYA(dernier.at)}, a touché `
+        + decrireElement(dernier.cible)
+        + (dernier.cible && dernier.cible.isConnected === false ? ' — retiré de la page depuis' : ''));
+      const la = sousLePoint(dernier.x, dernier.y);
+      if (la) lignes.push(...pile('au même endroit maintenant, de haut en bas', la));
+    }
+
+    const calques = calquesRacine();
+    if (calques.length) lignes.push(...pile('calques plein écran à la racine', calques));
+
+    const coupe = sourisCoupee();
+    lignes.push(`  souris : ${coupe.length ? coupe.join(' · ') : 'rien ne la coupe à la racine'}`);
+
+    if (erreursPage.length) {
+      lignes.push('Dernières erreurs de la page (la plus récente en dernier) :',
+        ...erreursPage.map((e) => `  il y a ${ilYA(e.at).padStart(7)} · ${e.texte}`
+          + (e.ou ? ` — ${e.ou}` : '')));
+    }
+    return lignes;
   }
 
   // ------------------------------------------------------------------ montage
@@ -14604,6 +14989,8 @@
     ['le filtre des notifications', installNotifProxy],
     ['le filtre du canal temps réel', installNotifWsProxy],
     ['le filtre des avis à l’écran', installNotifDomFiltre],
+    // Avant le site, lui aussi : ses erreurs de chargement doivent trouver preneur.
+    ['le relevé des blocages', installerReleveBlocage],
   ]) {
     try {
       faire();
@@ -15031,7 +15418,8 @@
        */
       `Cadence : ${state.delayMs} ms`
         + (state.probeFloorMs ? `, plancher appris ${state.probeFloorMs} ms` : ', aucun plancher appris')
-        + ` · ${state.throttles} refus 429 depuis le départ`,
+        // D'affilée, et non « depuis le départ » : chaque paquet ouvert le remet à zéro.
+        + ` · ${state.throttles} refus 429 d’affilée`,
       `Verrou : ${verrou}`,
       `Derniers succès : ${succes}`,
       perdus.length ? `Sélecteurs perdus : ${perdus.join(' ; ')}` : null,
@@ -15055,6 +15443,8 @@
     ]
       .filter(Boolean)
       .concat(faits)
+      // En dernier : il ne sert que le jour où le jeu ne répond plus.
+      .concat(releveBlocage())
       .join('\n');
   }
 
