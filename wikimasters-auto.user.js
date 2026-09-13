@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WikiMasters Tools
 // @namespace    https://www.wiki-masters.com/
-// @version      3.8.3
+// @version      3.8.4
 // @description  Boîte à outils WikiMasters : ouverture automatique des paquets, suivi des tirages, cote des cartes et revente.
 // @match        https://www.wiki-masters.com/*
 // @match        https://wiki-masters.com/*
@@ -41,7 +41,7 @@
    *
    * Il est lu par le garde juste en dessous, d'où sa place en tête.
    */
-  const VERSION = '3.8.3';
+  const VERSION = '3.8.4';
 
   /*
    * Une seule instance par page — et savoir laquelle
@@ -404,12 +404,14 @@
    *   4  ce numéro lui-même : les migrations se comparent au lieu de se deviner
    *   5  la limite quotidienne, que la boucle prenait pour un mur de débit
    *   6  la guilde retirée : `lot`, `publiees`, `watchGuild`, `karmaVu`, `guildSeen`
+   *   7  les doubles retirés à tort des relances avant la 3.8.3 : relevés dans
+   *      le journal, à reprendre une fois (`doublesAReprendre`)
    *
    * À incrémenter quand une migration s'ajoute, et à traiter dans `restore()`.
    * Les trois marqueurs booléens restent lus une dernière fois, pour déduire
    * le numéro d'un stockage écrit avant lui — voir `restore()`.
    */
-  const SCHEMA = 6;
+  const SCHEMA = 7;
 
   const state = {
     running: false,
@@ -951,6 +953,26 @@
     if (schemaLu < 6) {
       saveStore({ lot: undefined, publiees: undefined, watchGuild: undefined,
                   karmaVu: undefined, guildSeen: undefined });
+    }
+    /*
+     * Les doubles retirés à tort. Avant la 3.8.3, un double relancé pouvait
+     * sortir de la file sur un index lu pendant son enchère — voir
+     * `indexSaitJuger`. Le journal des relances en garde la trace : une sortie
+     * « étiquetée » ou « gardée, et plus qu'un exemplaire ». On en fait la
+     * liste ici, une fois ; la vérification, qui demande le réseau, se fait
+     * après le chargement (`reprendreDoublesRetires`) et consomme la liste —
+     * interrompue, elle reprendra au chargement suivant.
+     */
+    if (schemaLu < 7 && Array.isArray(s.relistLog)) {
+      const vus = new Set();
+      const liste = [];
+      for (const e of s.relistLog) {   // du plus récent au plus ancien
+        if (!e || e.issue !== 'stop' || !SORTIES_A_TORT.includes(e.motif) || !e.title) continue;
+        if (vus.has(e.title)) continue;
+        vus.add(e.title);
+        liste.push({ titre: e.title, prix: e.prix });
+      }
+      if (liste.length) saveStore({ doublesAReprendre: liste });
     }
     if (Number.isFinite(s.cadenceMs)) state.cadenceMs = s.cadenceMs;
     // Le maximum du compteur de pitié s'accumule d'une session à l'autre : c'est
@@ -10442,7 +10464,8 @@
     const VERBES = { ok: 'remise en vente', refus: 'refusée', stop: 'retirée', baisse: 'prix baissé' };
     const journal = log.slice(0, 6).map((e) => {
       const age = Date.now() - e.at;
-      const verbe = e.issue === 'ok' && e.motif === 'vendue' ? 'vendue'
+      // « vendue », ou « remise en file » pour un double sorti à tort et repris.
+      const verbe = e.issue === 'ok' && (e.motif === 'vendue' || e.motif === REPRISE) ? e.motif
         : e.issue === 'stop' && e.motif ? e.motif        // « retirée », « étiquetée »
         : (VERBES[e.issue] || e.issue);
       return `<li class="${e.issue}">
@@ -11296,7 +11319,7 @@
     // juge pas sur un index qui ne voyait pas son exemplaire : la barrière de
     // `reconcileWatch` tranchera, index relu. Voir `indexSaitJuger`.
     if (isTagged(card) && !voulu && !dejaVoulu && !observe && indexSaitJuger(card)) {
-      if (state.watch[card]) dropWatch(card, 'étiquetée');
+      if (state.watch[card]) dropWatch(card, SORTIE_ETIQUETEE);
       return false;
     }
     const dejaLa = state.watch[card];
@@ -11342,6 +11365,71 @@
     delete state.watch[card];
     saveStore({ watch: state.watch });
     if (motif) logRelist(e.title, motif === 'vendue' ? 'ok' : 'stop', e.price, motif);
+  }
+
+  /*
+   * LES DOUBLES RETIRÉS À TORT, REPRIS UNE FOIS.
+   *
+   * Voir la migration 7 de `restore()`, qui en dresse la liste. Une carte
+   * sortie de la file « étiquetée » et qui a aujourd'hui une copie SANS
+   * étiquette est forcément une victime : l'exemplaire mis en vente revient
+   * d'enchère sans son étiquette, et le double garde la sienne — c'est
+   * l'utilisateur qui l'a fait remarquer. Elle revient dans la file, au prix
+   * qu'elle avait, et le journal des relances le dit. Une carte dont toutes
+   * les copies sont encore gardées est vraiment protégée : elle reste dehors.
+   *
+   * Titre exact, une seule carte de ce nom, sinon on ne devine pas. Une
+   * lecture qui échoue remet la carte dans la liste, pour le chargement
+   * suivant.
+   */
+  const SORTIE_ETIQUETEE = 'étiquetée';
+  const SORTIE_DERNIERE = 'gardée, et plus qu’un exemplaire';
+  const SORTIES_A_TORT = [SORTIE_ETIQUETEE, SORTIE_DERNIERE];
+  const REPRISE = 'remise en file';
+
+  async function reprendreDoublesRetires() {
+    const liste = () => {
+      const l = loadStore().doublesAReprendre;
+      return Array.isArray(l) ? l : [];
+    };
+    for (let a = liste(); a.length; a = liste()) {
+      const [e, ...reste] = a;
+      // Prise AVANT la recherche : un autre onglet ne la reprend pas en double.
+      saveStore({ doublesAReprendre: reste.length ? reste : undefined });
+      const titre = e && e.titre;
+      const prix = e && Number(e.prix);
+      if (!titre || !cherchable(titre) || !(prix > 0)) continue;
+      if (Object.values(state.watch).some((w) => w && w.title === titre)) continue;   // déjà revenue
+
+      const siennes = [];
+      let lue = true;
+      for (let page = 0; page < Q_PAGES_MAX; page++) {
+        let d = null;
+        try {
+          d = await api(`/api/my-collection?page=${page}&q=${encodeURIComponent(titre)}`);
+        } catch (_) {
+          d = null;
+        }
+        const lignes = d && d.status === 200 && d.data && Array.isArray(d.data.collection) ? d.data.collection : null;
+        if (!lignes) { lue = false; break; }
+        for (const c of lignes) if (c && c.card_id && c.card && c.card.wikipedia_title === titre) siennes.push(c);
+        if (lignes.length < COLLECTION_PAGE) break;
+      }
+      if (!lue) {
+        saveStore({ doublesAReprendre: [e, ...liste()] });
+        return;
+      }
+      const cartes = new Set(siennes.map((c) => c.card_id));
+      if (cartes.size !== 1) continue;                                             // absente, ou homonyme
+      if (!siennes.some((c) => !(c.tags || []).length && !c.starred)) continue;   // toutes gardées : protégée
+      const card = [...cartes][0];
+      const minutes = (state.lastListing[card] && state.lastListing[card].minutes) || FILE_MINUTES;
+      // `observe` : la copie libre vient d'être vue, l'index n'a pas à la juger.
+      if (enrolWatch(card, titre, prix, minutes, 0, true)) {
+        logRelist(titre, 'ok', prix, REPRISE);
+        render();
+      }
+    }
   }
 
   /*
@@ -11626,7 +11714,7 @@
         }
         const exemplaires = owned.copies.get(card) || 0;
         if (isTagged(card) && !(w.voulu && exemplaires > 1)) {
-          dropWatch(card, w.voulu ? 'gardée, et plus qu’un exemplaire' : 'étiquetée');
+          dropWatch(card, w.voulu ? SORTIE_DERNIERE : SORTIE_ETIQUETEE);
           bouge = true;
           continue;
         }
@@ -15507,6 +15595,9 @@
    * et une requête sortante pendant le montage retarderait ce qui l'est.
    */
   setTimeout(chercherMaj, MAJ_PREMIER_DELAI);
+
+  // Les doubles retirés à tort (migration 7), une fois la page posée.
+  setTimeout(() => { reprendreDoublesRetires().catch(() => {}); }, 30000);
   setInterval(chercherMaj, MAJ_TOUTES_LES_MS);
 
   /*
