@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WikiMasters Tools
 // @namespace    https://www.wiki-masters.com/
-// @version      3.8.2
+// @version      3.8.3
 // @description  Boîte à outils WikiMasters : ouverture automatique des paquets, suivi des tirages, cote des cartes et revente.
 // @match        https://www.wiki-masters.com/*
 // @match        https://wiki-masters.com/*
@@ -41,7 +41,7 @@
    *
    * Il est lu par le garde juste en dessous, d'où sa place en tête.
    */
-  const VERSION = '3.8.2';
+  const VERSION = '3.8.3';
 
   /*
    * Une seule instance par page — et savoir laquelle
@@ -10672,6 +10672,30 @@
    */
   const isTagged = (card) => owned.tagged.has(card);
 
+  /*
+   * L'index sait-il juger CETTE carte ? Pas si un de ses exemplaires est aux
+   * enchères, ni s'il l'était quand l'index a été lu.
+   *
+   * Sur le site, l'exemplaire mis en vente quitte la collection le temps de
+   * l'enchère. Lu à ce moment-là, l'index ne voit d'un double que la copie
+   * restée — la gardée — et en conclut « carte étiquetée », ou « il n'en reste
+   * qu'une » pour un double vendu par « Vendre un double ». La relance
+   * retirait alors la carte de la file au lieu de la remettre en vente.
+   * Signalé à l'usage : « quand je mets un double en vente il se relance
+   * pas ». Reproduit au banc, dès qu'une autre carte de la file fait relire la
+   * collection pendant l'enchère.
+   *
+   * L'index ne vaut donc, pour une carte qui était en vente, que relu après
+   * son retour — `SETTLE_MS` après la fin, le temps que le serveur rende
+   * l'exemplaire.
+   */
+  function indexSaitJuger(card) {
+    if ((state.sales.list || []).some((v) => v.card === card)) return false;
+    const w = state.watch[card];
+    const partie = w ? Math.max(w.endsAt || 0, w.seenListedAt || 0) : 0;
+    return !partie || owned.at > partie + SETTLE_MS;
+  }
+
   async function ownedIndex(force) {
     const age = owned.at ? Date.now() - owned.at : Infinity;
     if (age < (force ? OWNED_MIN : OWNED_TTL)) return owned.map;
@@ -11268,7 +11292,10 @@
      * au moment de publier : d'ici là vous pouvez en avoir vendu un à la main.
      */
     const dejaVoulu = !!(state.watch[card] && state.watch[card].voulu);
-    if (isTagged(card) && !voulu && !dejaVoulu) {
+    // Une carte vue en vente (`observe`) — qui y est, ou qui en revient — ne se
+    // juge pas sur un index qui ne voyait pas son exemplaire : la barrière de
+    // `reconcileWatch` tranchera, index relu. Voir `indexSaitJuger`.
+    if (isTagged(card) && !voulu && !dejaVoulu && !observe && indexSaitJuger(card)) {
       if (state.watch[card]) dropWatch(card, 'étiquetée');
       return false;
     }
@@ -11580,6 +11607,23 @@
          * Un index tronqué compte trop bas ; « trop bas » se lit « exemplaire
          * unique », donc on s'abstient. C'est le bon sens de l'erreur.
          */
+        /*
+         * Et elle ne tranche que sur un index qui voyait tous les exemplaires
+         * de la carte : relu après son retour d'enchère. Sinon on le relit, et
+         * s'il ne peut pas l'être tout de suite, la carte attend le créneau
+         * suivant — sans rien perdre, ni échec compté, ni retrait de la file.
+         * Voir `indexSaitJuger`.
+         */
+        if (!indexSaitJuger(card)) {
+          if (!rebati) {
+            rebati = true;
+            index = await ownedIndex(true);
+          }
+          if (!indexSaitJuger(card)) {
+            cedee = true;
+            continue;
+          }
+        }
         const exemplaires = owned.copies.get(card) || 0;
         if (isTagged(card) && !(w.voulu && exemplaires > 1)) {
           dropWatch(card, w.voulu ? 'gardée, et plus qu’un exemplaire' : 'étiquetée');
@@ -11910,6 +11954,18 @@
            */
           const tours = ((state.watch[id] && state.watch[id].invendus) || 0) + 1;
           enrolWatch(id, titre, t.price, t.minutes, tours, true);
+          /*
+           * Elle était aux enchères jusqu'à cette notification, même mise en
+           * vente à la main : un index lu avant son retour ne voyait pas son
+           * exemplaire. On le note, pour que la barrière attende un index
+           * relu après. Voir `indexSaitJuger`.
+           */
+          const w = state.watch[id];
+          const fin = Date.parse(n.created_at) || Date.now();
+          if (w && !(w.seenListedAt >= fin)) {
+            w.seenListedAt = fin;
+            saveStore({ watch: state.watch });
+          }
         }
       }
     }
