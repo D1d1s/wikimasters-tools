@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WikiMasters Tools
 // @namespace    https://www.wiki-masters.com/
-// @version      3.8.5
+// @version      3.8.6
 // @description  Boîte à outils WikiMasters : ouverture automatique des paquets, suivi des tirages, cote des cartes et revente.
 // @match        https://www.wiki-masters.com/*
 // @match        https://wiki-masters.com/*
@@ -41,7 +41,7 @@
    *
    * Il est lu par le garde juste en dessous, d'où sa place en tête.
    */
-  const VERSION = '3.8.5';
+  const VERSION = '3.8.6';
 
   /*
    * Une seule instance par page — et savoir laquelle
@@ -15328,12 +15328,147 @@
   }
 
   /*
+   * LA BOÎTE NOIRE : CE QUE L'ONGLET A REÇU AVANT LE F5.
+   *
+   * Signalé de nouveau le 13 septembre 2026 : « la page bouge mais je peux
+   * cliquer nulle part », F5 obligatoire. Le relevé ci-dessous ne peut rien
+   * pour ce cas-là : il se lit en cliquant « Copier le diagnostic », et c'est
+   * justement le clic qui ne passe plus. Le F5, lui, efface tout.
+   *
+   * Le seul relevé fait pendant un blocage (12 septembre) disait déjà
+   * l'essentiel : aucun appui n'était arrivé à la page depuis vingt-deux
+   * minutes, alors qu'on cliquait. Un calque, même invisible, reçoit le clic ;
+   * un `pointer-events: none` sur la page le laisse à `<html>` — dans les deux
+   * cas un écouteur de la fenêtre l'entend. Là, rien : les clics n'entraient
+   * plus dans la page.
+   *
+   * Trois lectures restent, et la boîte les sépare :
+   *   - un glisser-déposer resté ouvert : le navigateur est dans sa boucle de
+   *     glisser, la souris ne clique plus, mais la page vit et se dessine.
+   *     `dragstart` sans `dragend`, et des survols qui continuent ;
+   *   - un fil principal pris : de longues tâches, relevées par le navigateur,
+   *     et une page qui n'a pas pu dire au revoir au F5 ;
+   *   - Chrome qui ne transmet plus la souris : plus rien n'arrive, pas même
+   *     les mouvements, alors que les images continuent d'être dessinées.
+   *
+   * Tenue dans `sessionStorage`, comme l'heure du dernier rechargement : le F5
+   * la garde, et elle est propre à l'onglet. Écrite au départ de la page et
+   * toutes les dix secondes — un fil pris ne part pas proprement. Rien de la
+   * page n'y entre : des heures, des comptes, et des éléments nommés par leur
+   * balise et leurs classes, comme le reste du diagnostic.
+   */
+  const BOITE_KEY = 'wm-auto-boite';
+  const BOITE_EVERY = 10000;
+  const BOITE_APPUIS = 10;
+  const boite = {
+    debut: Date.now(),
+    appui: 0, cibleAppui: '', appuis: [],   // `pointerdown` : le dernier, et les heures des dix derniers
+    clic: 0,                                // dernier `click` complet
+    bouge: 0, roue: 0, touche: 0,           // derniers mouvement, molette, touche
+    glisse: 0, cibleGlisse: '', glisseFin: 0, survols: 0,
+    capture: '',                            // ce qui tient le pointeur, s'il est tenu
+    tache: 0, tacheAt: 0, longues: 0,       // plus longue tâche du fil ; celles d'une seconde et plus
+    image: 0,                               // dernière image dessinée, onglet visible
+  };
+  let boitesAvant = [];   // les chargements d'avant, dans cet onglet, le plus récent d'abord
+  let imageDemandee = false;
+
+  function lireBoitesAvant() {
+    try {
+      const d = JSON.parse(sessionStorage.getItem(BOITE_KEY) || 'null');
+      boitesAvant = [d && d.courante, d && d.precedente]
+        .filter((x) => x && Number.isFinite(x.fin) && Number.isFinite(x.debut));
+    } catch (_) {
+      boitesAvant = [];
+    }
+  }
+
+  /** `depart` : écrite par `pagehide`, la page est partie proprement. */
+  function sauverBoite(depart = false) {
+    try {
+      const courante = {
+        ...boite,
+        appuis: boite.appuis.slice(),
+        fin: Date.now(),
+        depart,
+        visible: document.visibilityState !== 'hidden',
+        active: typeof document.hasFocus === 'function' ? document.hasFocus() : true,
+      };
+      sessionStorage.setItem(BOITE_KEY, JSON.stringify({ courante, precedente: boitesAvant[0] || null }));
+    } catch (_) {
+      /* stockage refusé : la boîte ne passera pas le F5, le reste du diagnostic tient */
+    }
+  }
+
+  function tenirLaBoite() {
+    lireBoitesAvant();
+    const noter = (type, faire) => addEventListener(type, (e) => {
+      try {
+        faire(e, Date.now());
+      } catch (_) {
+        /* relever ne doit jamais coûter le geste relevé */
+      }
+    }, { capture: true, passive: true });
+    noter('pointerdown', (e, t) => {
+      boite.appui = t;
+      boite.cibleAppui = nomElement(e.target);
+      boite.appuis.push(t);
+      if (boite.appuis.length > BOITE_APPUIS) boite.appuis.shift();
+    });
+    noter('click', (e, t) => { boite.clic = t; });
+    noter('pointermove', (e, t) => { boite.bouge = t; });
+    noter('wheel', (e, t) => { boite.roue = t; });
+    noter('keydown', (e, t) => { boite.touche = t; });
+    noter('dragstart', (e, t) => {
+      boite.glisse = t;
+      boite.cibleGlisse = nomElement(e.target);
+      boite.survols = 0;
+    });
+    noter('dragover', () => { boite.survols += 1; });
+    noter('dragend', (e, t) => { boite.glisseFin = t; });
+    noter('drop', (e, t) => { boite.glisseFin = t; });
+    noter('gotpointercapture', (e) => { boite.capture = nomElement(e.target); });
+    noter('lostpointercapture', () => { boite.capture = ''; });
+
+    // Les tâches du fil principal, telles que le navigateur les mesure.
+    try {
+      if (typeof PerformanceObserver === 'function'
+          && (PerformanceObserver.supportedEntryTypes || []).includes('longtask')) {
+        new PerformanceObserver((liste) => {
+          for (const t of liste.getEntries()) {
+            const at = Math.round(performance.timeOrigin + t.startTime);
+            if (t.duration > boite.tache) { boite.tache = Math.round(t.duration); boite.tacheAt = at; }
+            if (t.duration >= 1000) boite.longues += 1;
+          }
+        }).observe({ type: 'longtask', buffered: true });
+      }
+    } catch (_) {
+      /* navigateur sans cette mesure : la boîte s'en passe */
+    }
+
+    addEventListener('pagehide', () => sauverBoite(true));
+    setInterval(() => {
+      // Une image demandée à la fois, et seulement onglet visible : caché, le
+      // navigateur ne dessine rien, et ce n'est pas une panne.
+      if (!imageDemandee && document.visibilityState === 'visible') {
+        imageDemandee = true;
+        requestAnimationFrame(() => {
+          imageDemandee = false;
+          boite.image = Date.now();
+        });
+      }
+      sauverBoite();
+    }, BOITE_EVERY);
+  }
+
+  /*
    * Posé au démarrage, avant le premier script du site : une erreur levée
    * pendant son chargement doit déjà trouver quelqu'un pour l'entendre.
    * Les trois écouteurs regardent et ne touchent à rien — ni `preventDefault`,
    * ni arrêt de propagation : le clic et l'erreur continuent leur chemin.
    */
   function installerReleveBlocage() {
+    tenirLaBoite();
     addEventListener('pointerdown', (e) => {
       try {
         if (estANous(e.target)) return;
@@ -15381,8 +15516,12 @@
     });
   }
 
-  /** Une ligne par élément : ce que le navigateur voit, jamais ce que la page écrit. */
-  function decrireElement(el) {
+  /**
+   * Balise, identifiant et classes : de quoi reconnaître un élément sans le
+   * mesurer. La boîte noire l'appelle à chaque appui — une mesure forcerait
+   * le navigateur à recalculer la page sous le doigt.
+   */
+  function nomElement(el) {
     if (!el || !el.tagName) return 'rien';
     if (estANous(el)) return `[WikiMasters Tools] #${el.id || el.tagName.toLowerCase()}`;
     let nom = el.tagName.toLowerCase();
@@ -15391,6 +15530,14 @@
     const classes = String((typeof el.className === 'string' ? el.className
       : el.getAttribute && el.getAttribute('class')) || '').trim().split(/\s+/).filter(Boolean);
     if (classes.length) nom += `.${classes.slice(0, 6).join('.')}${classes.length > 6 ? '…' : ''}`;
+    return nom;
+  }
+
+  /** Une ligne par élément : ce que le navigateur voit, jamais ce que la page écrit. */
+  function decrireElement(el) {
+    if (!el || !el.tagName) return 'rien';
+    const nom = nomElement(el);
+    if (estANous(el)) return nom;
 
     const traits = [];
     try {
@@ -15521,6 +15668,48 @@
         ...erreursPage.map((e) => `  il y a ${ilYA(e.at).padStart(7)} · ${e.texte}`
           + (e.ou ? ` — ${e.ou}` : '')));
     }
+    return lignes.concat(lignesBoite());
+  }
+
+  /*
+   * Ce que la boîte noire a gardé des chargements d'avant — rien sans F5.
+   * Les heures se disent AVANT LA FIN de cette page-là : c'est l'écart entre
+   * le dernier appui reçu et le F5 qui dit depuis quand les clics n'entraient
+   * plus.
+   */
+  function lignesBoite() {
+    const lignes = [];
+    const duree = (ms) => {
+      const v = Math.max(0, ms);
+      return v < 60000 ? `${Math.round(v / 1000)} s` : fmtSpan(v);
+    };
+    const recharge = dernierRechargement();
+    boitesAvant.forEach((b, i) => {
+      const avant = (at) => (at ? `${duree(b.fin - at)} avant la fin` : 'jamais');
+      // L'outil note l'heure juste avant de recharger un Marché caché.
+      const parLOutil = i === 0 && recharge > 0 && b.fin >= recharge && b.fin - recharge < 5000;
+      lignes.push(`${i ? 'Et le chargement d’avant' : 'Avant le dernier rechargement de cet onglet'}`
+        + ` (il y a ${duree(Date.now() - b.fin)}, après ${duree(b.fin - b.debut)} de page)`
+        + (parLOutil ? ', rechargé par l’outil' : '')
+        + (b.depart ? '' : ', page fermée sans au revoir : relevé jusqu’à 10 s avant la fin')
+        + ' :');
+      const recents = (b.appuis || []).filter((t) => b.fin - t <= 60000).length;
+      lignes.push(`  dernier appui reçu : ${avant(b.appui)}${b.appui ? `, sur ${b.cibleAppui}` : ''}`
+        + ` · ${recents} dans sa dernière minute · dernier clic complet : ${avant(b.clic)}`);
+      lignes.push(`  souris qui bouge : ${avant(b.bouge)} · molette : ${avant(b.roue)}`
+        + ` · touche : ${avant(b.touche)}`);
+      const ouvert = !!b.glisse && !(b.glisseFin >= b.glisse);
+      if (b.glisse) {
+        lignes.push(`  glisser-déposer : commencé ${avant(b.glisse)}, sur ${b.cibleGlisse}, `
+          + (ouvert ? `jamais fini — ${b.survols} survol(s) depuis` : `fini ${avant(b.glisseFin)}`));
+      }
+      if (b.capture) lignes.push(`  pointeur tenu par : ${b.capture}`);
+      lignes.push(`  fil principal : ${b.tache ? `plus longue tâche ${b.tache} ms, ${avant(b.tacheAt)}`
+        : 'aucune longue tâche relevée'} · ${b.longues} d’une seconde ou plus`);
+      lignes.push(`  dernière image dessinée : ${avant(b.image)}`
+        + ` · onglet ${b.visible ? 'visible' : 'caché'} · fenêtre ${b.active ? 'active' : 'inactive'}`);
+      if (ouvert) lignes.push('  → un glisser-déposer était resté ouvert : la prochaine fois, essayez Échap avant F5.');
+    });
     return lignes;
   }
 
