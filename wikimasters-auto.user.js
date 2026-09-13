@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WikiMasters Tools
 // @namespace    https://www.wiki-masters.com/
-// @version      3.8.1
+// @version      3.8.2
 // @description  Boîte à outils WikiMasters : ouverture automatique des paquets, suivi des tirages, cote des cartes et revente.
 // @match        https://www.wiki-masters.com/*
 // @match        https://wiki-masters.com/*
@@ -41,7 +41,7 @@
    *
    * Il est lu par le garde juste en dessous, d'où sa place en tête.
    */
-  const VERSION = '3.8.1';
+  const VERSION = '3.8.2';
 
   /*
    * Une seule instance par page — et savoir laquelle
@@ -149,9 +149,9 @@
       corps.style.cssText = 'color:#C7CEDA';
       corps.textContent =
         `Une ancienne (${autre || 'numéro illisible'}) a pris la page avant la ${VERSION}, `
-        + 'et c\'est elle que tu vois — celle-ci s\'est retirée pour ne pas afficher deux '
-        + 'panneaux. Ouvre le tableau de bord Tampermonkey, supprime le script qui n\'est '
-        + `pas en ${VERSION}, puis actualise la page.`;
+        + 'et c\'est elle que vous voyez — celle-ci s\'est retirée pour ne pas afficher deux '
+        + 'panneaux. Ouvrez le tableau de bord Tampermonkey, supprimez le script qui n\'est '
+        + `pas en ${VERSION}, puis actualisez la page.`;
 
       const fermer = document.createElement('button');
       fermer.textContent = 'Compris';
@@ -3014,7 +3014,7 @@
   window.wmPity = function () {
     const avecPitie = state.history.filter((e) => Number.isFinite(e.pity));
     if (avecPitie.length < 2) {
-      return 'Pas encore de mesure — le compteur est relevé à chaque ouverture, laisse tourner.';
+      return 'Pas encore de mesure — le compteur est relevé à chaque ouverture, laissez tourner.';
     }
 
     // Le journal va du plus récent au plus ancien, et porte cinq lignes par
@@ -3660,7 +3660,7 @@
       const prev = before.get(b.title);
       // Surenchère : on ne prévient qu'au basculement, pas à chaque scan.
       if (b.status === 'surencheri' && prev && prev.status === 'mene') {
-        notifyBid('Tu es surenchéri', `${b.title} — ${b.bid} wb`);
+        notifyBid('Vous êtes surenchéri', `${b.title} — ${b.bid} wb`);
       }
       if (
         b.status === 'mene' && leftNow(b) != null && leftNow(b) <= BIDS.endingSoonMs &&
@@ -3676,7 +3676,7 @@
   }
 
   /*
-   * Tes ventes. Pas de badge à surveiller ici : ce qui compte est l'échéance,
+   * Vos ventes. Pas de badge à surveiller ici : ce qui compte est l'échéance,
    * et le passage d'« aucune offre » à une première mise.
    *
    * Le relevé est appelé de trois endroits — le tour du guetteur (15 s), le
@@ -3711,7 +3711,7 @@
         leftNow(v) != null && leftNow(v) <= BIDS.endingSoonMs &&
         (!prev || leftNow(prev) == null || leftNow(prev) > BIDS.endingSoonMs)
       ) {
-        notifyBid('Ta vente se termine', `${v.title} — ${v.bid} wb, fin dans ${fmtClock(leftNow(v))}`);
+        notifyBid('Votre vente se termine', `${v.title} — ${v.bid} wb, fin dans ${fmtClock(leftNow(v))}`);
       }
     }
 
@@ -3764,7 +3764,7 @@
       state.bids = { at: Date.now(), list: liste };
       saveStore({ bids: state.bids });
       if (avant && avant.status === 'mene' && ligne.status === 'surencheri') {
-        notifyBid('Tu es surenchéri', `${ligne.title} — ${ligne.bid} wb`);
+        notifyBid('Vous êtes surenchéri', `${ligne.title} — ${ligne.bid} wb`);
       }
       render();
     } catch (_) {
@@ -4820,8 +4820,8 @@
     state.blockedAt = Date.now();
     state.blockedReserve = state.reserve;
     stop(prefs.autoResume
-      ? 'Vérification humaine — coche la case dans la page, la boucle repart seule.'
-      : 'Vérification humaine — coche la case dans la page, puis relance.', true);
+      ? 'Vérification humaine — cochez la case dans la page, la boucle repart seule.'
+      : 'Vérification humaine — cochez la case dans la page, puis relancez.', true);
     flashTitle();
     if (CFG.alertSound) beep();
     notifyBid('Vérification humaine', humanCost());
@@ -4844,7 +4844,7 @@
   function humanCost() {
     const cadence = state.cadenceMs || CFG.defaultCadenceMs;
     if (state.blockedReserve == null) {
-      return 'réserve inconnue — coche la case pour reprendre';
+      return 'réserve inconnue — cochez la case pour reprendre';
     }
     const place = MAX_RESERVE - state.blockedReserve;
     const regen = Math.floor((Date.now() - state.blockedAt) / cadence);
@@ -4910,11 +4910,12 @@
           notifyBid('Vérification humaine', humanCost());
         }
         // Demandée par le serveur, jamais montrée ici : on ne devine pas quand
-        // elle est faite, c'est Start qui le dira.
+        // elle est faite, c'est Start qui le dira. Court : la ligne d'état en
+        // tenait six au panneau étroit, elle en tient quatre.
         setStatus(presente
           ? `Vérification humaine — ${humanCost()}`
-          : 'Vérification demandée par le site, sans case dans cette page : faites-la sur le '
-            + `site (au besoin en rechargeant), puis cliquez Start — ${humanCost()}`, true);
+          : 'Vérification demandée par le site : actualisez la page, faites-la, puis cliquez '
+            + `Start — ${humanCost()}`, true);
         return;
       }
 
@@ -7055,7 +7056,7 @@
             <div class="sect suite">Notifications du site</div>
             <label class="opt" title="Le jeu vous envoie une notification « aucune offre n'a été faite pendant l'enchère » à chaque vente qui ne trouve pas preneur. Elles noient les autres. Cette case les cache. Rien n'est effacé : décochez et elles reviennent."><input type="checkbox" data-opt-masqinv> Cacher les « aucune offre »</label>
             <div class="tune" data-notifnote></div>
-            <div class="sect suite">Ce qu'il a constaté</div>
+            <div class="sect suite" data-constate>Ce qu'il a constaté</div>
             <div class="tune" data-bonusnote></div>
             <div class="tune" data-dbnote></div>
             <!--
@@ -7107,6 +7108,7 @@
       reset: q('[data-reset]'),
       bonusnote: q('[data-bonusnote]'),
       dbnote: q('[data-dbnote]'),
+      constate: q('[data-constate]'),
       notifnote: q('[data-notifnote]'),
       diag: q('[data-diag]'),
       troc: q('[data-troc]'),
@@ -7868,14 +7870,54 @@
    */
   const peint = new WeakMap();   // élément → dernier gabarit écrit
 
+  /*
+   * Les comptes à rebours ne refont pas leur liste.
+   *
+   * Les listes du Marché — enchères, ventes, souhaits, relances — portent
+   * chacune une échéance qui change chaque seconde : leur gabarit changeait
+   * donc chaque seconde, et la liste entière était refaite pour un chiffre.
+   * Un clic dont l'appui et le relâché encadrent ce rendu vise deux lignes
+   * différentes, et peut se perdre.
+   *
+   * Un compte à rebours porte donc son échéance (`data-fin`, voir `compteur`) :
+   * la comparaison des gabarits l'ignore, et seul son texte est remis à
+   * l'heure, en place. La liste n'est refaite que si autre chose a bougé.
+   */
+  const COMPTE = /(<[a-z][a-z0-9]*\b[^>]*\bdata-fin="[^"]*"[^>]*>)[^<]*/g;
+
+  /**
+   * L'attribut d'un compte à rebours. `horloge` écrit 1:36, `secondes` 36 s,
+   * et par défaut comme `fmtLeft` — la forme doit être celle du gabarit.
+   */
+  const compteur = (fin, forme) => (Number.isFinite(fin)
+    ? ` data-fin="${fin}"${forme ? ` data-forme="${forme}"` : ''}`
+    : '');
+
+  function majComptes(el) {
+    for (const s of el.querySelectorAll('[data-fin]')) {
+      const fin = Number(s.dataset.fin);
+      if (!Number.isFinite(fin)) continue;
+      const reste = fin - Date.now();
+      const t = s.dataset.forme === 'horloge' ? fmtClock(reste)
+        : s.dataset.forme === 'secondes' ? `${Math.ceil(Math.max(0, reste) / 1000)} s`
+          : fmtLeft(reste);
+      if (s.textContent !== t) s.textContent = t;
+    }
+  }
+
   function paint(el, html) {
-    if (!el || peint.get(el) === html) return;
+    if (!el) return;
+    const cle = html.includes('data-fin="') ? html.replace(COMPTE, '$1') : html;
+    if (peint.get(el) === cle) {
+      majComptes(el);
+      return;
+    }
     const dedans = [...el.querySelectorAll('ul, table, .scroll')]
       .map((n, i) => [i, n.scrollTop])
       .filter(([, y]) => y);
     const haut = el.scrollTop;
     el.innerHTML = html;
-    peint.set(el, html);
+    peint.set(el, cle);
     el.scrollTop = haut;
     if (dedans.length) {
       const apres = el.querySelectorAll('ul, table, .scroll');
@@ -8003,6 +8045,10 @@
        */
       ui.bonusnote.textContent = state.bonusNote;
       ui.dbnote.textContent = state.dbNote;
+      // Rien de constaté : pas de titre posé au-dessus du vide.
+      ui.bonusnote.hidden = !state.bonusNote;
+      ui.dbnote.hidden = !state.dbNote;
+      ui.constate.hidden = !state.bonusNote && !state.dbNote;
       ui.notifnote.textContent = noteInvendus();
     }
   }
@@ -8065,7 +8111,7 @@
      */
     const cote = new Map((sell.rows || []).map((r) => [r.id, r]));
 
-    paint(ui.log, cards
+    peindreJournal(ui.log, cards
       .map((e) => {
         const col = RARITY_COLOR[e.rarity] || '#8C8275';
         const wiki = e.url
@@ -8095,8 +8141,39 @@
                title="Voir sa cote : ventes, moyenne, min/max">M</a>
             ${wiki}
           </div>`;
-      })
-      .join(''));
+      }));
+  }
+
+  /*
+   * Un tirage de plus n'écrit que sa ligne.
+   *
+   * Le journal compte jusqu'à mille lignes, et un paquet en ajoute cinq en
+   * tête — en retirant cinq en queue quand il est plein. Le refaire en entier
+   * pour ça coûtait 80 ms dans Chrome, pendant lesquelles la page du jeu, qui
+   * partage le fil, ne répond plus. On reconnaît donc le cas — les anciennes
+   * lignes, intactes, décalées de quelques rangs — et on n'écrit que les
+   * neuves. Tout autre changement (un filtre de rareté, une cote qui arrive)
+   * refait le journal, comme avant.
+   */
+  let journalPeint = [];       // les lignes telles qu'écrites, dans l'ordre
+  const JOURNAL_AJOUT_MAX = 50;   // au-delà, autant tout refaire
+
+  function peindreJournal(el, lignes) {
+    if (!el) return;
+    const avant = journalPeint;
+    const k = avant.length ? lignes.indexOf(avant[0]) : -1;
+    const gardees = lignes.length - k;
+    let ajout = k > 0 && k <= JOURNAL_AJOUT_MAX && gardees <= avant.length
+      && el.children.length === avant.length;
+    for (let i = 0; ajout && i < gardees; i++) if (lignes[k + i] !== avant[i]) ajout = false;
+    if (ajout) {
+      el.insertAdjacentHTML('afterbegin', lignes.slice(0, k).join(''));
+      for (let n = avant.length - gardees; n > 0; n--) el.lastElementChild.remove();
+      peint.set(el, lignes.join(''));
+    } else {
+      paint(el, lignes.join(''));
+    }
+    journalPeint = lignes;
   }
 
   /*
@@ -8330,7 +8407,7 @@
           <span class="t">${esc(x.title)}</span>
           ${tag}
           <span class="v">${fmtWb(montant)} wb</span>
-          <span class="e">${fmtLeft(ms)}</span>
+          <span class="e"${compteur(x.end)}>${fmtLeft(ms)}</span>
         </li>`;
       })
       .join('');
@@ -9194,8 +9271,15 @@
         + '</div>');
       const qui = e.suivant ? `${esc(e.suivant.n)} (${rangFr(e.suivant.r)})` : '';
       if (amisStop) lignes.push('<div>Arrêt demandé : plus rien ne part.</div>');
-      else if (qui && e.pause && reste) lignes.push(`<div>Pause · ${qui} dans ${fmtClock(reste)}</div>`);
-      else if (qui && reste) lignes.push(`<div>Prochaine : ${qui} dans ${Math.ceil(reste / 1000)} s</div>`);
+      // Les secondes se remettent à l'heure en place : voir « Les comptes à
+      // rebours ne refont pas leur liste » — le lien vers la page Amis, juste
+      // dessous, reste cliquable pendant l'envoi.
+      else if (qui && e.pause && reste) {
+        lignes.push(`<div>Pause · ${qui} dans <span${compteur(e.prochaine, 'horloge')}>${fmtClock(reste)}</span></div>`);
+      } else if (qui && reste) {
+        lignes.push(`<div>Prochaine : ${qui} dans <span${compteur(e.prochaine, 'secondes')}>`
+          + `${Math.ceil(reste / 1000)} s</span></div>`);
+      }
       else lignes.push('<div>Envoi…</div>');
     } else if (amisNote && Date.now() - amisNoteAt < AMIS_NOTE_MS) {
       lignes.push(`<div><span title="${esc(amisNoteTitre)}">${esc(amisNote)}</span></div>`);
@@ -9573,7 +9657,7 @@
         wishDire(
           prefs.db ? 'base illisible' : 'option décochée',
           prefs.db
-            ? 'Ta liste de souhaits n’a pas pu être lue, et sans elle le bouton écrirait en '
+            ? 'Votre liste de souhaits n’a pas pu être lue, et sans elle le bouton écrirait en '
               + 'double. Réessayez ; si ça dure, décochez puis recochez « Accès direct à la base ».'
             : 'Cochez « Accès direct à la base » dans les réglages du panneau.',
         );
@@ -9594,7 +9678,7 @@
         wishDire(
           `serveur freiné · ${freine || 'attente'}`,
           'Le serveur a demandé de lever le pied pendant la lecture. Rien n’a été écrit, et le '
-            + 'compte aurait été faux. Laisse passer une minute et reclique.',
+            + 'compte aurait été faux. Laissez passer une minute et recliquez.',
         );
         return;
       }
@@ -9625,12 +9709,12 @@
                 : `${neuves.length - place} de trop`,
             `Le volet Souhaits ne surveille que ${WISH_SUIVI_MAX} cartes : au-delà, vous rempliriez `
               + 'une liste dont la fin ne serait plus regardée, ce qui est pire que de ne rien '
-              + `ajouter. Tu en souhaites déjà ${deja.size}, il reste donc ${reste} places, et `
+              + `ajouter. Vous en souhaitez déjà ${deja.size}, il reste donc ${reste} places, et `
               + (deborde
                 ? 'cette recherche en demande davantage — la lecture s’est arrêtée dès qu’elle '
                   + 'a débordé, rien n’a été écrit. '
                 : `celle-ci en demande ${neuves.length}. `)
-              + 'Resserre la recherche, ou coche une rareté.',
+              + 'Resserrez la recherche, ou cochez une rareté.',
           );
           wishAllLot = null;
           return;
@@ -9798,7 +9882,7 @@
        * est montré — précisément l'erreur que le bouton doit rendre
        * impossible.
        */
-      texte = 'Valide la recherche';
+      texte = 'Validez la recherche';
       titre = `Le champ dit « ${barre.tape || '(vide)'} », l’écran montre `
         + `${barre.q ? `« ${barre.q} »` : 'le catalogue'}. Cliquez « Rechercher » — le bouton `
         + 'agit sur ce qui est affiché, jamais sur ce qui est seulement tapé.';
@@ -9811,7 +9895,7 @@
         : 'Vider la liste de souhaits entière. Le compte s’affiche avant, et il faut recliquer.';
     } else if (!barre.q) {
       texte = 'Tout souhaiter';
-      titre = 'Cherche quelque chose d’abord — « BMW », « Peugeot », un réalisateur. Le bouton '
+      titre = 'Cherchez quelque chose d’abord — « BMW », « Peugeot », un réalisateur. Le bouton '
         + 'souhaite ce que la recherche affiche, jamais le catalogue.';
       actif = false;
     } else {
@@ -9954,7 +10038,7 @@
           <span class="t">${esc(x.title)}</span>
           ${x.bids ? '<span class="tag">offre</span>' : ''}
           <span class="v${c ? ` ${c.cls}` : ''}">${c ? `${c.fleche} ` : ''}${fmtWb(x.bid)} wb</span>
-          <span class="e">${fmtLeft(ms)}</span>
+          <span class="e"${compteur(x.end)}>${fmtLeft(ms)}</span>
         </li>`;
       })
       .join('');
@@ -10050,7 +10134,7 @@
     const perime = veille ? '' : '\nSurveillance décochée : dernier relevé connu, il ne se met plus à jour.';
     renderSubs({
       ench: { n: bids.length, hot: veille && perdues > 0, pale: !veille,
-              title: (perdues ? `${perdues} enchère(s) surenchérie(s)` : 'Tes mises en cours') + perime },
+              title: (perdues ? `${perdues} enchère(s) surenchérie(s)` : 'Vos mises en cours') + perime },
       vent: { n: occupes, hot: veille && !libres, pale: !veille,
               title: `${occupes} vente(s) sur ${max} emplacements` + perime },
       rel: { n: suivies, hot: pausees > 0,
@@ -10151,7 +10235,7 @@
         (souhaits.length
           ? `<ul>${wishRows(souhaits)}</ul>`
           : `<div class="none">Rien de votre liste de souhaits aux enchères en ce ` +
-            `moment. Le marché récent est relu toutes les 100 s ; ajoute des ` +
+            `moment. Le marché récent est relu toutes les 100 s ; ajoutez des ` +
             `cartes depuis <em>Toutes les cartes</em> sur le site.</div>`);
 
     ui.relist.hidden = sub !== 'rel';
@@ -10323,7 +10407,7 @@
         <span class="dot"></span>
         <span class="t">${esc(w.title)}</span>
         <span class="p">${w.price} wb</span>
-        <span class="st">${enCompte ? info : etat}</span>
+        <span class="st"${enCompte ? compteur(vente.end) : ''}>${enCompte ? info : etat}</span>
         <span class="w">${enCompte ? '' : info}</span>
         ${w.paused
           ? `<button class="x" data-retry="${esc(card)}" title="Reprendre le suivi : remet le compteur d'échecs à zéro">↻</button>`
@@ -10390,7 +10474,10 @@
     if (aPlacer && !prefs.relistUnsold) { entete = 'option décochée'; entCls = 'wait hot'; }
     else if (aPlacer && complet) { entete = 'emplacements pleins'; entCls = 'wait hot'; }
     // Une attente chiffrée reprend le pas sur l'alerte : elle est plus utile.
-    else if (aPlacer && dans > 0) { entete = `prochaine dans ${fmtClock(dans)}`; entCls = 'wait'; }
+    else if (aPlacer && dans > 0) {
+      entete = `prochaine dans <span${compteur(state.nextRelistAt, 'horloge')}>${fmtClock(dans)}</span>`;
+      entCls = 'wait';
+    }
 
     // Le titre de la section ferait doublon avec l'onglet : seul l'état reste.
     paint(ui.relist,
@@ -10777,8 +10864,9 @@
     for (const v of ventes) {
       // La durée est posée AVANT l'annulation : si le tour de relance passe
       // entre les deux, il republie déjà à la bonne durée.
+      // Et écrite aussitôt : un autre onglet qui la relance doit la lire.
       const w = state.watch[v.card];
-      if (w) w.minutes = minutes;
+      if (w) { w.minutes = minutes; saveStore({ watch: state.watch }); }
       else enrolWatch(v.card, v.title, v.price, minutes, 0);
 
       /*
@@ -11229,6 +11317,102 @@
     if (motif) logRelist(e.title, motif === 'vendue' ? 'ok' : 'stop', e.price, motif);
   }
 
+  /*
+   * DEUX ONGLETS, UNE SEULE FILE.
+   *
+   * Le verrou « un seul onglet travaille à la fois » ne vaut que pour
+   * l'ouverture des paquets : les relances, elles, tournent dans chaque onglet
+   * ouvert sur le jeu. Chacun tenait sa copie de la file, relue au chargement
+   * et jamais depuis, et chacun remettait les cartes en vente de son côté.
+   * Éprouvé au banc : deux onglets, une carte à replacer, deux mises en vente
+   * de la même copie.
+   *
+   * Deux gardes, pour deux défauts :
+   *
+   * - une carte se RÉSERVE juste avant d'être publiée (`reserverRelance`) : un
+   *   onglet qui la trouve réservée par un autre passe son tour. La réserve
+   *   vit sous sa propre clé — une sauvegarde de la file par un autre onglet
+   *   ne peut pas l'effacer — et dure deux minutes, le temps que l'annonce
+   *   paraisse dans le relevé des ventes de tous les onglets ;
+   * - la file SUIT le stockage (`suivreLaFile`) : une carte ajoutée ou retirée
+   *   ailleurs, un prix ou une durée changés ailleurs, se voient ici aussitôt,
+   *   au lieu de repartir au prix d'avant. Seuls les champs qu'on règle à la
+   *   main suivent ; ce que chaque onglet sait de ses propres publications
+   *   reste le sien.
+   */
+  const RELANCE_KEY = 'wm-auto-relance';
+  const RELANCE_TTL = 120000;
+  // Écrire, attendre, relire : deux onglets qui réservent au même instant
+  // écrivent tous deux, et seul le dernier écrit se relit.
+  const RELANCE_VERIF_MS = 250;
+  const CHAMPS_DE_LA_FILE = ['title', 'price', 'minutes', 'invendus', 'voulu'];
+
+  async function reserverRelance(card) {
+    const lire = () => {
+      try {
+        return JSON.parse(localStorage.getItem(RELANCE_KEY) || '{}') || {};
+      } catch (_) {
+        return {};
+      }
+    };
+    const pris = lire();
+    const maintenant = Date.now();
+    for (const [c, p] of Object.entries(pris)) {
+      if (!p || !(maintenant - p.at < RELANCE_TTL)) delete pris[c];
+    }
+    if (pris[card] && pris[card].id !== instanceId) return false;
+    pris[card] = { id: instanceId, at: maintenant };
+    try {
+      localStorage.setItem(RELANCE_KEY, JSON.stringify(pris));
+    } catch (_) {
+      return true;   // sans stockage, rien à partager : un onglet ne se gêne pas lui-même
+    }
+    await delay(RELANCE_VERIF_MS);
+    const relu = lire()[card];
+    return !!relu && relu.id === instanceId;
+  }
+
+  // La dernière file écrite par un autre onglet, en attente qu'un tour de
+  // relance finisse : on ne retire pas une carte sous les pieds de celui-ci.
+  let fileDesAutres = null;
+
+  function suivreLaFile() {
+    if (!fileDesAutres || reconcileWatch.busy) return;
+    const autre = fileDesAutres;
+    fileDesAutres = null;
+    let bouge = false;
+    for (const [c, w] of Object.entries(autre)) {
+      if (!w) continue;
+      const ici = state.watch[c];
+      if (!ici) {
+        state.watch[c] = { ...w };
+        bouge = true;
+        continue;
+      }
+      for (const k of CHAMPS_DE_LA_FILE) {
+        if (w[k] !== undefined && ici[k] !== w[k]) { ici[k] = w[k]; bouge = true; }
+      }
+    }
+    for (const c of Object.keys(state.watch)) {
+      if (!(c in autre)) { delete state.watch[c]; bouge = true; }
+    }
+    if (bouge) {
+      render();
+      if (sell.open) renderSell();
+    }
+  }
+
+  function fileEcriteAilleurs(e) {
+    if (e.key !== STORE_KEY || !e.newValue) return;
+    try {
+      const lu = JSON.parse(e.newValue);
+      if (lu && lu.watch && typeof lu.watch === 'object') fileDesAutres = lu.watch;
+    } catch (_) {
+      return;
+    }
+    suivreLaFile();
+  }
+
   async function reconcileWatch() {
     let ids = Object.keys(state.watch);
     if (!prefs.relistUnsold || !ids.length || reconcileWatch.busy) return;
@@ -11373,6 +11557,7 @@
       let rebati = false;
       let bouge = false;
       let absente = false;   // une carte introuvable a été cherchée ce tour-ci
+      let cedee = false;     // une carte réservée par un autre onglet a été laissée
       let tentee = false;    // une annonce est partie au serveur, acceptée ou non
 
       for (const card of manquantes) {
@@ -11526,6 +11711,12 @@
          * on ne l'a pas trouvée » : la trouver le remet à zéro.
          */
         if (w.fails) { w.fails = 0; w.failAt = 0; bouge = true; }
+        // Un autre onglet la publie en ce moment : il a la main, on passe.
+        // Voir « Deux onglets, une seule file ».
+        if (!(await reserverRelance(card))) {
+          cedee = true;
+          continue;
+        }
         const res = await api('/api/marketplace', 'POST', {
           card_id: copie,
           base_amount: w.price,
@@ -11613,15 +11804,17 @@
         spaceRelist();
         break;
       }
-      // Rien de publié parce que la carte reste introuvable : prochain essai
-      // au prochain créneau, pas à la seconde. Voir « L'échec était espacé ».
-      if (absente && !tentee) spaceRelist();
+      // Rien de publié — carte introuvable, ou réservée par un autre onglet :
+      // prochain essai au prochain créneau, pas à la seconde. Voir « L'échec
+      // était espacé ».
+      if ((absente || cedee) && !tentee) spaceRelist();
       if (bouge) {
         saveStore({ watch: state.watch, asks: state.asks });
         render();
       }
     } finally {
       reconcileWatch.busy = false;
+      suivreLaFile();   // ce qu'un autre onglet a changé pendant le tour
     }
   }
 
@@ -12516,7 +12709,7 @@
    * Deux seuils qui se contredisent ne valent pas mieux qu'aucun seuil.
    */
   const sellPrefs = { minSales: THIN_SALES, hideTags: [], hideTagged: false, rarity: '', onlyFree: true,
-                      // « Tes ventes » déplié, et l'aide ouverte : repliés tant qu'on ne les demande pas.
+                      // « Vos ventes » déplié, et l'aide ouverte : repliés tant qu'on ne les demande pas.
                       journalOuvert: false, aide: false,
                       // Le tri choisi en cliquant une colonne (vide : l'ordre par défaut), son sens,
                       // le nom cherché, et combien de lignes on affiche.
@@ -13965,7 +14158,7 @@
      * nombre, et la flèche ne paraît que lorsqu'il y en a deux à comparer.
      */
     .jhead { display: flex; align-items: flex-start; gap: 26px; flex-wrap: wrap; }
-    /* Le titre de « Tes ventes » est le bouton qui la déplie. */
+    /* Le titre de « Vos ventes » est le bouton qui la déplie. */
     .jtoggle { align-self: center; display: flex; align-items: center; gap: 8px; margin-right: 2px;
                padding: 0; border: 0; background: none; cursor: pointer; color: var(--text);
                font: 600 12px ui-sans-serif, system-ui, sans-serif; letter-spacing: -.005em; }
@@ -14070,7 +14263,7 @@
     q('[data-wrap]').addEventListener('click', (e) => { if (e.target === q('[data-wrap]')) closeSell(); });
     q('[data-rescan]').addEventListener('click', scanCote);
     /*
-     * L'aide et « Tes ventes » se replient, et l'état se retient. Tous deux
+     * L'aide et « Vos ventes » se replient, et l'état se retient. Tous deux
      * restaient ouverts sous le tableau, à hauteur fixe : sur un portable, ils
      * prenaient plus de place que lui.
      */
@@ -14378,7 +14571,7 @@
     const rapport = comparables.length >= 5 && demande ? Math.round((obtenu / demande) * 100) : null;
     const tete = `<div class="jhead"><button class="jtoggle" data-jtoggle aria-expanded="${ouvert}"`
       + ` title="${ouvert ? 'Replier la liste de vos dernières ventes' : 'Voir vos dernières ventes, une par une'}">`
-      + `<i class="chev${ouvert ? ' on' : ''}"></i>Tes ventes</button>`
+      + `<i class="chev${ouvert ? ' on' : ''}"></i>Vos ventes</button>`
       + `<div class="f" title="Sur vos ${nb(state.journal.length)} dernières fins d’enchère : ${taux} % ont trouvé un acheteur.">`
       + `<b>${nb(vendues.length)} / ${nb(state.journal.length)}</b><span>vendues · ${taux} %</span></div>`
       + `<div class="f"><b>${nb(gains)}</b><span>wb encaissés</span></div>`
@@ -15369,6 +15562,9 @@
 
   addEventListener('pagehide', releaseLock);
 
+  // La file des relances suit ce que les autres onglets en font.
+  addEventListener('storage', fileEcriteAilleurs);
+
   /*
    * Un rechargement libère le verrou via `pagehide`, mais un onglet tué
    * brutalement le laisse traîner jusqu'à expiration. L'auto-démarrage patiente
@@ -15487,7 +15683,7 @@
             bridé_jusqu_à: p.activity_blocked_until || null }
         : state.dbNote || 'profil illisible';
     } else {
-      rapport.compte = 'coche « Accès direct à la base » dans les réglages pour lire '
+      rapport.compte = 'cochez « Accès direct à la base » dans les réglages pour lire '
         + 'is_pro et les sanctions du compte';
     }
 
