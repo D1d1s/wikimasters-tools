@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WikiMasters Tools
 // @namespace    https://www.wiki-masters.com/
-// @version      3.8.4
+// @version      3.8.5
 // @description  Boîte à outils WikiMasters : ouverture automatique des paquets, suivi des tirages, cote des cartes et revente.
 // @match        https://www.wiki-masters.com/*
 // @match        https://wiki-masters.com/*
@@ -41,7 +41,7 @@
    *
    * Il est lu par le garde juste en dessous, d'où sa place en tête.
    */
-  const VERSION = '3.8.4';
+  const VERSION = '3.8.5';
 
   /*
    * Une seule instance par page — et savoir laquelle
@@ -7131,6 +7131,7 @@
       bonusnote: q('[data-bonusnote]'),
       dbnote: q('[data-dbnote]'),
       constate: q('[data-constate]'),
+      mopts: [...root.querySelectorAll('[data-mopt]')],
       notifnote: q('[data-notifnote]'),
       diag: q('[data-diag]'),
       troc: q('[data-troc]'),
@@ -7931,7 +7932,9 @@
     if (!el) return;
     const cle = html.includes('data-fin="') ? html.replace(COMPTE, '$1') : html;
     if (peint.get(el) === cle) {
-      majComptes(el);
+      // Seulement s'il y a des comptes : le tableau de la Revente, deux cents
+      // lignes sans aucun, était parcouru à chaque rendu pour rien.
+      if (cle !== html) majComptes(el);
       return;
     }
     const dedans = [...el.querySelectorAll('ul, table, .scroll')]
@@ -7983,7 +7986,8 @@
 
     ui.panel.classList.toggle('live', state.running);
     ui.panel.classList.toggle('warn', !state.running && state.warn);
-    ui.toggle.textContent = state.running ? 'Stop' : 'Start';
+    const bouton = state.running ? 'Stop' : 'Start';
+    if (ui.toggle.textContent !== bouton) ui.toggle.textContent = bouton;
 
     renderPannes();
     renderStatus();
@@ -10099,8 +10103,15 @@
   function renderMarket() {
     const sub = prefs.mktSub;
     // Seul l'interrupteur du volet ouvert reste à l'écran — voir `data-mopt`.
-    for (const l of ui.panel.querySelectorAll('[data-mopt]')) {
-      l.hidden = !l.dataset.mopt.split(' ').includes(sub);
+    /*
+     * Les trois interrupteurs sont relevés une fois, au montage (`ui.mopts`).
+     * Les chercher ici parcourait tout le panneau — journal de mille lignes
+     * compris — à chaque rendu, trois fois par seconde : au banc, 99 % du coût
+     * de ce rendu.
+     */
+    for (const l of ui.mopts) {
+      const cache = !l.dataset.mopt.split(' ').includes(sub);
+      if (l.hidden !== cache) l.hidden = cache;
     }
     const bids = stillRunning(state.bids.list);
     /*
@@ -10554,15 +10565,20 @@
     // normal le script la vide aussitôt, et un « 0/10 » permanent n'apprend rien.
     const stock = held > 0 ? `<span class="stock">${held} en réserve</span>` : '';
 
+    // Le compte à rebours avance en place : voir `compteur`. La ligne n'est
+    // refaite que si le message ou la réserve changent.
     paint(ui.status, waiting
-      ? `<span>${esc(state.waitLabel)}</span>${stock}<b>${left > 0 ? fmtClock(left) : '0:00'}</b>`
+      ? `<span>${esc(state.waitLabel)}</span>${stock}<b${compteur(state.waitUntil, 'horloge')}>${fmtClock(left)}</b>`
       : `<span>${esc(state.message)}</span>${stock}`);
 
-    ui.mini.textContent = waiting && left > 0 ? fmtClock(left) : '';
+    // Et rien n'est réécrit à l'identique, deux fois par seconde.
+    const mini = waiting && left > 0 ? fmtClock(left) : '';
+    if (ui.mini.textContent !== mini) ui.mini.textContent = mini;
     ui.bar.classList.toggle('idle', !waiting);
     if (waiting) {
       const progress = Math.min(1, Math.max(0, 1 - left / span));
-      ui.barFill.style.width = `${(progress * 100).toFixed(1)}%`;
+      const largeur = `${(progress * 100).toFixed(1)}%`;
+      if (ui.barFill.style.width !== largeur) ui.barFill.style.width = largeur;
     }
   }
 
@@ -11318,7 +11334,11 @@
     // Une carte vue en vente (`observe`) — qui y est, ou qui en revient — ne se
     // juge pas sur un index qui ne voyait pas son exemplaire : la barrière de
     // `reconcileWatch` tranchera, index relu. Voir `indexSaitJuger`.
-    if (isTagged(card) && !voulu && !dejaVoulu && !observe && indexSaitJuger(card)) {
+    // Ni sur un index vieux : il n'est plus relu à chaque relance (voir « La
+    // carte, lue à l'instant »), et vieux d'une heure il refuserait une carte
+    // dont vous avez retiré l'étiquette depuis. La seconde barrière, elle, lit.
+    const indexFrais = owned.at && Date.now() - owned.at < OWNED_TTL;
+    if (indexFrais && isTagged(card) && !voulu && !dejaVoulu && !observe && indexSaitJuger(card)) {
       if (state.watch[card]) dropWatch(card, SORTIE_ETIQUETEE);
       return false;
     }
@@ -11668,7 +11688,9 @@
       // On tient le rythme même quand tout est prêt : une annonce à la fois.
       if (Date.now() < state.nextRelistAt) { render(); return; }
 
-      let index = libres > 0 ? await ownedIndex(false) : owned.map;
+      // L'index de toute la collection, relu seulement si un titre ne se
+      // cherche pas — voir « La carte, lue à l'instant ».
+      let index = null;
       let rebati = false;
       let bouge = false;
       let absente = false;   // une carte introuvable a été cherchée ce tour-ci
@@ -11679,116 +11701,86 @@
         if (libres <= 0) break;               // les autres attendront un emplacement
         const w = state.watch[card];
         /*
-         * Dernière barrière avant de publier, et la seule qui compte vraiment :
-         * l'index vient d'être relu, ses étiquettes sont donc à jour. Une carte
-         * étiquetée entre-temps sort du suivi ici, et l'écart est visible au
-         * journal plutôt que silencieux.
-         */
-        /*
-         * Le geste explicite passe — à une condition qui se revérifie ICI.
+         * LA CARTE, LUE À L'INSTANT, PAR SON TITRE.
          *
-         * `voulu` a été donné devant un tableau qui annonçait plusieurs
-         * exemplaires. Entre-temps vous avez pu en vendre un à la main : il
-         * n'en reste qu'un, et publier reviendrait à vendre la carte que vous
-         * gardez. L'index vient d'être relu, il sait compter — on lui demande.
+         * C'est la dernière barrière avant de publier, et la seule qui compte
+         * vraiment : elle dit quelle copie partira, et si la carte peut encore
+         * partir — une carte étiquetée entre-temps sort du suivi ici, et
+         * l'écart se lit au journal. Elle se jugeait sur un index de TOUTE la
+         * collection : quatre-vingts pages, relues toutes les cinq minutes dès
+         * qu'une carte attendait un emplacement : au banc, le premier poste
+         * de requêtes du script. Et cet index vieillissait : lu pendant qu'un
+         * exemplaire était aux enchères, il ne le voyait pas (voir
+         * `indexSaitJuger`).
          *
-         * Un index tronqué compte trop bas ; « trop bas » se lit « exemplaire
-         * unique », donc on s'abstient. C'est le bon sens de l'erreur.
+         * Le serveur sait filtrer par titre — vérifié sur le vrai site : `?q=`
+         * rend les copies de la carte, étiquettes comprises. Une requête, au
+         * moment de publier, et la réponse est fraîche. L'index ne sert plus
+         * qu'à un titre trop court pour la recherche, ou quand elle ne permet
+         * pas de conclure — une carte qu'on n'a pas su chercher n'est pas une
+         * carte absente.
          */
+        let copie = null;
+        let jugee = false;
+        const copies = cherchable(w.title) ? await exemplairesParTitre(card, w.title, true) : null;
+        const libresIci = copies ? copies.filter((c) => !(c.tags || []).length && !c.starred) : [];
         /*
-         * Et elle ne tranche que sur un index qui voyait tous les exemplaires
-         * de la carte : relu après son retour d'enchère. Sinon on le relit, et
-         * s'il ne peut pas l'être tout de suite, la carte attend le créneau
-         * suivant — sans rien perdre, ni échec compté, ni retrait de la file.
-         * Voir `indexSaitJuger`.
+         * Une recherche noyée d'homonymes rend ce qu'elle a trouvé sans avoir
+         * tout lu : un exemplaire libre trouvé y est sûr, « toutes gardées »
+         * non — le libre peut être plus loin. Celle-là laisse juger l'index.
          */
-        if (!indexSaitJuger(card)) {
-          if (!rebati) {
-            rebati = true;
-            index = await ownedIndex(true);
-          }
-          if (!indexSaitJuger(card)) {
-            cedee = true;
+        if (copies && (libresIci.length || !copies.tronque)) {
+          jugee = true;
+          /*
+           * Toutes gardées : la carte ne part pas — sauf si vous avez demandé
+           * d'en vendre une (« Vendre un double ») et que la lecture en compte
+           * encore plusieurs. S'il n'en reste qu'une, publier vendrait celle
+           * que vous gardez : c'est ici que ça se revérifie.
+           */
+          if (copies.length && !libresIci.length && !(w.voulu && copies.length > 1)) {
+            dropWatch(card, w.voulu ? SORTIE_DERNIERE : SORTIE_ETIQUETEE);
+            bouge = true;
             continue;
           }
+          // Un exemplaire LIBRE d'abord : jamais la copie gardée d'un double.
+          // Toutes gardées et « Vendre un double » demandé : la première.
+          const ligne = libresIci[0] || (w.voulu && copies.length > 1 ? copies[0] : null);
+          copie = ligne ? ligne.id : null;
         }
-        const exemplaires = owned.copies.get(card) || 0;
-        if (isTagged(card) && !(w.voulu && exemplaires > 1)) {
-          dropWatch(card, w.voulu ? SORTIE_DERNIERE : SORTIE_ETIQUETEE);
-          bouge = true;
-          continue;
-        }
-        let copie = index.get(card);
-        /*
-         * La relecture forcée de l'index — quatre-vingts pages — ne sert qu'au
-         * PREMIER manque d'une série : c'est là qu'une carte revient d'une
-         * enchère close et que l'index, vieux de quelques minutes, ne la
-         * connaît pas encore. Aux manques suivants, la recherche par titre
-         * juste en dessous répond pour une requête. Relue à chaque manque, elle
-         * coûtait quatre-vingts pages toutes les trente secondes par carte
-         * partie : 7 600 pages en trois heures au banc, pour une seule carte.
-         * Seul un titre trop court pour la recherche la garde à chaque fois.
-         */
-        const premierManque = !w.fails && !w.perduDepuis;
-        if (!copie && !rebati && (premierManque || !cherchable(w.title))) {
-          rebati = true;                      // une seule reconstruction par passage
-          index = await ownedIndex(true);
-          copie = index.get(card);
-        }
-        /*
-         * TOUJOURS PAS TROUVÉE : ON DEMANDE AU SERVEUR, AU LIEU DE CONCLURE.
-         *
-         * `ownedIndex` s'arrête à quatre-vingts pages, soit 4 000 cartes.
-         * Au-delà, la collection existe mais le balayage ne la voit pas — et
-         * l'index ne le SAIT pas : son drapeau `complet` ne compte que les
-         * requêtes en échec, pas la troncature. Une carte suivie au-delà de
-         * cette borne récoltait donc une absence par créneau, atteignait les
-         * vingt absences, et se mettait en pause définitivement. Vu à l'usage :
-         * des cartes en pause définitive, vingt absences chacune, zéro refus du
-         * serveur, jamais publiées — et une collection dont le balayage n'avait
-         * jamais atteint la fin.
-         *
-         * Le même défaut avait été corrigé côté cote : `fetchCollectionRaw`
-         * lit jusqu'à la première page incomplète et signale sa troncature.
-         * Il ne l'avait jamais été ici, dans la fonction qui décide si une
-         * carte existe encore.
-         *
-         * Relever la borne coûterait cinq cents requêtes toutes les cinq
-         * minutes. Le serveur sait filtrer par titre — vérifié sur le vrai
-         * site : `?q=` rend UNE ligne. On lui demande donc la carte, une
-         * requête, plutôt que de relire la collection entière pour la trouver.
-         *
-         * Ce qu'on ne fait toujours pas : conclure. Une carte qu'on n'a pas su
-         * chercher n'est pas une carte absente.
-         */
-        if (!copie) {
-          try {
-            const d = await api(`/api/my-collection?page=0&q=${encodeURIComponent(w.title)}`);
-            const miennes = ((d.data && d.data.collection) || []).filter((c) => c.card_id === card);
-            /*
-             * Un exemplaire LIBRE d'abord, comme l'index.
-             *
-             * Le serveur rend toutes vos copies, et prendre la première venue
-             * referait ici l'erreur qu'on vient de corriger là-bas : sur une
-             * carte en double dont une seule est gardée, on mettrait en vente
-             * celle qu'on garde. Le repli suit donc la même règle que l'index —
-             * et s'il n'y a que des exemplaires protégés, on n'en prend aucun.
-             */
-            const ligne = miennes.find((c) => !(c.tags || []).length && !c.starred)
-              /*
-               * Toutes gardées, mais vous avez demandé d'en vendre une et le
-               * serveur vient de confirmer qu'il y en a plusieurs : on prend la
-               * première. C'est le seul endroit où une copie étiquetée part en
-               * vente, et il a fallu un clic de confirmation pour y arriver.
-               */
-              || (w.voulu && miennes.length > 1 ? miennes[0] : null);
-            if (ligne && ligne.id) {
-              copie = ligne.id;
-              // Elle existe : l'index était court, pas la collection.
-              index.set(card, ligne.id);
+        if (!jugee) {
+          if (!index) index = await ownedIndex(false);
+          // Un index lu pendant l'enchère ne voyait pas l'exemplaire : relu,
+          // ou la carte attend le créneau suivant. Voir `indexSaitJuger`.
+          if (!indexSaitJuger(card)) {
+            if (!rebati) {
+              rebati = true;
+              index = await ownedIndex(true);
             }
-          } catch (_) {
-            /* réseau : le créneau suivant retentera, comme pour le reste */
+            if (!indexSaitJuger(card)) {
+              cedee = true;
+              continue;
+            }
+          }
+          const exemplaires = owned.copies.get(card) || 0;
+          if (isTagged(card) && !(w.voulu && exemplaires > 1)) {
+            dropWatch(card, w.voulu ? SORTIE_DERNIERE : SORTIE_ETIQUETEE);
+            bouge = true;
+            continue;
+          }
+          copie = index.get(card) || null;
+          /*
+           * La relecture forcée — quatre-vingts pages — ne sert qu'au PREMIER
+           * manque d'une série, ou à un titre qu'on ne peut pas chercher. Aux
+           * manques suivants, la recherche par titre a déjà répondu, à chaque
+           * créneau. Relue à chaque manque, elle coûtait quatre-vingts pages
+           * toutes les trente secondes par carte partie : 7 600 pages en trois
+           * heures au banc, pour une seule carte.
+           */
+          const premierManque = !w.fails && !w.perduDepuis;
+          if (!copie && !rebati && (premierManque || !cherchable(w.title))) {
+            rebati = true;                      // une seule reconstruction par passage
+            index = await ownedIndex(true);
+            copie = index.get(card) || null;
           }
         }
         if (!copie) {
@@ -12880,17 +12872,38 @@
     med: (x) => x.med,
   };
 
+  /*
+   * UN comparateur pour tout le tri. `localeCompare` avec options en bâtit un
+   * à chaque comparaison : trier trois mille noms en demandait des dizaines
+   * de milliers, soit quelques centaines de millisecondes de calcul pur à
+   * chaque clic sur « Carte », contre six avec un comparateur partagé —
+   * mesuré au banc. Signalé à l'usage : « l'interface de la revente est d'une
+   * lenteur folle ».
+   */
+  const COLLATEUR = new Intl.Collator('fr', { sensitivity: 'base' });
+
   /** Les lignes dans l'ordre que vous avez choisi, ou telles quelles. */
   function trierVue(rows) {
     const k = sellPrefs.tri;
     if (!k || !(k in VALEUR_TRI)) return rows;
     const s = sellPrefs.sens;
-    if (k === 't') return rows.slice().sort((a, b) => s * a.t.localeCompare(b.t, 'fr', { sensitivity: 'base' }));
+    if (k === 't') return rows.slice().sort((a, b) => s * COLLATEUR.compare(a.t, b.t));
     return rows.slice().sort((a, b) => s * (VALEUR_TRI[k](a) - VALEUR_TRI[k](b)));
   }
 
   /** Pour chercher un nom sans se soucier des accents ni des majuscules. */
   const sansAccents = (s) => String(s || '').normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase();
+
+  /*
+   * Et chaque nom n'est mis à plat qu'une fois : la recherche le refaisait
+   * pour toutes les cartes à chaque lettre tapée.
+   */
+  const aPlat = new Map();   // titre → titre sans accents ni majuscules
+  const cleDe = (t) => {
+    let c = aPlat.get(t);
+    if (c === undefined) aPlat.set(t, (c = sansAccents(t)));
+    return c;
+  };
 
   /** Une cote assise sur assez de ventes pour qu'on la classe devant. */
   const fiable = (x) => (!x.seule && x.n >= THIN_SALES ? 1 : 0);
@@ -12906,6 +12919,7 @@
   const concurrenceConnue = () => !!sell.compAt;
 
   function sellRows() {
+    const cherche = sellPrefs.cherche ? sansAccents(sellPrefs.cherche) : '';
     return sell.rows
       // Une cote sans historique n'a pas de nombre de ventes : le seuil ne
       // s'applique pas à elle, sinon elle serait toujours masquée.
@@ -12916,7 +12930,7 @@
       .filter((x) => sellPrefs.hideTagged || !x.tags.some((t) => sellPrefs.hideTags.includes(t)))
       .filter((x) => !sellPrefs.rarity || x.r === sellPrefs.rarity)
       // Le nom cherché dans la barre, accents et majuscules confondus.
-      .filter((x) => !sellPrefs.cherche || sansAccents(x.t).includes(sansAccents(sellPrefs.cherche)))
+      .filter((x) => !cherche || cleDe(x.t).includes(cherche))
       // Sans concurrence d'abord, puis par prix visé.
       .filter((x) => !sellPrefs.onlyFree || !concurrenceConnue() || !sell.comp.get(x.id))
       /*
@@ -13327,8 +13341,12 @@
       for (const e of lignes) if (e.card_id === id && e.id != null) copies.set(e.id, e);
       if (lignes.length < COLLECTION_PAGE) return rendre();
     }
-    // Des homonymes à perte de vue : ce qu'on a trouvé est sûr, l'absence non.
-    return copies.size ? rendre() : null;
+    // Des homonymes à perte de vue : ce qu'on a trouvé est sûr, l'absence non
+    // — ni celle d'un autre exemplaire, d'où `tronque`.
+    if (!copies.size) return null;
+    const trouvees = rendre();
+    trouvees.tronque = true;
+    return trouvees;
   }
 
   async function pruneSold() {
@@ -13877,10 +13895,16 @@
      * ton de l'amplitude et des en-têtes de colonnes, les plus petits
      * textes du tableau. On gagne donc le relief en ENFONÇANT ce qu'il y a
      * derrière, jamais en remontant ce qu'il y a devant.
+     *
+     * Et le flou est retiré. Sur toute la fenêtre, derrière un fond déjà
+     * opaque à 94 %, il ne se voyait presque pas, et il se payait à chaque
+     * image : le navigateur refait le flou de tout l'arrière-plan dès que
+     * quelque chose bouge, défilement du tableau compris. La Revente était
+     * signalée « d'une lenteur folle ». Le fond monte à 97 % : les 3 % qui
+     * restent de la page, nets, ne se distinguent plus.
      */
     .wrap {
-      position: absolute; inset: 0; background: rgba(6,8,11,.94);
-      backdrop-filter: blur(20px) saturate(.9);
+      position: absolute; inset: 0; background: rgba(6,8,11,.97);
       display: flex; align-items: center; justify-content: center;
       padding: 28px; font: 13px/1.5 ui-sans-serif, system-ui, -apple-system,
         "Segoe UI Variable", "Segoe UI", sans-serif; color: var(--text);
@@ -15115,8 +15139,13 @@
       return !e.protegee && !e.dejaEnVente && !e.enFile;
     });
     const toutCoche = cochables.length > 0 && cochables.every((x) => sell.aDefausser.has(x.id));
+    /*
+     * L'état coché n'est PAS dans le gabarit : il est posé sur les cases après
+     * coup, plus bas. Écrit dans le balisage, il le changeait à chaque clic —
+     * et le tableau entier, deux cents lignes, était refait pour une case.
+     */
     const caseTout = `<th class="sel">${cochables.length
-      ? `<input type="checkbox" data-selall${toutCoche ? ' checked' : ''} aria-label="Cocher toutes les cartes affichées"`
+      ? '<input type="checkbox" data-selall aria-label="Cocher toutes les cartes affichées"'
         + ' title="Cocher toutes les cartes affichées, pour les défausser">'
       : ''}</th>`;
     // La page se redessine seule pendant qu'on tape un prix : le champ garde
@@ -15132,7 +15161,7 @@
             const cochable = !protegee && !dejaEnVente && !enFile;
             return `<tr class="${aLister ? 'next' : ''}">
             <td class="sel">${cochable
-              ? `<input type="checkbox" data-sel="${esc(x.id)}"${sell.aDefausser.has(x.id) ? ' checked' : ''}`
+              ? `<input type="checkbox" data-sel="${esc(x.id)}"`
                 + ` aria-label="Cocher ${esc(x.t)} pour la défausser">`
               : ''}</td>
             <td class="r"><i style="--c:${RARITY_COLOR[x.r] || '#949DAD'}">${x.r}</i></td>
@@ -15215,6 +15244,13 @@
           + `<span>${vue.length.toLocaleString('fr-FR')} lignes sur ${rows.length.toLocaleString('fr-FR')}</span></td></tr>`
         : '')
       + '</tbody></table>');
+    // Les cases suivent la sélection, sans toucher au reste du tableau.
+    for (const c of sellUI.scroll.querySelectorAll('[data-sel]')) {
+      const voulu = sell.aDefausser.has(c.dataset.sel);
+      if (c.checked !== voulu) c.checked = voulu;
+    }
+    const tout = sellUI.scroll.querySelector('[data-selall]');
+    if (tout && tout.checked !== toutCoche) tout.checked = toutCoche;
     if (tapait) {
       const champ = sellUI.scroll.querySelector('[data-fprix]');
       if (champ && sellUI.root.activeElement !== champ) champ.focus();
