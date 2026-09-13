@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WikiMasters Tools
 // @namespace    https://www.wiki-masters.com/
-// @version      3.8.6
+// @version      3.8.7
 // @description  Boîte à outils WikiMasters : ouverture automatique des paquets, suivi des tirages, cote des cartes et revente.
 // @match        https://www.wiki-masters.com/*
 // @match        https://wiki-masters.com/*
@@ -41,7 +41,7 @@
    *
    * Il est lu par le garde juste en dessous, d'où sa place en tête.
    */
-  const VERSION = '3.8.6';
+  const VERSION = '3.8.7';
 
   /*
    * Une seule instance par page — et savoir laquelle
@@ -1805,8 +1805,19 @@
       let tuileEchange = false;
       if (!item && onTrades()) {
         let n = h.parentElement;
-        for (let i = 0; i < 4 && n && !item; i++, n = n.parentElement) {
-          if (getComputedStyle(n).position === 'relative') { item = n; tuileEchange = true; }
+        for (let i = 0; i < 4 && n; i++, n = n.parentElement) {
+          if (getComputedStyle(n).position !== 'relative') continue;
+          /*
+           * Une tuile ne porte qu'UN titre. Le premier ancêtre positionné d'un
+           * titre qui n'est pas une carte — celui d'une fenêtre du site — peut
+           * être la fenêtre entière, grille comprise. Pris pour une tuile, il
+           * retirait la pastille de la première carte, que la carte reposait
+           * aussitôt : un changement de la page, donc un passage 300 ms plus
+           * tard, et ainsi de suite tant que la fenêtre restait ouverte. Au
+           * banc, deux cents pastilles posées et retirées par minute.
+           */
+          if (n.getElementsByTagName('h3').length === 1) { item = n; tuileEchange = true; }
+          break;
         }
       }
       if (!item) continue;
@@ -1819,7 +1830,9 @@
        * et qui n'affiche rien.
        */
       const hote = tuileEchange ? item : (item.firstElementChild || item);
-      const pastille = hote.querySelector('[data-wm-value]');
+      // Parmi ses enfants seulement : c'est là qu'on la pose, et celle d'une
+      // autre carte plus bas dans l'arbre n'est pas la sienne.
+      const pastille = [...hote.children].find((c) => c.dataset && c.dataset.wmValue);
       const moy = prix ? prix.get(h.textContent.trim()) : null;
 
       if (moy == null) {
@@ -2326,6 +2339,7 @@
   }
 
   function refreshCollection() {
+    const debut = Date.now();
     syncNavigation();
     injectNewFilter();
     applyNewFilter();
@@ -2334,6 +2348,8 @@
     paintTradeListPrices();
     injectWishAll();
     injectAuctionCote();
+    // Pour la boîte noire : un passage qui se relance lui-même se voit à son rythme.
+    noterPasse(Date.now() - debut);
   }
 
   /** Répartition par rareté, dérivée de l'historique — jamais comptée à part. */
@@ -15369,7 +15385,20 @@
     capture: '',                            // ce qui tient le pointeur, s'il est tenu
     tache: 0, tacheAt: 0, longues: 0,       // plus longue tâche du fil ; celles d'une seconde et plus
     image: 0,                               // dernière image dessinée, onglet visible
+    passes: [], passeMax: 0,                // nos passages sur la page : heures des derniers, le plus long
   };
+  const BOITE_PASSES = 30;
+
+  /*
+   * Nos propres passages sur la page du site. Celui des échanges se relançait
+   * lui-même toutes les 300 ms, sans fin : c'est ce qui se voit ici, à son
+   * rythme, avant de se sentir sous la souris.
+   */
+  function noterPasse(ms) {
+    boite.passes.push(Date.now());
+    if (boite.passes.length > BOITE_PASSES) boite.passes.shift();
+    if (ms > boite.passeMax) boite.passeMax = Math.round(ms);
+  }
   let boitesAvant = [];   // les chargements d'avant, dans cet onglet, le plus récent d'abord
   let imageDemandee = false;
 
@@ -15389,6 +15418,7 @@
       const courante = {
         ...boite,
         appuis: boite.appuis.slice(),
+        passes: boite.passes.slice(),
         fin: Date.now(),
         depart,
         visible: document.visibilityState !== 'hidden',
@@ -15706,6 +15736,9 @@
       if (b.capture) lignes.push(`  pointeur tenu par : ${b.capture}`);
       lignes.push(`  fil principal : ${b.tache ? `plus longue tâche ${b.tache} ms, ${avant(b.tacheAt)}`
         : 'aucune longue tâche relevée'} · ${b.longues} d’une seconde ou plus`);
+      const passes = (b.passes || []).filter((t) => b.fin - t <= 60000).length;
+      lignes.push(`  passages de l’outil sur la page : ${passes >= BOITE_PASSES ? `${passes} ou plus` : passes}`
+        + ` dans sa dernière minute · le plus long ${b.passeMax || 0} ms`);
       lignes.push(`  dernière image dessinée : ${avant(b.image)}`
         + ` · onglet ${b.visible ? 'visible' : 'caché'} · fenêtre ${b.active ? 'active' : 'inactive'}`);
       if (ouvert) lignes.push('  → un glisser-déposer était resté ouvert : la prochaine fois, essayez Échap avant F5.');
