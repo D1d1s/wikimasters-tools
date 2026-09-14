@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WikiMasters Tools
 // @namespace    https://www.wiki-masters.com/
-// @version      3.8.7
+// @version      3.8.8
 // @description  Boîte à outils WikiMasters : ouverture automatique des paquets, suivi des tirages, cote des cartes et revente.
 // @match        https://www.wiki-masters.com/*
 // @match        https://wiki-masters.com/*
@@ -41,7 +41,7 @@
    *
    * Il est lu par le garde juste en dessous, d'où sa place en tête.
    */
-  const VERSION = '3.8.7';
+  const VERSION = '3.8.8';
 
   /*
    * Une seule instance par page — et savoir laquelle
@@ -15382,6 +15382,7 @@
     clic: 0,                                // dernier `click` complet
     bouge: 0, roue: 0, touche: 0,           // derniers mouvement, molette, touche
     glisse: 0, cibleGlisse: '', glisseFin: 0, survols: 0,
+    empeches: 0, empecheAt: 0, cibleEmpeche: '',   // glisser annulés par `empecherLeGlisser`
     capture: '',                            // ce qui tient le pointeur, s'il est tenu
     tache: 0, tacheAt: 0, longues: 0,       // plus longue tâche du fil ; celles d'une seconde et plus
     image: 0,                               // dernière image dessinée, onglet visible
@@ -15450,6 +15451,13 @@
     noter('wheel', (e, t) => { boite.roue = t; });
     noter('keydown', (e, t) => { boite.touche = t; });
     noter('dragstart', (e, t) => {
+      // Annulé par `empecherLeGlisser`, posé avant : ce glisser n'a jamais commencé.
+      if (e.defaultPrevented) {
+        boite.empeches += 1;
+        boite.empecheAt = t;
+        boite.cibleEmpeche = nomElement(e.target && e.target.nodeType === 3 ? e.target.parentElement : e.target);
+        return;
+      }
       boite.glisse = t;
       boite.cibleGlisse = nomElement(e.target);
       boite.survols = 0;
@@ -15489,6 +15497,45 @@
       }
       sauverBoite();
     }, BOITE_EVERY);
+  }
+
+  /*
+   * LE GLISSER QUI NE FINIT JAMAIS — le blocage, pris sur le fait le
+   * 14 septembre 2026.
+   *
+   * Vu en direct dans Brave, sur /trades, l'onglet bloqué : dix appuis en deux
+   * secondes sur les cartes du composeur, et au dixième un `dragstart` sur
+   * l'IMAGE de la carte — une image se glisse d'office, un frémissement de la
+   * souris pendant le clic suffit. Ni `dragend` ni survol ensuite, et plus RIEN
+   * n'entrait dans l'onglet : ni les clics, ni Échap, ni le survol envoyé par
+   * l'automatisation du navigateur, qui passait pourtant sur un autre onglet.
+   * La page tournait et se dessinait, sa plus longue tâche faisait 86 ms, nos
+   * passages 4 ms. Huit minutes ainsi, jusqu'au F5. Le chargement d'avant,
+   * même histoire sur un lien de la barre latérale : un lien se glisse
+   * d'office, lui aussi.
+   *
+   * Le défaut est dans le navigateur ; ce qu'on tient, c'est son déclencheur.
+   * Le site n'a aucun glisser-déposer — relu dans ses fragments : pas un
+   * `onDragStart`, et il pose même `draggable={false}` sur l'une de ses
+   * images. On annule donc le glisser que le navigateur offre d'office aux
+   * images, aux liens et au texte sélectionné. Sans glisser, pas de glisser
+   * coincé, et le clic reste un clic. Ce qu'une page déclare glissable
+   * (`draggable="true"`) garde le sien.
+   *
+   * Posé avant la boîte noire : elle voit le `dragstart` déjà annulé, et le
+   * compte comme empêché plutôt que comme un glisser resté ouvert.
+   */
+  function empecherLeGlisser() {
+    addEventListener('dragstart', (e) => {
+      try {
+        const n = e.target;
+        const el = n && n.nodeType === 3 ? n.parentElement : n;   // texte sélectionné : son parent
+        if (el && el.closest && el.closest('[draggable="true"]')) return;
+        e.preventDefault();
+      } catch (_) {
+        /* un garde-fou qui lève ne doit pas coûter le geste */
+      }
+    }, true);
   }
 
   /*
@@ -15733,6 +15780,9 @@
         lignes.push(`  glisser-déposer : commencé ${avant(b.glisse)}, sur ${b.cibleGlisse}, `
           + (ouvert ? `jamais fini — ${b.survols} survol(s) depuis` : `fini ${avant(b.glisseFin)}`));
       }
+      if (b.empeches) {
+        lignes.push(`  glisser empêché : ${b.empeches} fois, le dernier ${avant(b.empecheAt)}, sur ${b.cibleEmpeche}`);
+      }
       if (b.capture) lignes.push(`  pointeur tenu par : ${b.capture}`);
       lignes.push(`  fil principal : ${b.tache ? `plus longue tâche ${b.tache} ms, ${avant(b.tacheAt)}`
         : 'aucune longue tâche relevée'} · ${b.longues} d’une seconde ou plus`);
@@ -15741,7 +15791,8 @@
         + ` dans sa dernière minute · le plus long ${b.passeMax || 0} ms`);
       lignes.push(`  dernière image dessinée : ${avant(b.image)}`
         + ` · onglet ${b.visible ? 'visible' : 'caché'} · fenêtre ${b.active ? 'active' : 'inactive'}`);
-      if (ouvert) lignes.push('  → un glisser-déposer était resté ouvert : la prochaine fois, essayez Échap avant F5.');
+      // Le 14 septembre, Échap n'est même pas arrivé à la page : ne plus le conseiller.
+      if (ouvert) lignes.push('  → un glisser-déposer était resté ouvert : c’est lui qui bloque l’onglet, seul le F5 en sort.');
     });
     return lignes;
   }
@@ -15792,6 +15843,8 @@
     ['le filtre des notifications', installNotifProxy],
     ['le filtre du canal temps réel', installNotifWsProxy],
     ['le filtre des avis à l’écran', installNotifDomFiltre],
+    // Avant la boîte noire : elle doit voir le glisser déjà annulé.
+    ['le garde-fou du glisser', empecherLeGlisser],
     // Avant le site, lui aussi : ses erreurs de chargement doivent trouver preneur.
     ['le relevé des blocages', installerReleveBlocage],
   ]) {
